@@ -1,4 +1,4 @@
-import { Terminal, Globe, ArrowRight } from 'lucide-react';
+import { Terminal, Briefcase, ArrowRight, Code2, User } from 'lucide-react';
 
 interface PortfolioChooserProps {
   onChoose: (mode: 'kali' | 'classic') => void;
@@ -15,12 +15,19 @@ export default function PortfolioChooser({ onChoose }: PortfolioChooserProps) {
           Tishant <span className="text-amber-400">Chandrakar</span>
         </h1>
         <p className="text-gray-500 text-sm sm:text-base">
-          Full Stack Developer &mdash; Choose your experience
+          Full Stack Developer
+        </p>
+      </div>
+
+      {/* Question */}
+      <div className="relative z-10 text-center mb-10">
+        <p className="text-lg sm:text-xl text-gray-300 font-light">
+          Are you a <span className="text-amber-400 font-medium">developer</span>?
         </p>
       </div>
 
       <div className="relative z-10 grid grid-cols-1 sm:grid-cols-2 gap-6 max-w-3xl w-full">
-        {/* Kali Desktop Card */}
+        {/* Yes, I'm a Developer → Kali */}
         <button
           onClick={() => onChoose('kali')}
           className="group text-left bg-white/[0.03] border border-white/[0.08] rounded-2xl p-8 hover:border-blue-400/40 hover:bg-white/[0.05] transition-all"
@@ -29,11 +36,11 @@ export default function PortfolioChooser({ onChoose }: PortfolioChooserProps) {
             <Terminal className="w-7 h-7 text-blue-400" />
           </div>
           <h2 className="text-xl font-bold text-white mb-2 flex items-center gap-2">
-            Desktop Mode
+            Yes, I'm a Developer
             <ArrowRight className="w-4 h-4 text-blue-400 opacity-0 group-hover:opacity-100 transition-opacity" />
           </h2>
           <p className="text-sm text-gray-500 leading-relaxed mb-4">
-            Interactive Kali Linux desktop experience. Explore my portfolio through a terminal, file manager, and windowed applications.
+            Enter an interactive Kali Linux desktop. Explore my portfolio through a terminal, file manager, and windowed applications — the way a developer would.
           </p>
           <div className="flex flex-wrap gap-1.5">
             {['Terminal', 'File Manager', 'Draggable Windows', 'Boot Sequence'].map(tag => (
@@ -42,22 +49,26 @@ export default function PortfolioChooser({ onChoose }: PortfolioChooserProps) {
               </span>
             ))}
           </div>
+          <div className="flex items-center gap-2 mt-5 text-xs text-gray-600">
+            <Code2 className="w-3.5 h-3.5" />
+            <span>Kali Linux Desktop Experience</span>
+          </div>
         </button>
 
-        {/* Classic Card */}
+        {/* No, Show Me the Portfolio → Classic */}
         <button
           onClick={() => onChoose('classic')}
           className="group text-left bg-white/[0.03] border border-white/[0.08] rounded-2xl p-8 hover:border-amber-400/40 hover:bg-white/[0.05] transition-all"
         >
           <div className="w-14 h-14 rounded-xl bg-amber-500/10 flex items-center justify-center mb-5 group-hover:bg-amber-500/20 transition-colors">
-            <Globe className="w-7 h-7 text-amber-400" />
+            <Briefcase className="w-7 h-7 text-amber-400" />
           </div>
           <h2 className="text-xl font-bold text-white mb-2 flex items-center gap-2">
-            Classic Portfolio
+            No, Just Show Portfolio
             <ArrowRight className="w-4 h-4 text-amber-400 opacity-0 group-hover:opacity-100 transition-opacity" />
           </h2>
           <p className="text-sm text-gray-500 leading-relaxed mb-4">
-            Clean, modern portfolio with smooth animations. Browse experience, projects, and skills in a professional layout.
+            A clean, professional portfolio with smooth animations. Browse my experience, projects, and skills in a familiar web layout.
           </p>
           <div className="flex flex-wrap gap-1.5">
             {['Animated Background', 'Smooth Scroll', 'Contact Form', 'Responsive'].map(tag => (
@@ -66,11 +77,15 @@ export default function PortfolioChooser({ onChoose }: PortfolioChooserProps) {
               </span>
             ))}
           </div>
+          <div className="flex items-center gap-2 mt-5 text-xs text-gray-600">
+            <User className="w-3.5 h-3.5" />
+            <span>Classic Professional Portfolio</span>
+          </div>
         </button>
       </div>
 
       <p className="relative z-10 text-gray-600 text-xs mt-10">
-        You can switch between modes anytime
+        You can switch between modes anytime from the navigation
       </p>
     </div>
   );
