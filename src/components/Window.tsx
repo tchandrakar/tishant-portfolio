@@ -81,15 +81,33 @@ export default function Window({
 
   if (!win.isOpen || win.isMinimized) return null;
 
+  const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
+
   const style = win.isMaximized
-    ? { top: 32, left: 0, right: 0, bottom: 48, width: '100%', height: 'calc(100vh - 80px)', zIndex: win.zIndex }
-    : {
-        top: localPos.y,
-        left: localPos.x,
-        width: win.size.width,
-        height: win.size.height,
+    ? {
+        top: isMobile ? 0 : 32,
+        left: 0,
+        right: 0,
+        bottom: isMobile ? 0 : 48,
+        width: '100%',
+        height: isMobile ? '100vh' : 'calc(100vh - 80px)',
         zIndex: win.zIndex,
-      };
+      }
+    : isMobile
+      ? {
+          top: 40,
+          left: 8,
+          width: 'calc(100vw - 16px)',
+          height: 'calc(100vh - 100px)',
+          zIndex: win.zIndex,
+        }
+      : {
+          top: localPos.y,
+          left: localPos.x,
+          width: win.size.width,
+          height: win.size.height,
+          zIndex: win.zIndex,
+        };
 
   return (
     <div

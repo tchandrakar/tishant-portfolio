@@ -29,9 +29,9 @@ export default function TopBar({ activeWindow }: TopBarProps) {
     });
 
   return (
-    <div className="panel-glass h-8 flex items-center justify-between px-3 text-xs text-kali-text relative z-[999]">
+    <div className="panel-glass h-8 flex items-center justify-between px-2 sm:px-3 text-xs text-kali-text relative z-[999]">
       {/* Left - Activities */}
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-2 sm:gap-4">
         <button className="hover:text-white transition-colors font-medium">
           Activities
         </button>
@@ -41,20 +41,20 @@ export default function TopBar({ activeWindow }: TopBarProps) {
       </div>
 
       {/* Center - Date/Time */}
-      <button className="absolute left-1/2 -translate-x-1/2 hover:text-white transition-colors">
-        {formatDate(time)}  {formatTime(time)}
+      <button className="absolute left-1/2 -translate-x-1/2 hover:text-white transition-colors text-[10px] sm:text-xs whitespace-nowrap">
+        <span className="hidden sm:inline">{formatDate(time)}  </span>{formatTime(time)}
       </button>
 
       {/* Right - System Tray */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1 sm:gap-2">
         <div
-          className="flex items-center gap-1.5 px-2 py-1 rounded hover:bg-white/10 cursor-pointer transition-colors"
+          className="flex items-center gap-1 sm:gap-1.5 px-1.5 sm:px-2 py-1 rounded hover:bg-white/10 cursor-pointer transition-colors"
           onClick={() => setShowSystemMenu(!showSystemMenu)}
         >
           <Wifi className="w-3.5 h-3.5" />
-          <Volume2 className="w-3.5 h-3.5" />
+          <Volume2 className="w-3.5 h-3.5 hidden sm:block" />
           <Battery className="w-3.5 h-3.5" />
-          <ChevronDown className="w-3 h-3" />
+          <ChevronDown className="w-3 h-3 hidden sm:block" />
         </div>
       </div>
 
