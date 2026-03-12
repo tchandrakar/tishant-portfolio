@@ -88,6 +88,12 @@ export const EXPERIENCES: Experience[] = [
 
 export const PROJECTS: Project[] = [
   {
+    name: 'AI Dev Manager',
+    description: 'An AI-powered development manager that automates project workflows, task management, and developer coordination using intelligent agents.',
+    tech: ['JavaScript', 'AI/LLM', 'Automation', 'DevTools'],
+    github: 'https://github.com/tchandrakar/ai-dev-manager',
+  },
+  {
     name: 'Omniplex',
     description: 'Open-source Perplexity alternative — AI-powered search and answer engine with real-time web access and intelligent summarization.',
     tech: ['TypeScript', 'Next.js', 'AI/LLM', 'Web Search'],
