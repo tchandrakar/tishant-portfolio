@@ -18,6 +18,42 @@ html, body, #root {
   user-select: none;
 }
 
+/* Classic mode overrides */
+.classic-mode {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  user-select: text;
+  background: #0a0a12;
+  color: #e5e7eb;
+  -webkit-font-smoothing: antialiased;
+}
+
+.classic-mode ::-webkit-scrollbar {
+  width: 6px;
+}
+
+.classic-mode ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.classic-mode ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+.classic-mode ::selection {
+  background: rgba(245, 158, 11, 0.4);
+  color: #fff;
+}
+
+.classic-mode input:focus,
+.classic-mode textarea:focus {
+  outline: none;
+  border-color: rgba(245, 158, 11, 0.5);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.15);
+}
+
 /* Scrollbar Styling - Kali theme */
 ::-webkit-scrollbar {
   width: 8px;

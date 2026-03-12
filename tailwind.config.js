@@ -7,6 +7,9 @@ export default {
   theme: {
     extend: {
       colors: {
+        brand: {
+          dark: '#0a0a12',
+        },
         kali: {
           bg: '#0d0d1a',
           surface: '#1a1a2e',
