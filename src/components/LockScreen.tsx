@@ -9,11 +9,16 @@ export default function LockScreen({ onUnlock }: LockScreenProps) {
   const [password, setPassword] = useState('');
   const [showInput, setShowInput] = useState(false);
   const [time, setTime] = useState(new Date());
+  const [isMobile, setIsMobile] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const interval = setInterval(() => setTime(new Date()), 1000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    setIsMobile(window.innerWidth < 768);
   }, []);
 
   useEffect(() => {
@@ -44,7 +49,7 @@ export default function LockScreen({ onUnlock }: LockScreenProps) {
       {/* Content */}
       <div className="relative z-10 flex flex-col items-center">
         {/* Time */}
-        <div className="text-7xl sm:text-8xl font-light text-white mb-2 tracking-wide">
+        <div className="text-5xl sm:text-7xl font-light text-white mb-2 tracking-wide">
           {formatTime(time)}
         </div>
         <div className="text-xl text-white/70 mb-12">
@@ -79,7 +84,7 @@ export default function LockScreen({ onUnlock }: LockScreenProps) {
           </form>
         ) : (
           <p className="text-sm text-white/50 animate-pulse">
-            Click anywhere to unlock
+            {isMobile ? 'Tap anywhere to unlock' : 'Click anywhere to unlock'}
           </p>
         )}
       </div>

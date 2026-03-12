@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#0f0f1a"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#367bf0"/>
+      <stop offset="100%" stop-color="#2856a8"/>
+    </linearGradient>
+  </defs>
+  <!-- Dark background -->
+  <rect width="64" height="64" rx="12" fill="url(#bg)"/>
+  <!-- Shield shape -->
+  <path d="M32 6 L52 16 L52 32 Q52 48 32 58 Q12 48 12 32 L12 16 Z"
+        fill="none" stroke="url(#shield)" stroke-width="2.5"
+        stroke-linejoin="round"/>
+  <!-- Inner shield accent line -->
+  <path d="M32 12 L47 20 L47 32 Q47 44.5 32 52.5 Q17 44.5 17 32 L17 20 Z"
+        fill="url(#shield)" opacity="0.12"/>
+  <!-- TC initials -->
+  <text x="32" y="40" text-anchor="middle"
+        font-family="'Courier New', monospace" font-weight="bold"
+        font-size="18" fill="#367bf0" letter-spacing="1">TC</text>
+  <!-- Small dragon/fang accents at top of shield -->
+  <path d="M32 6 L32 14" stroke="#367bf0" stroke-width="1.5" stroke-linecap="round"/>
+  <path d="M26 9.5 L28 15" stroke="#367bf0" stroke-width="1" stroke-linecap="round" opacity="0.6"/>
+  <path d="M38 9.5 L36 15" stroke="#367bf0" stroke-width="1" stroke-linecap="round" opacity="0.6"/>
+</svg>

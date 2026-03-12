@@ -26,8 +26,8 @@ interface DockProps {
 
 export default function Dock({ windows, onOpenApp }: DockProps) {
   return (
-    <div className="fixed bottom-3 left-1/2 -translate-x-1/2 z-[998]">
-      <div className="dock-glass rounded-2xl px-3 py-2 flex items-center gap-1">
+    <div className="fixed bottom-2 sm:bottom-3 left-1/2 -translate-x-1/2 z-[998]">
+      <div className="dock-glass rounded-2xl px-2 sm:px-3 py-1.5 sm:py-2 flex items-center gap-0.5 sm:gap-1">
         {DOCK_ITEMS.map(({ id, label, Icon }) => {
           const win = windows.find(w => w.id === id);
           const isOpen = win && win.isOpen;
@@ -41,14 +41,14 @@ export default function Dock({ windows, onOpenApp }: DockProps) {
               title={label}
             >
               <div
-                className={`w-11 h-11 rounded-xl flex items-center justify-center transition-all ${
+                className={`w-9 h-9 sm:w-11 sm:h-11 rounded-xl flex items-center justify-center transition-all ${
                   isOpen && !isMinimized
                     ? 'bg-kali-accent/20 ring-1 ring-kali-accent/30'
                     : 'hover:bg-white/10'
                 }`}
               >
                 <Icon
-                  className={`w-5 h-5 ${
+                  className={`w-4 h-4 sm:w-5 sm:h-5 ${
                     isOpen ? 'text-kali-accent' : 'text-kali-text'
                   }`}
                 />
