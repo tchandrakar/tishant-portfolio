@@ -107,7 +107,7 @@ export default function App() {
   // --- Chooser ---
   if (mode === 'chooser') {
     return (
-      <div className="classic-mode">
+      <div className="classic-mode page-transition" key="chooser">
         <PortfolioChooser onChoose={handleChoose} />
       </div>
     );
@@ -116,7 +116,7 @@ export default function App() {
   // --- Classic Portfolio ---
   if (mode === 'classic') {
     return (
-      <div className="classic-mode">
+      <div className="classic-mode page-transition" key="classic">
         <ClassicPortfolio onSwitchPortfolio={() => setMode('chooser')} />
       </div>
     );
@@ -133,7 +133,7 @@ export default function App() {
 
   return (
     <div
-      className="fixed inset-0 kali-wallpaper overflow-hidden"
+      className="fixed inset-0 kali-wallpaper overflow-hidden page-transition"
       onContextMenu={handleContextMenu}
       onClick={handleDesktopClick}
     >

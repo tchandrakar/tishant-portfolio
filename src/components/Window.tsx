@@ -24,12 +24,41 @@ export default function Window({
   const dragRef = useRef<{ startX: number; startY: number; posX: number; posY: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [localPos, setLocalPos] = useState(win.position);
+  const [animState, setAnimState] = useState<'entering' | 'idle' | 'minimizing' | 'closing'>('entering');
 
   useEffect(() => {
     if (!isDragging) {
       setLocalPos(win.position);
     }
   }, [win.position, isDragging]);
+
+  // When opened, play enter animation
+  useEffect(() => {
+    if (win.isOpen && !win.isMinimized) {
+      setAnimState('entering');
+      const timer = setTimeout(() => setAnimState('idle'), 300);
+      return () => clearTimeout(timer);
+    }
+  }, [win.isOpen]);
+
+  // When un-minimized, re-enter
+  useEffect(() => {
+    if (!win.isMinimized && animState === 'minimizing') {
+      setAnimState('entering');
+      const timer = setTimeout(() => setAnimState('idle'), 300);
+      return () => clearTimeout(timer);
+    }
+  }, [win.isMinimized]);
+
+  const handleMinimize = useCallback(() => {
+    setAnimState('minimizing');
+    setTimeout(onMinimize, 280);
+  }, [onMinimize]);
+
+  const handleClose = useCallback(() => {
+    setAnimState('closing');
+    setTimeout(onClose, 250);
+  }, [onClose]);
 
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
@@ -48,25 +77,17 @@ export default function Window({
         if (!dragRef.current) return;
         const dx = e.clientX - dragRef.current.startX;
         const dy = e.clientY - dragRef.current.startY;
-        const newPos = {
+        setLocalPos({
           x: dragRef.current.posX + dx,
           y: dragRef.current.posY + dy,
-        };
-        setLocalPos(newPos);
+        });
       };
 
       const handleMouseUp = () => {
-        if (dragRef.current) {
-          const finalPos = {
-            x: dragRef.current.posX + (0), // will be updated from localPos
-            y: dragRef.current.posY + (0),
-          };
-          // Get the latest position from state
-          setLocalPos(prev => {
-            onPositionChange(prev);
-            return prev;
-          });
-        }
+        setLocalPos(prev => {
+          onPositionChange(prev);
+          return prev;
+        });
         setIsDragging(false);
         dragRef.current = null;
         document.removeEventListener('mousemove', handleMouseMove);
@@ -79,7 +100,8 @@ export default function Window({
     [onFocus, onPositionChange, localPos]
   );
 
-  if (!win.isOpen || win.isMinimized) return null;
+  if (!win.isOpen) return null;
+  if (win.isMinimized && animState !== 'minimizing') return null;
 
   const isMobile = typeof window !== 'undefined' && window.innerWidth < 640;
 
@@ -109,11 +131,17 @@ export default function Window({
           zIndex: win.zIndex,
         };
 
+  const animClass =
+    animState === 'entering' ? 'window-enter' :
+    animState === 'minimizing' ? 'window-minimize' :
+    animState === 'closing' ? 'page-fade-out' :
+    win.isMaximized ? 'window-maximize' : '';
+
   return (
     <div
       className={`fixed flex flex-col window-shadow rounded-lg overflow-hidden ${
         win.isMaximized ? 'rounded-none' : ''
-      }`}
+      } ${animClass}`}
       style={style}
       onMouseDown={onFocus}
     >
@@ -126,7 +154,7 @@ export default function Window({
         <span className="text-xs text-kali-text truncate flex-1 mr-4">{win.title}</span>
         <div className="flex items-center gap-1">
           <button
-            onClick={onMinimize}
+            onClick={handleMinimize}
             className="w-6 h-6 rounded flex items-center justify-center hover:bg-white/10 transition-colors"
             title="Minimize"
           >
@@ -144,7 +172,7 @@ export default function Window({
             )}
           </button>
           <button
-            onClick={onClose}
+            onClick={handleClose}
             className="w-6 h-6 rounded flex items-center justify-center hover:bg-kali-red/80 transition-colors"
             title="Close"
           >

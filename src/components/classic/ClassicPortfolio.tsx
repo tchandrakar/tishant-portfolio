@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { PROFILE, EXPERIENCES, PROJECTS, SKILLS } from '../../data/profile';
 import StarBackground from './StarBackground';
+import ScrollReveal from './ScrollReveal';
 
 interface ClassicPortfolioProps {
   onSwitchPortfolio: () => void;
@@ -156,8 +157,8 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
 
       {/* Hero Section */}
       <section id="home" className="relative min-h-screen flex items-center justify-center px-4">
-        <div className="max-w-3xl mx-auto text-center relative z-10">
-          <p className="text-amber-400 text-sm sm:text-base mb-4 font-mono animate-fade-in">
+        <div className="max-w-3xl mx-auto text-center relative z-10 hero-text-enter">
+          <p className="text-amber-400 text-sm sm:text-base mb-4 font-mono">
             Hello World! I'm
           </p>
           <h1 className="text-4xl sm:text-5xl md:text-7xl font-bold mb-4 leading-tight">
@@ -212,36 +213,42 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
       {/* Feature Cards */}
       <section className="relative z-10 py-20 px-4">
         <div className="max-w-6xl mx-auto">
-          <h2 className="text-center text-sm text-amber-400 font-mono mb-2">Why work with me?</h2>
-          <p className="text-center text-2xl sm:text-3xl font-bold text-white mb-12">
-            What I bring to the table
-          </p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
-            {featureCards.map((card, i) => (
-              <div
-                key={i}
-                className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-6 hover:border-amber-400/20 hover:bg-white/[0.05] transition-all group"
-              >
-                <div className="w-10 h-10 rounded-lg bg-amber-400/10 flex items-center justify-center mb-4 group-hover:bg-amber-400/20 transition-colors">
-                  <card.icon className="w-5 h-5 text-amber-400" />
+          <ScrollReveal>
+            <h2 className="text-center text-sm text-amber-400 font-mono mb-2">Why work with me?</h2>
+            <p className="text-center text-2xl sm:text-3xl font-bold text-white mb-12">
+              What I bring to the table
+            </p>
+          </ScrollReveal>
+          <ScrollReveal stagger>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+              {featureCards.map((card, i) => (
+                <div
+                  key={i}
+                  className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-6 hover:border-amber-400/20 hover:bg-white/[0.05] transition-all group"
+                >
+                  <div className="w-10 h-10 rounded-lg bg-amber-400/10 flex items-center justify-center mb-4 group-hover:bg-amber-400/20 transition-colors">
+                    <card.icon className="w-5 h-5 text-amber-400" />
+                  </div>
+                  <h3 className="text-sm font-semibold text-white mb-2">{card.title}</h3>
+                  <p className="text-xs text-gray-500 leading-relaxed">{card.description}</p>
                 </div>
-                <h3 className="text-sm font-semibold text-white mb-2">{card.title}</h3>
-                <p className="text-xs text-gray-500 leading-relaxed">{card.description}</p>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          </ScrollReveal>
         </div>
       </section>
 
       {/* About Section */}
       <section id="about" className="relative z-10 py-20 px-4">
         <div className="max-w-4xl mx-auto">
-          <h2 className="text-sm text-amber-400 font-mono mb-2">About Me</h2>
-          <p className="text-2xl sm:text-3xl font-bold text-white mb-8">Get to know me</p>
+          <ScrollReveal>
+            <h2 className="text-sm text-amber-400 font-mono mb-2">About Me</h2>
+            <p className="text-2xl sm:text-3xl font-bold text-white mb-8">Get to know me</p>
+          </ScrollReveal>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
             {/* Left - Bio */}
-            <div>
+            <ScrollReveal direction="left"><div>
               <p className="text-sm text-gray-400 leading-relaxed mb-6 whitespace-pre-line">
                 {PROFILE.bio}
               </p>
@@ -261,8 +268,10 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
               </div>
             </div>
 
+            </ScrollReveal>
+
             {/* Right - Skills */}
-            <div>
+            <ScrollReveal direction="right"><div>
               <h3 className="text-xs text-amber-400 font-mono uppercase mb-4">Tech Stack</h3>
               <div className="space-y-3">
                 {SKILLS.map((cat, i) => (
@@ -281,7 +290,7 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
                   </div>
                 ))}
               </div>
-            </div>
+            </div></ScrollReveal>
           </div>
         </div>
       </section>
@@ -289,12 +298,14 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
       {/* Experience Section */}
       <section id="experience" className="relative z-10 py-20 px-4">
         <div className="max-w-4xl mx-auto">
-          <h2 className="text-sm text-amber-400 font-mono mb-2">Experience</h2>
-          <p className="text-2xl sm:text-3xl font-bold text-white mb-10">Where I've worked</p>
+          <ScrollReveal>
+            <h2 className="text-sm text-amber-400 font-mono mb-2">Experience</h2>
+            <p className="text-2xl sm:text-3xl font-bold text-white mb-10">Where I've worked</p>
+          </ScrollReveal>
 
           <div className="space-y-6">
             {EXPERIENCES.map((exp, i) => (
-              <div
+              <ScrollReveal key={i} delay={i * 100}><div
                 key={i}
                 className="relative pl-8 border-l-2 border-white/10 hover:border-amber-400/40 transition-colors"
               >
@@ -328,7 +339,7 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
                     ))}
                   </div>
                 </div>
-              </div>
+              </div></ScrollReveal>
             ))}
           </div>
         </div>
@@ -337,9 +348,12 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
       {/* Projects Section */}
       <section id="projects" className="relative z-10 py-20 px-4">
         <div className="max-w-4xl mx-auto">
-          <h2 className="text-sm text-amber-400 font-mono mb-2">Projects</h2>
-          <p className="text-2xl sm:text-3xl font-bold text-white mb-10">What I've built</p>
+          <ScrollReveal>
+            <h2 className="text-sm text-amber-400 font-mono mb-2">Projects</h2>
+            <p className="text-2xl sm:text-3xl font-bold text-white mb-10">What I've built</p>
+          </ScrollReveal>
 
+          <ScrollReveal stagger>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
             {PROJECTS.map((project, i) => (
               <div
@@ -375,11 +389,13 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
               </div>
             ))}
           </div>
+          </ScrollReveal>
         </div>
       </section>
 
       {/* Contact Section */}
       <section id="contact" className="relative z-10 py-20 px-4">
+        <ScrollReveal>
         <div className="max-w-2xl mx-auto">
           <h2 className="text-sm text-amber-400 font-mono mb-2 text-center">Get in Touch</h2>
           <p className="text-2xl sm:text-3xl font-bold text-white mb-10 text-center">
@@ -460,6 +476,7 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
             </form>
           )}
         </div>
+        </ScrollReveal>
       </section>
 
       {/* Footer */}

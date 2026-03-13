@@ -8,6 +8,7 @@ interface BootScreenProps {
 export default function BootScreen({ onComplete }: BootScreenProps) {
   const [visibleLines, setVisibleLines] = useState<number>(0);
   const [showLogo, setShowLogo] = useState(false);
+  const [fadingOut, setFadingOut] = useState(false);
 
   useEffect(() => {
     if (visibleLines < BOOT_MESSAGES.length) {
@@ -22,13 +23,22 @@ export default function BootScreen({ onComplete }: BootScreenProps) {
 
   useEffect(() => {
     if (showLogo) {
-      const timer = setTimeout(onComplete, 1500);
+      const timer = setTimeout(() => setFadingOut(true), 1200);
       return () => clearTimeout(timer);
     }
-  }, [showLogo, onComplete]);
+  }, [showLogo]);
+
+  useEffect(() => {
+    if (fadingOut) {
+      const timer = setTimeout(onComplete, 500);
+      return () => clearTimeout(timer);
+    }
+  }, [fadingOut, onComplete]);
 
   return (
-    <div className="fixed inset-0 bg-black flex flex-col justify-start overflow-hidden z-[9999]">
+    <div className={`fixed inset-0 bg-black flex flex-col justify-start overflow-hidden z-[9999] transition-opacity duration-500 ${
+      fadingOut ? 'opacity-0' : 'opacity-100'
+    }`}>
       {!showLogo ? (
         <div className="p-4 font-mono text-sm">
           {BOOT_MESSAGES.slice(0, visibleLines).map((msg, i) => (
@@ -52,7 +62,6 @@ export default function BootScreen({ onComplete }: BootScreenProps) {
         </div>
       ) : (
         <div className="flex-1 flex flex-col items-center justify-center animate-fade-in">
-          {/* Kali Dragon ASCII Logo */}
           <pre className="text-kali-accent text-xs sm:text-sm leading-tight mb-6 font-mono">
 {`
     ⠀⠀⠀⠀⠀⠀⣠⣶⣿⣿⣶⣄⠀⠀⠀⠀⠀⠀
@@ -70,7 +79,6 @@ export default function BootScreen({ onComplete }: BootScreenProps) {
             TishantOS
           </h1>
           <p className="text-kali-muted text-sm mt-2">Loading desktop environment...</p>
-          {/* Loading bar */}
           <div className="mt-6 w-64 h-1 bg-kali-border rounded-full overflow-hidden">
             <div
               className="h-full bg-kali-accent rounded-full transition-all duration-1000"
@@ -79,7 +87,6 @@ export default function BootScreen({ onComplete }: BootScreenProps) {
           </div>
         </div>
       )}
-      {/* Scanlines overlay */}
       <div className="absolute inset-0 scanlines pointer-events-none" />
     </div>
   );
