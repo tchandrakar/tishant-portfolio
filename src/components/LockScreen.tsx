@@ -10,6 +10,7 @@ export default function LockScreen({ onUnlock }: LockScreenProps) {
   const [showInput, setShowInput] = useState(false);
   const [time, setTime] = useState(new Date());
   const [isMobile, setIsMobile] = useState(false);
+  const [fadingOut, setFadingOut] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -29,7 +30,8 @@ export default function LockScreen({ onUnlock }: LockScreenProps) {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onUnlock();
+    setFadingOut(true);
+    setTimeout(onUnlock, 500);
   };
 
   const formatTime = (d: Date) =>
@@ -40,15 +42,14 @@ export default function LockScreen({ onUnlock }: LockScreenProps) {
 
   return (
     <div
-      className="fixed inset-0 kali-wallpaper flex flex-col items-center justify-center z-[9998] cursor-pointer"
+      className={`fixed inset-0 kali-wallpaper flex flex-col items-center justify-center z-[9998] cursor-pointer page-transition ${
+        fadingOut ? 'lock-fade-out' : ''
+      }`}
       onClick={() => !showInput && setShowInput(true)}
     >
-      {/* Background blur overlay */}
       <div className="absolute inset-0 lock-blur bg-black/40" />
 
-      {/* Content */}
       <div className="relative z-10 flex flex-col items-center">
-        {/* Time */}
         <div className="text-5xl sm:text-7xl font-light text-white mb-2 tracking-wide">
           {formatTime(time)}
         </div>
@@ -56,17 +57,14 @@ export default function LockScreen({ onUnlock }: LockScreenProps) {
           {formatDate(time)}
         </div>
 
-        {/* Avatar */}
         <div className="w-24 h-24 rounded-full bg-kali-surface border-2 border-kali-accent/30 flex items-center justify-center mb-4 overflow-hidden">
           <span className="text-3xl font-bold text-kali-accent">TC</span>
         </div>
 
-        {/* Name */}
         <h2 className="text-xl font-medium text-white mb-6">Tishant Chandrakar</h2>
 
-        {/* Password Input */}
         {showInput ? (
-          <form onSubmit={handleSubmit} className="flex flex-col items-center">
+          <form onSubmit={handleSubmit} className="flex flex-col items-center animate-fade-in">
             <div className="relative">
               <input
                 ref={inputRef}
