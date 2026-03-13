@@ -28,11 +28,10 @@ export default function Resume() {
             <Printer className="w-3.5 h-3.5 text-kali-muted" />
           </button>
           <a
-            href={PROFILE.linkedin}
-            target="_blank"
-            rel="noopener noreferrer"
+            href={PROFILE.resumeUrl}
+            download="Tishant_Chandrakar_CV.pdf"
             className="p-1.5 rounded hover:bg-white/10"
-            title="Download from LinkedIn"
+            title="Download Resume"
           >
             <Download className="w-3.5 h-3.5 text-kali-muted" />
           </a>
