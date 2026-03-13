@@ -152,7 +152,7 @@ export default function PortfolioChooser({ onChoose }: PortfolioChooserProps) {
           Full Stack Developer
         </p>
         <p className="text-lg sm:text-xl text-gray-300 font-light">
-          Are you a <span className="text-amber-400 font-medium">developer</span>?
+          How would you like to <span className="text-amber-400 font-medium">explore</span>?
         </p>
       </div>
 
@@ -177,7 +177,7 @@ export default function PortfolioChooser({ onChoose }: PortfolioChooserProps) {
               <Terminal className="w-7 h-7 text-blue-400" />
             </div>
             <h2 className="text-2xl sm:text-3xl font-bold text-white mb-1 flex items-center gap-3" style={{ transform: 'translateZ(15px)' }}>
-              Yes
+              I'm a Developer
               <ArrowRight className="w-5 h-5 text-blue-400 opacity-0 group-hover:opacity-100 group-hover:translate-x-1 transition-all" />
             </h2>
             <p className="text-sm text-gray-500 leading-relaxed mb-4" style={{ transform: 'translateZ(5px)' }}>
@@ -213,14 +213,14 @@ export default function PortfolioChooser({ onChoose }: PortfolioChooserProps) {
               <Briefcase className="w-7 h-7 text-amber-400" />
             </div>
             <h2 className="text-2xl sm:text-3xl font-bold text-white mb-1 flex items-center gap-3" style={{ transform: 'translateZ(15px)' }}>
-              No
+              Working Professional
               <ArrowRight className="w-5 h-5 text-amber-400 opacity-0 group-hover:opacity-100 group-hover:translate-x-1 transition-all" />
             </h2>
             <p className="text-sm text-gray-500 leading-relaxed mb-4" style={{ transform: 'translateZ(5px)' }}>
-              A clean, professional portfolio with smooth animations. Browse my experience, projects, and skills in a familiar web layout.
+              An immersive 3D portfolio with interactive cards, parallax effects, and smooth animations. Experience my work in a visually stunning layout.
             </p>
             <div className="flex flex-wrap gap-1.5" style={{ transform: 'translateZ(8px)' }}>
-              {['Animated Background', 'Smooth Scroll', 'Contact Form', 'Responsive'].map(tag => (
+              {['3D Interactive', 'Mouse Parallax', 'Scroll Animations', 'Glassmorphism'].map(tag => (
                 <span key={tag} className="px-2 py-0.5 text-[10px] bg-amber-400/10 text-amber-400/70 rounded-full border border-amber-400/15">
                   {tag}
                 </span>
@@ -228,7 +228,7 @@ export default function PortfolioChooser({ onChoose }: PortfolioChooserProps) {
             </div>
             <div className="flex items-center gap-2 mt-5 text-xs text-gray-600" style={{ transform: 'translateZ(5px)' }}>
               <User className="w-3.5 h-3.5" />
-              <span>Classic Professional Portfolio</span>
+              <span>Immersive 3D Portfolio</span>
             </div>
           </Card3D>
         </div>

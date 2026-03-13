@@ -400,3 +400,22 @@ input:focus, textarea:focus {
     0 20px 60px rgba(0, 0, 0, 0.4),
     0 0 30px rgba(54, 123, 240, 0.05);
 }
+
+/* ===== Animated gradient border for contact form ===== */
+.gradient-border-card {
+  background: linear-gradient(
+    135deg,
+    rgba(245, 158, 11, 0.4),
+    rgba(59, 130, 246, 0.2),
+    rgba(139, 92, 246, 0.2),
+    rgba(245, 158, 11, 0.4)
+  );
+  background-size: 300% 300%;
+  animation: gradientShift 4s ease infinite;
+}
+
+@keyframes gradientShift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
