@@ -154,6 +154,16 @@ html, body, #root {
   50% { opacity: 0; }
 }
 
+/* Shutdown progress bar — drains from 100% to 0% */
+.shutdown-progress {
+  animation: shutdownDrain 1.2s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+@keyframes shutdownDrain {
+  from { width: 100%; }
+  to   { width: 0%; }
+}
+
 /* Smooth transitions */
 .transition-smooth {
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
@@ -318,4 +328,75 @@ input:focus, textarea:focus {
 @keyframes heroSlideUp {
   from { opacity: 0; transform: translateY(20px); }
   to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ===== Floating 3D shapes for chooser ===== */
+.floating-shape-1 {
+  animation: float1 8s ease-in-out infinite;
+}
+.floating-shape-2 {
+  animation: float2 10s ease-in-out infinite;
+}
+.floating-shape-3 {
+  animation: float3 12s ease-in-out infinite;
+}
+.floating-shape-4 {
+  animation: float4 14s ease-in-out infinite;
+}
+.floating-shape-5 {
+  animation: float5 6s ease-in-out infinite;
+}
+.floating-shape-6 {
+  animation: float6 7s ease-in-out infinite;
+}
+.floating-shape-7 {
+  animation: float7 9s ease-in-out infinite;
+}
+.floating-shape-8 {
+  animation: float8 5s ease-in-out infinite;
+}
+
+@keyframes float1 {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  33% { transform: translate(20px, -30px) rotate(5deg); }
+  66% { transform: translate(-15px, 15px) rotate(-3deg); }
+}
+@keyframes float2 {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  33% { transform: translate(-25px, 20px) rotate(-4deg); }
+  66% { transform: translate(15px, -25px) rotate(6deg); }
+}
+@keyframes float3 {
+  0%, 100% { transform: rotate(45deg) scale(1); }
+  50% { transform: rotate(135deg) scale(1.1); }
+}
+@keyframes float4 {
+  0%, 100% { transform: rotate(30deg) scale(1); }
+  50% { transform: rotate(-60deg) scale(1.15); }
+}
+@keyframes float5 {
+  0%, 100% { transform: translateY(0); opacity: 0.3; }
+  50% { transform: translateY(-15px); opacity: 0.7; }
+}
+@keyframes float6 {
+  0%, 100% { transform: translateY(0); opacity: 0.3; }
+  50% { transform: translateY(12px); opacity: 0.6; }
+}
+@keyframes float7 {
+  0%, 100% { transform: translate(0, 0); opacity: 0.15; }
+  50% { transform: translate(10px, -10px); opacity: 0.4; }
+}
+@keyframes float8 {
+  0%, 100% { transform: translate(0, 0); opacity: 0.2; }
+  50% { transform: translate(-8px, 8px); opacity: 0.5; }
+}
+
+/* 3D card hover shadow */
+.card-3d {
+  transition: transform 0.15s ease-out, box-shadow 0.3s ease;
+}
+.card-3d:hover {
+  box-shadow:
+    0 20px 60px rgba(0, 0, 0, 0.4),
+    0 0 30px rgba(54, 123, 240, 0.05);
 }

@@ -10,7 +10,7 @@ export interface WindowState {
   zIndex: number;
 }
 
-export type AppScreen = 'boot' | 'lock' | 'desktop';
+export type AppScreen = 'boot' | 'lock' | 'desktop' | 'shutdown';
 
 export interface DesktopIconData {
   id: string;

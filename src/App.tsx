@@ -3,6 +3,7 @@ import type { AppScreen } from './types';
 import { useWindowManager } from './hooks/useWindowManager';
 import BootScreen from './components/BootScreen';
 import LockScreen from './components/LockScreen';
+import ShutdownScreen from './components/ShutdownScreen';
 import TopBar from './components/TopBar';
 import Desktop from './components/Desktop';
 import Dock from './components/Dock';
@@ -131,13 +132,17 @@ export default function App() {
     return <LockScreen onUnlock={handleUnlock} />;
   }
 
+  if (screen === 'shutdown') {
+    return <ShutdownScreen onComplete={() => setMode('chooser')} />;
+  }
+
   return (
     <div
       className="fixed inset-0 kali-wallpaper overflow-hidden page-transition"
       onContextMenu={handleContextMenu}
       onClick={handleDesktopClick}
     >
-      <TopBar activeWindow={topWindow?.title} />
+      <TopBar activeWindow={topWindow?.title} onShutdown={() => setScreen('shutdown')} />
       <Desktop onOpenApp={openWindow} />
 
       <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none select-none opacity-[0.025]">

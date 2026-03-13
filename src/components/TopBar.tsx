@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react';
-import { Wifi, Volume2, Battery, ChevronDown } from 'lucide-react';
+import { Wifi, Volume2, Battery, ChevronDown, Power } from 'lucide-react';
 
 interface TopBarProps {
   activeWindow?: string;
+  onShutdown?: () => void;
 }
 
-export default function TopBar({ activeWindow }: TopBarProps) {
+export default function TopBar({ activeWindow, onShutdown }: TopBarProps) {
   const [time, setTime] = useState(new Date());
   const [showSystemMenu, setShowSystemMenu] = useState(false);
 
@@ -95,6 +96,19 @@ export default function TopBar({ activeWindow }: TopBarProps) {
                 </div>
                 <span className="text-sm">Tishant Chandrakar</span>
               </div>
+              {/* Separator */}
+              <div className="border-t border-kali-border" />
+              {/* Power Off */}
+              <button
+                className="flex items-center gap-2 py-1.5 w-full rounded hover:bg-kali-red/20 transition-colors group"
+                onClick={() => {
+                  setShowSystemMenu(false);
+                  onShutdown?.();
+                }}
+              >
+                <Power className="w-4 h-4 text-kali-red group-hover:text-kali-red" />
+                <span className="text-sm text-kali-text group-hover:text-kali-red">Power Off</span>
+              </button>
             </div>
           </div>
         </>
