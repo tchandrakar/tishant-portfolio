@@ -2,12 +2,13 @@ import type { Experience, Project, Skill } from '../types';
 
 export const PROFILE = {
   name: 'Tishant Chandrakar',
-  title: 'Full Stack Developer (BE Heavy)',
+  title: 'Associate Technical Architect',
   email: 'tishantchandrakar007@gmail.com',
   phone: '+91-9068703837',
   location: 'Bangalore, India',
   github: 'https://github.com/tchandrakar',
   linkedin: 'https://www.linkedin.com/in/tishant-chandrakar/',
+  resumeUrl: '/Tishant_Chandrakar_CV.pdf',
   education: {
     institution: 'Indian Institute of Technology, Roorkee',
     degree: 'B.Tech',
@@ -27,7 +28,7 @@ export const PROFILE = {
     'Summer Undergraduate Research Award (SURA-2017)',
     'Published: Temperature and time dependent morphological evolution of copper oxide nanostructures (Springer, 2024)',
   ],
-  bio: `I'm a Full Stack Developer with a strong backend focus, currently at Quizizz, Bangalore. With 6+ years of experience building scalable systems across fintech, edtech, and AI-powered platforms, I've worked at Goldman Sachs, MindTickle, and PhotonInsights before my current role.
+  bio: `I'm an Associate Technical Architect at Hilabs, Bangalore, leading the Provider-Directory team as an acting EM and architect. With 6+ years of experience building scalable systems across healthtech, edtech, fintech, and AI-powered platforms, I've worked at Zilingo, MindTickle, PhotonInsights, and Quizizz before my current role.
 
 I hold a B.Tech from IIT Roorkee and carry certifications in cybersecurity (Security+, CEH v11). I'm passionate about system design, performance optimization, and building products that serve millions of users.
 
@@ -36,14 +37,23 @@ When I'm not coding, you'll find me exploring cybersecurity challenges on HackTh
 
 export const EXPERIENCES: Experience[] = [
   {
+    company: 'Hilabs',
+    role: 'Associate Technical Architect',
+    location: 'Bangalore',
+    period: 'December 2025 - Present',
+    highlights: [
+      'Leading the Provider-Directory team as an acting EM and architect.',
+    ],
+    techStack: ['AWS', 'Docker', 'Angular', 'Node.JS', 'GO', 'Python', 'OpenAI', 'ECS', 'MongoDB'],
+  },
+  {
     company: 'Quizizz',
     role: 'Full Stack Developer (BE Heavy)',
     location: 'Bangalore',
-    period: 'November 2024 - Present',
+    period: 'November 2024 - September 2025',
     highlights: [
       'Leading the Lessons and Content team back-end as an IC.',
       'Revamped authentication flow with end-to-end reusable refresh tokens for 300K+ DAU across U.S. school platforms.',
-      'Optimized Node.js APIs, reducing P99 response times to meet <800ms SLA.',
       'Built content import flow for Google Drive and OneDrive integration.',
       'Implemented AI-driven parameterized quiz generation, reducing user interaction steps by 40%.',
     ],
@@ -57,7 +67,7 @@ export const EXPERIENCES: Experience[] = [
     highlights: [
       'Led a backend and infrastructure team of 4, driving scalable system development.',
       'Generated Level 1 diligence reports for asset management institutions.',
-      'Integrated Slack and Microsoft Teams for live queries, reducing search time from 2-3 weeks to <1 hour.',
+      'Enabled document insights with annotations for university PhD students, generating 2-3 new annotations per project.',
       'Integrated Microsoft OpenAI LLM with vector databases, reducing query time from minutes to <5 seconds.',
     ],
     techStack: ['AWS', 'Docker', 'React', 'Python', 'OpenAI', 'ECS', 'Scala', 'Java', 'MySQL', 'Postgres', 'MongoDB'],
@@ -74,15 +84,15 @@ export const EXPERIENCES: Experience[] = [
     techStack: ['AWS', 'Docker', 'ECS', 'Scala', 'Scala-Spark', 'Java', 'Python', 'PySpark', 'MySQL', 'Postgres', 'MongoDB'],
   },
   {
-    company: 'Goldman Sachs',
-    role: 'Analyst - Global Markets Division',
+    company: 'Zilingo',
+    role: 'SDE-II',
     location: 'Bangalore',
     period: 'July 2019 - July 2021',
     highlights: [
-      'Led migration of legacy monolith to micro-service architecture with CI/CD.',
+      'Writing core libraries: pagination in UI interfaces, password authentication across all login micro-services.',
       'Solved business problems including duplicate trade data prevention, rebates and commission calculation.',
     ],
-    techStack: ['Java', 'MySQL', 'Postgres'],
+    techStack: ['Java', 'Scala', 'MySQL', 'Postgres'],
   },
 ];
 
@@ -188,7 +198,7 @@ export const BOOT_MESSAGES = [
   '[    0.896201] Loading portfolio modules...',
   '[    1.024223] [portfolio] experience.ko loaded — 6+ years indexed',
   '[    1.152245] [portfolio] skills.ko loaded — 25 technologies catalogued',
-  '[    1.280267] [portfolio] projects.ko loaded — 4 repositories synced',
+  '[    1.280267] [portfolio] projects.ko loaded — 5 repositories synced',
   '[    1.408289] [portfolio] certifications.ko loaded — Security+ | CEH | Network+',
   '[    1.536312] Initializing display manager...',
   '[    1.664334] Starting GDM (GNOME Display Manager)...',
@@ -221,13 +231,13 @@ export const NEOFETCH_PLAIN = [
   { art: '    :KKxddxkkkxxdddx0:  ', info: 'Host:     Bangalore, India' },
   { art: '   dKxddO0OOO00Okxddx0; ', info: 'Kernel:   IIT Roorkee B.Tech' },
   { art: '  dXxddO0KKK00OOOkxddOK ', info: 'Uptime:   6+ years in industry' },
-  { art: '  OXkxxO0KXXKK00Okxdx0X;', info: 'Role:     Full Stack Dev @ Quizizz' },
+  { art: '  OXkxxO0KXXKK00Okxdx0X;', info: 'Role:     Assoc. Tech Architect @ Hilabs' },
   { art: '  kXOxxk0KXXXXK0OkxxOKX:', info: 'DE:       Node.js + Go + Python' },
   { art: '  ;KX0kxkO0KKK0OkkO0KXK ', info: 'WM:       AWS + Docker + ECS' },
   { art: '   lKXK0kxxkkkkxk0KXKx  ', info: 'Theme:    Kali-Dark [GTK3]' },
   { art: '    :0XXKK00000KKXXKl   ', info: 'Terminal: react-portfolio v1.0' },
   { art: '      lkKXXXXXXXKkl     ', info: 'Shell:    bash 5.2.15' },
-  { art: '        ,;;::;;,.       ', info: 'CPU:      Goldman|MindTickle|Photon|Quizizz' },
+  { art: '        ,;;::;;,.       ', info: 'CPU:      Zilingo|MindTickle|Photon|Quizizz|Hilabs' },
   { art: '                        ', info: 'GPU:      React + Angular + TypeScript' },
   { art: '                        ', info: 'Memory:   MongoDB | Postgres | MySQL' },
 ];

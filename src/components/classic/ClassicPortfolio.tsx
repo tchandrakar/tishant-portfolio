@@ -174,9 +174,8 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
           </p>
           <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
             <a
-              href={PROFILE.linkedin}
-              target="_blank"
-              rel="noopener noreferrer"
+              href={PROFILE.resumeUrl}
+              download="Tishant_Chandrakar_CV.pdf"
               className="px-6 py-2.5 bg-amber-500 hover:bg-amber-400 text-black font-medium rounded-lg text-sm transition-colors flex items-center gap-2"
             >
               <Download className="w-4 h-4" /> Resume
@@ -259,7 +258,7 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
                 </div>
                 <div className="flex items-center gap-3 text-sm">
                   <Briefcase className="w-4 h-4 text-amber-400" />
-                  <span className="text-gray-400">Currently at Quizizz, Bangalore</span>
+                  <span className="text-gray-400">Currently at Hilabs, Bangalore</span>
                 </div>
                 <div className="flex items-center gap-3 text-sm">
                   <Award className="w-4 h-4 text-amber-400" />
