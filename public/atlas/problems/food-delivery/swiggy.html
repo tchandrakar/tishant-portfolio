@@ -1,0 +1,136 @@
+<h1>Design Swiggy (food delivery in India: dispatch + routing)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">food-delivery</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">maps-location</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build Swiggy: a 3-sided marketplace connecting hungry customers, restaurant partners, and a fleet of delivery executives ("DEs") across 500+ Indian cities. The system must surface nearby restaurants, accept orders, route them to the kitchen, dispatch a DE within 60s of food being ready, and stream live ETA to the customer. India-specific constraints dominate: dense pin codes, dark alleys without GPS, 2G fallback, COD payments, monsoon outages, and a peak dinner rush at 8 PM IST that spikes 6x baseline.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Discover restaurants within a delivery radius (typ. 5 km), filter by cuisine, ETA, rating.</li>
+  <li>Place order with item-level customisations, apply coupons, pay via UPI/card/COD.</li>
+  <li>Restaurant partner accepts/rejects within 90s; kitchen prep timer starts.</li>
+  <li>Dispatch engine assigns the best DE; courier tracks pickup → drop with live map.</li>
+  <li>Real-time ETA with re-estimation every 10s based on traffic + DE location.</li>
+  <li>Ratings, refunds, in-app chat between customer ↔ DE.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> home feed p99 &lt; 400 ms; ETA push &lt; 2 s end-to-end.</li>
+  <li><b>Scale:</b> 50 M MAU, 6 M orders/day, 500 K concurrent DEs, 250 K active restaurants.</li>
+  <li><b>Availability:</b> 99.95% for order path; dispatch must degrade gracefully on map outages.</li>
+  <li><b>Consistency:</b> strong for payment, eventual for feed/listings.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 6 M orders/day → 70 avg, 420 peak (dinner). Browse traffic ~50x → 21 K peak QPS.</li>
+  <li>Storage: order row ~2 KB → 12 GB/day; 5 yr retention ~22 TB. Geo-pings 1/sec/DE → 500 K ev/s.</li>
+  <li>Bandwidth: live tracking 200 B/ping × 500 K DEs = 100 MB/s outbound to customers (fanout 1:1).</li>
+  <li>Cache: top-1000 restaurants per city in Redis ~5 GB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/feed?lat=&amp;lng=&amp;cuisine=          → list[restaurant]
+POST  /v1/cart                                {items[], couponId}    → cartId, total
+POST  /v1/orders                              {cartId, addrId, payMode} → orderId, etaSec
+GET   /v1/orders/{id}/track                   (SSE/WebSocket)        → {state, deLat, deLng, eta}
+POST  /v1/partner/accept   {orderId, prepMin}                         → ok
+POST  /v1/de/location      {deId, lat, lng, ts}                       → ack</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App] → [Edge LB] → [API GW] ─┬─→ [Feed Svc] ← [ES + Redis] ← [Restaurant Svc]
+                              ├─→ [Cart Svc]
+                              ├─→ [Order Svc] → [Postgres (orders)] → [Kafka: order.events]
+                              ├─→ [Payment Svc] → [PSP: Razorpay/UPI]
+                              └─→ [Track Svc] ← WS gateway
+
+[Kafka] → [Dispatch Engine] → [Assignment Store: Redis]
+                ↓
+        [Routing/ETA Svc] ← [OSRM/Google Maps]
+                ↑
+[DE App] → [Geo Ingest] → [Kafka: de.pings] → [Geohash Index in Redis]
+</div>
+<p>Order is the source of truth in Postgres; events fan out via Kafka to dispatch, notifications, analytics. DE pings flow into a geohash-bucketed Redis index used for nearest-DE lookup.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Orders (Postgres, sharded by city_id)</h3>
+<pre>CREATE TABLE orders (
+  order_id   bigint PRIMARY KEY,
+  cust_id    bigint, rest_id bigint, de_id bigint,
+  city_id    int, state text, total_paise int,
+  created_at timestamptz, eta_at timestamptz
+);
+CREATE INDEX ix_orders_cust ON orders(cust_id, created_at DESC);</pre>
+<h3>7.2 DE locations (Redis GEO + Cassandra archive)</h3>
+<p>Live state in Redis <code>GEOADD</code> per city geohash bucket; durable trail in Cassandra (<code>partition: de_id+date</code>) for payouts and disputes.</p>
+<h3>7.3 Why Postgres for orders?</h3>
+<p>ACID is non-negotiable for money + inventory holds. Per-city sharding keeps a hot Bengaluru shard isolated from Patna. See DDIA Ch. 6.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Dispatch engine</h3>
+<p>Every 5s, batched matching: take pending orders in a city, candidate DEs within 2 km via Redis <code>GEOSEARCH</code>, score by <code>dist + load + acceptanceRate − idleTime</code>. Solved as a min-cost bipartite matching (Hungarian, capped at 200 orders × 500 DEs per tick). Falls back to greedy if &gt;500 ms.</p>
+<h3>8.2 ETA service</h3>
+<p>Two-stage: OSRM gives base travel time on Indian OSM graph; an XGBoost model adds a residual using time-of-day, weather, restaurant prep variance. p50 error target: ±3 min.</p>
+<h3>8.3 Live tracking</h3>
+<p>WebSocket gateway with sticky sessions; DE app pushes 1 ping/sec, server publishes to <code>order:{id}</code> channel; customer sub fans out via Redis pub/sub. On drop, SSE fallback.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Dinner spike:</b> pre-warm 2x dispatch workers at 7:30 PM via cron-driven HPA.</li>
+  <li><b>Hot restaurant:</b> token-bucket queue per <code>rest_id</code> protects POS integrations.</li>
+  <li><b>Geo hotspot (Koramangala):</b> sub-shard the geohash by 1-level finer grid at runtime.</li>
+  <li><b>2G/flaky network:</b> protobuf payloads, last-known-position client cache, exponential reconnect.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Batched dispatch every 5s</td><td>Globally optimal matches, reduces overlap</td><td>Up to 5s extra latency for the customer</td></tr>
+<tr><td>Redis GEO for live state</td><td>Sub-ms nearest-N queries</td><td>RAM bound; lose data on failover</td></tr>
+<tr><td>Postgres sharded by city</td><td>Strong consistency, predictable shards</td><td>Cross-city analytics needs ETL</td></tr>
+<tr><td>WebSocket for tracking</td><td>2s push latency</td><td>Connection state at gateway</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — city-sharded Postgres and geohash-bucketed Redis.</li>
+  <li>Ch. 7 Transactions — payment + order-state machine needs serialisable snapshots.</li>
+  <li>Ch. 11 Stream Processing — Kafka-backed order.events drives dispatch and analytics.</li>
+  <li>Ch. 12 Future of Data Systems — derived data: ETA model trained on Cassandra trails.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start single-region (Mumbai DC) with city-shards, then add a Hyderabad DR site replicating Postgres via logical decoding."</li>
+  <li>"Hardest part is dispatch under partial information — a DE may reject; I model it as a Markov decision process and re-solve every 5s."</li>
+  <li>"For 2G users I trade richness for resilience: cached menus, tiny protobuf, optimistic local UI."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>PostgreSQL (city-sharded)</td><td>Money + order state needs ACID and serialisable snapshots; 6 M orders/day at 12 GB/day fits comfortably per-shard. Per-city sharding keeps a hot Bengaluru shard isolated so a Patna outage cannot cascade and dinner-rush 420 peak QPS lands locally.</td><td>MySQL (less rich constraint support); Cassandra (no ACID for payments); CockroachDB (higher write latency, costlier for single-region India).</td></tr>
+<tr><td>Redis GEO (geohash buckets)</td><td>Sub-ms <code>GEOSEARCH</code> for 500 K active DEs in 2 km radius drives the every-5s dispatch tick; 500 K pings/s at ~200 B fits in RAM and lets dispatch produce assignments inside the 60s ready-to-dispatch SLA.</td><td>PostGIS (slower under 500 K writes/s); MongoDB geo (less predictable p99); ScyllaDB (overkill for ephemeral state).</td></tr>
+<tr><td>Apache Kafka</td><td>Single source of truth for order.events and de.pings; 500 K events/s ingest with replay lets dispatch, notifications, and analytics fan out independently. Replay is critical when re-running the dinner-rush window for ML training.</td><td>RabbitMQ (no replay, weaker fan-out); AWS Kinesis (vendor lock; cost at 500 K/s); Pulsar (smaller community in India ecosystem).</td></tr>
+<tr><td>Cassandra (DE trail archive)</td><td>Per-DE per-day partition absorbs 1 ping/s × 500 K DEs = 43 B pings/day cheaply for payouts and disputes. Time-ordered reads dominate ad-hoc queries here, and writes never block dispatch.</td><td>S3 + Parquet (slow point-lookups for disputes); HBase (heavier ops); ScyllaDB (good fit but smaller ecosystem).</td></tr>
+<tr><td>Elasticsearch (feed/listings)</td><td>Combines geo_point distance filter with text relevance over 250 K active restaurants; supports the 21 K peak browse QPS with replicas, and aggregations power cuisine/ETA facets.</td><td>Solr (older tooling); pgvector (single-stage only); Vespa (smaller in-house expertise).</td></tr>
+<tr><td>OSRM (self-hosted)</td><td>India-specific OSM graph keeps drive-time queries at $0 marginal cost; needed because Google Maps at 500 K DE re-routings/day plus customer ETA refresh every 10s would cost millions monthly. Sub-50ms responses.</td><td>Google Directions API (cost-prohibitive at scale); Mapbox (still per-request billing); Valhalla (less mature India tooling).</td></tr>
+<tr><td>XGBoost ETA residual</td><td>OSRM gives free-flow time; gradient boosting layers in time-of-day, monsoon weather, restaurant prep variance to hit ±3 min p50 — critical because every minute of ETA error costs ~₹5 in refund liability across 6 M orders.</td><td>Linear regression (under-fits non-linear traffic); deep nets (overkill, slower inference); pure heuristics (worse error).</td></tr>
+<tr><td>WebSocket gateway (sticky)</td><td>2 s push latency for live tracking with 1 ping/sec from 500 K DEs fanning out to 500 K customers; sticky sessions keep state local so each pod handles ~100 K conns within RAM budget.</td><td>SSE (one-way only — needed bi-directional for client status); Long-poll (3-5x server load); MQTT (extra broker hop for the 100 MB/s fan-out).</td></tr>
+<tr><td>Hungarian / min-cost matching</td><td>200 orders × 500 DEs per tick yields globally optimal assignments vs greedy; trade-off acceptable because the 5s batching window is well below the 60s dispatch SLA, and overlap reduction saves DE idle time.</td><td>Greedy nearest (5-10% worse efficiency, used as fallback); LP relaxation (heavier, marginal gains); MILP (200ms timeout often violated).</td></tr>
+<tr><td>Razorpay PSP + UPI</td><td>UPI dominates Indian payments (≥65% of orders); native integration handles COD reconciliation, refund flows, and 99.95% checkout availability. Idempotency keys prevent double-charge on retry under 2G drops.</td><td>Stripe (poor UPI support); PayU (less reliable webhooks); building in-house (regulatory burden).</td></tr>
+<tr><td>Protocol Buffers</td><td>200 B/ping × 500 K DEs = 100 MB/s outbound; protobuf shaves ~70% off JSON, critical on 2G where each byte costs latency. Schema discipline also catches breaking changes for the mobile fleet.</td><td>JSON (3-4x bigger payloads); FlatBuffers (less mature ecosystem); MessagePack (no schema evolution story).</td></tr>
+<tr><td>Kubernetes + HPA cron pre-warm</td><td>Dinner spike at 8 PM IST is 6x baseline; cron-driven HPA pre-scales dispatch workers at 7:30 PM so the first batched solve at 8:00 doesn't queue. Reactive HPA alone reacts too slowly for the 6x ramp inside 30 minutes.</td><td>EC2 Auto Scaling (slower with custom AMIs); Nomad (smaller ecosystem); manual scaling (operationally fragile).</td></tr>
+</tbody>
+</table>
+

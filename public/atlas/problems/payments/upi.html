@@ -1,0 +1,205 @@
+<h1>Design UPI (unified payments interface, NPCI-style)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the switch behind India's UPI: a real-time interbank rail where any payer at Bank A can push money to any payee at Bank B using a virtual address (<code>vyom@okhdfcbank</code>) in under 3 seconds, 24×7, with bank-grade settlement. NPCI sits in the middle as a switch + directory + dispute resolver. UPI does ~10 B transactions/month (2025) — roughly 4 K TPS average, 12–15 K TPS peak.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>VPA registration &amp; resolution: map <code>handle@bank</code> → account number + IFSC.</li>
+  <li>Pay (push): payer-initiated transfer with PIN auth on payer's device.</li>
+  <li>Collect (pull): payee requests money; payer approves on their app.</li>
+  <li>Auto-pay mandates (recurring); QR static + dynamic; UPI Lite (offline small-value).</li>
+  <li>Dispute &amp; reversal flow within T+1.</li>
+  <li>End-to-end E2EE PIN block; H2H links to every member bank.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 &lt; 3 s end-to-end; switch internal &lt; 200 ms.</li>
+  <li><b>Scale:</b> 10 B txns/month; peak 15 K TPS; 350 M+ users; 600+ member banks.</li>
+  <li><b>Availability:</b> 99.99%; member banks may flap, switch must not.</li>
+  <li><b>Correctness:</b> debit &amp; credit are atomic across two independent banks; no money in flight after reconciliation.</li>
+  <li><b>Settlement:</b> deferred net settlement (DNS) at RBI 4× daily.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Peak 15 K TPS × 5 messages (req, debit, credit, ack, settle) ≈ 75 K msgs/s through the switch.</li>
+  <li>Storage: 10 B txns/month × 12 × 1 KB × 7 yr retention ≈ 850 TB raw, 2.5 PB replicated.</li>
+  <li>VPA directory: 350 M VPAs × 256 B = 90 GB; lookups ~30 K QPS, &lt; 20 ms p99 (Redis + Postgres).</li>
+  <li>Net settlement file: 600 banks × pairwise nets = ~360 K position rows × 4 cycles/day.</li>
+</ul>
+
+<h2>5. API design (ISO 20022-ish)</h2>
+<pre>POST /upi/v1/pay             {payerVPA, payeeVPA, amount, currency=INR,
+                              orderRef, deviceFP, pinBlock, idempotencyKey}
+                             → {rrn, status: SUCCESS|PENDING|FAILED, errCode}
+POST /upi/v1/collect         {payerVPA, payeeVPA, amount, expiresIn}
+GET  /upi/v1/resolve/{vpa}   → {accountHash, ifsc, name, active}
+POST /upi/v1/reversal        {originalRRN, reason}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">  [Payer App]                                            [Payee App]
+       │                                                       ▲
+       ▼  (TLS, signed PIN block)                              │
+  [Payer PSP] ──► [NPCI Switch] ◄────── [Payee PSP]            │
+       │              │                       │                │
+       │   ┌──────────┼───────────┐           │                │
+       │   ▼          ▼           ▼           │                │
+       │ [VPA Dir] [Risk] [Idempotency Store] │                │
+       │              │                       │                │
+       ▼              ▼                       ▼                │
+  [Payer Bank] ─── debit ───►[Switch]─── credit ──►[Payee Bank]┘
+   (Core CBS)                                          (Core CBS)
+                                  │
+                                  ▼
+                         [Settlement Engine]
+                         (4× daily DNS at RBI)
+</div>
+<p>Each leg (debit, credit) is a synchronous H2H call with strict 30-second timeout. The switch is the <b>orchestrator + system of record</b> for the txn lifecycle; banks are participants.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Transaction journal (Postgres, sharded by RRN prefix)</h3>
+<pre>CREATE TABLE upi_txn (
+  rrn          CHAR(12) PRIMARY KEY,         -- retrieval ref number
+  payer_vpa    TEXT, payee_vpa TEXT,
+  amount       NUMERIC(15,2),
+  state        SMALLINT,  -- INIT, DEBITED, CREDITED, CLOSED, REVERSED
+  payer_bank   CHAR(11), payee_bank CHAR(11),
+  created_at   TIMESTAMPTZ,
+  closed_at    TIMESTAMPTZ,
+  idem_key     TEXT UNIQUE
+);
+CREATE INDEX ix_state_time ON upi_txn(state, created_at) WHERE state &lt; 3;</pre>
+<h3>7.2 Why Postgres for the journal?</h3>
+<p>The state machine needs <b>serializable updates</b>: a debit ack and a timeout reversal must not both run. SSI (DDIA Ch.7) makes the predicate "no other writer for this rrn" cheap. CockroachDB / Spanner-style if multi-region active-active is needed.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 The two-leg saga</h3>
+<p>UPI is fundamentally a saga because the payer bank and payee bank are independent systems we can't 2PC-lock. Sequence:</p>
+<pre>1. NPCI receives PAY → write INIT row (idem-keyed)
+2. Call payer bank: DEBIT (synchronous, 7 s budget)
+   - on SUCCESS: state=DEBITED
+   - on TIMEOUT/UNKNOWN: state=DEBITED_PENDING, reconcile via batch
+3. Call payee bank: CREDIT (synchronous, 7 s budget)
+   - on SUCCESS: state=CREDITED → emit ack to payer
+   - on FAILURE: enqueue COMPENSATING_REVERSAL → re-credit payer bank
+4. Final state CLOSED only after credit ack (or reversal ack)</pre>
+
+<h3>8.2 Idempotency &amp; replay safety</h3>
+<p>Every request carries (deviceFP, txnId). The switch enforces a unique constraint on (payer_psp, txnId). Bank-side, the debit message carries the RRN; banks must dedupe by RRN. This is the ONLY way to get exactly-once-ish semantics on a non-2PC rail (DDIA Ch.7 idempotent operations).</p>
+
+<h3>8.3 Settlement</h3>
+<p>The switch journal is the source of truth. Every CLOSED txn flows to the settlement engine, which nets per-bank-pair amounts. At T+0 4× a day, NPCI posts net positions to RBI's RTGS for inter-bank settlement. Reconciliation files (raw tape) are exchanged with each bank within 30 minutes of cycle close.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Slow bank drags the switch:</b> per-bank circuit breaker + bulkhead thread pools so HDFC's flap doesn't starve SBI traffic.</li>
+  <li><b>Hot VPA directory:</b> Redis cluster with read-replicas; LRU + 60s TTL; cold-path Postgres.</li>
+  <li><b>Festival peaks (Diwali, IPL):</b> autoscale stateless app tier; pre-shard journal partitions; throttle non-essential collects to protect pay traffic.</li>
+  <li><b>Reversal storm:</b> if a bank is down post-debit, queued reversals can stampede on recovery — token-bucket per bank.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Saga (no 2PC)</td><td>Banks stay autonomous; rail scales</td><td>Reversal/UNKNOWN is real and complex</td></tr>
+<tr><td>Deferred net settlement</td><td>10× fewer RBI postings</td><td>Switch carries credit risk for ~6 h</td></tr>
+<tr><td>Synchronous debit-then-credit</td><td>Matches user UX of "instant"</td><td>Latency is bounded by slowest bank</td></tr>
+<tr><td>VPA decoupled from account</td><td>Privacy; portability</td><td>Directory becomes a hot dependency</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 7 Transactions</b> — UPI is the textbook case for "sagas instead of distributed transactions"; idempotency keys, single-object atomic state transitions, and SSI on the txn journal are all directly applicable.</li>
+  <li><b>Ch. 7 Transactions</b> — the "what does it mean to fail?" discussion: UNKNOWN state after a network timeout is a first-class concept here, not an edge case.</li>
+  <li><b>Ch. 9 Consensus</b> — total order broadcast for settlement file generation; Raft for switch-leader election per shard so reversals aren't double-fired.</li>
+  <li><b>Ch. 9 Consensus</b> — linearizable VPA-resolve reads (a stale VPA → wrong account = financial loss).</li>
+  <li><b>Ch. 11 Stream Processing</b> — Kafka journal for downstream analytics, fraud, and dispute systems.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"UPI's brilliance is the indirection: VPA decouples identity from account, so the switch can be agnostic of CBS schemas."</li>
+  <li>"The hardest engineering problem is not throughput; it's the UNKNOWN state — a debited-but-not-credited txn — and the reconciliation discipline that closes it."</li>
+  <li>"I'd never pretend this is exactly-once; it's at-least-once with bank-side dedup by RRN, and we sleep at night because of the daily recon file."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Postgres (SSI) — txn journal</td>
+      <td>15 K TPS peak × 5 state messages each = 75 K msg/s on the journal. SSI (DDIA Ch.7) prevents the race where a debit-ack and a timeout-reversal both fire on the same RRN — write skew is not theoretical here, it would cause double reversals on flaky bank links.</td>
+      <td>MySQL (no proper SSI); CockroachDB (kept on the table for active-active multi-region v2).</td>
+    </tr>
+    <tr>
+      <td>Spanner / CockroachDB — multi-region option</td>
+      <td>NPCI's switch is single-region today, but if we ever go active-active across Mumbai &amp; Hyderabad, we need TrueTime/HLC-style external consistency for RRN ordering (DDIA Ch.9). 600+ banks pinging both DCs would race without it.</td>
+      <td>Postgres logical replication (asymmetric writes hard); MySQL Group Replication (eventual consistency on conflicts).</td>
+    </tr>
+    <tr>
+      <td>Cassandra — explicitly rejected for journal</td>
+      <td>The journal's state machine (INIT → DEBITED → CREDITED → CLOSED) needs CAS on the rrn row that is guaranteed not to lose a write. Cassandra's LWW would silently overwrite a CREDITED back to DEBITED on a clock skew — unacceptable. Used only for downstream analytics dump.</td>
+      <td>n/a — this is the rejection.</td>
+    </tr>
+    <tr>
+      <td>Kafka — downstream events &amp; recon</td>
+      <td>Every CLOSED txn fans out to fraud, dispute, settlement, analytics. 75 K msg/s peak × 7-day retention = ~45 TB; Kafka's per-partition ordering preserves RRN sequence so settlement nets correctly (DDIA Ch.11).</td>
+      <td>RabbitMQ (no replay window, weak ordering at scale); Pulsar (less ops familiarity in NPCI's stack).</td>
+    </tr>
+    <tr>
+      <td>Flink — fraud / velocity features</td>
+      <td>Velocity rules ("&gt;5 transfers from same VPA in 60s") need windowed stateful aggregations at 15 K TPS. Flink's checkpointed RocksDB state (DDIA Ch.11) survives switch failover without losing in-flight windows; latency budget for fraud is &lt; 200 ms.</td>
+      <td>Kafka Streams (state limits); Spark Streaming (micro-batch latency too high for inline).</td>
+    </tr>
+    <tr>
+      <td>Redis — VPA directory cache</td>
+      <td>30 K QPS resolves with &lt; 20 ms p99 budget; 350 M VPAs × 256 B = 90 GB easily fits a Redis cluster. LRU + 60 s TTL absorbs the festival-peak burst when everyone is collecting payments simultaneously.</td>
+      <td>Memcached (no replication, lossy on failover); local cache (no consistency across switch nodes).</td>
+    </tr>
+    <tr>
+      <td>Saga (two-leg debit/credit)</td>
+      <td>Payer Bank A and Payee Bank B are independently regulated CBS systems — we cannot 2PC-lock across them. Saga with explicit DEBITED_PENDING / COMPENSATING_REVERSAL states is the only correct shape (DDIA Ch.9: 2PC fails when participants are autonomous orgs).</td>
+      <td>Distributed 2PC (XA) — politically and technically impossible across banks; Synchronous mirroring (banks would never sign off).</td>
+    </tr>
+    <tr>
+      <td>2PC — explicitly rejected</td>
+      <td>2PC across 600+ banks would mean every bank's CBS holds locks waiting on every other; one bank's GC pause stalls the rail. Saga + bank-side dedup by RRN is the practical at-least-once contract NPCI actually runs on.</td>
+      <td>Saga (chosen); per-pair clearing house (operational nightmare).</td>
+    </tr>
+    <tr>
+      <td>Idempotency keys — (payer_psp, txnId)</td>
+      <td>The switch enforces a UNIQUE constraint on (payer_psp, txnId); banks dedupe by RRN. This is the ONLY mechanism that prevents double-debit when a payer app retries after a timeout (DDIA Ch.7: "exactly-once = at-least-once + idempotent").</td>
+      <td>Switch-only dedup (banks would still double-debit); Bank-only dedup (switch would re-issue conflicting RRNs).</td>
+    </tr>
+    <tr>
+      <td>Double-entry settlement journal</td>
+      <td>Net settlement at RBI requires bank-pair positions that always sum to zero across the system; double-entry on the switch journal makes net = sum(credits) − sum(debits) per bank pair, mathematically reconcilable against bank tape files.</td>
+      <td>Single-sided ledger (cannot prove conservation across bank boundaries during recon).</td>
+    </tr>
+    <tr>
+      <td>Raft (etcd) — switch shard leader</td>
+      <td>Each journal shard has a Raft-elected leader so reversals aren't double-fired during failover (DDIA Ch.9). 5 s lease, 200 ms internal SLA easily covered.</td>
+      <td>ZooKeeper (older, heavier); database-led election (slower failover).</td>
+    </tr>
+    <tr>
+      <td>Per-bank circuit breaker / bulkhead</td>
+      <td>15 K TPS comes from 600 banks unevenly; if HDFC's link goes flap, its requests must not consume thread-pools meant for SBI. Bulkhead pattern + token-bucket per bank stops the failure from cascading switch-wide.</td>
+      <td>Global queue (one bad bank starves all); naive timeout (head-of-line blocking).</td>
+    </tr>
+    <tr>
+      <td>Reconciliation files (T+0 4× daily)</td>
+      <td>UNKNOWN states (debited but no credit-ack) are the dominant correctness risk on UPI. The recon file (raw tape from each bank) is compared against the journal within 30 min of cycle close — closes the gap that no inline mechanism can.</td>
+      <td>Pure inline reconciliation (impossible — bank CBS state isn't fully visible in real-time).</td>
+    </tr>
+  </tbody>
+</table>

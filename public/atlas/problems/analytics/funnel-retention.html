@@ -1,0 +1,204 @@
+<h1>Design Funnel &amp; Retention Analytics (sessionization at scale)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">analytics</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the analytical engine that powers product-team questions: "what % of users who started checkout finished within 30 minutes?", "what's the D7 retention of users acquired via TikTok in March?", "where do users drop off in the onboarding flow?". The substrate is a stream of user events (10B/day); the output is interactive funnel and retention queries that must run in seconds. The crux is <b>sessionization at scale</b> &mdash; grouping unbounded events into per-user sequences efficiently.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Funnel queries: ordered N-step conversion within a user-supplied window.</li>
+  <li>Retention queries: weekly/daily cohorts vs. an "active" event.</li>
+  <li>Segmentation: filter cohorts by user properties or first-event properties.</li>
+  <li>Sessionization: derive sessions (30-min inactivity gap) used by both funnel and retention.</li>
+  <li>Backfill: re-run historical computations after a definition change.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 10B events/day, 500M MAU, 50M DAU.</li>
+  <li><b>Query p95:</b> &lt; 5 s for a 90-day funnel over 100M-user cohort.</li>
+  <li><b>Freshness:</b> within 5 min for "today" queries; full daily snapshot by 02:00 local.</li>
+  <li><b>Backfill SLA:</b> 1 year of history reprocessable in &lt; 24 h.</li>
+  <li><b>Reproducibility:</b> same query &rarr; same number bit-for-bit.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>10e9 events/day * 1 KB = <b>10 TB/day</b>; 3.6 PB/yr after 3&times; Parquet compression &asymp; 1.2 PB.</li>
+  <li>Sessions/day: 50M DAU * 3 sessions = 150M; avg 30 events/session.</li>
+  <li>Per-user state for streaming sessionization: 50M active * 1 KB = 50 GB Flink RocksDB.</li>
+  <li>Cohort bitmaps: 500M users * 1 bit * 365 days = ~22 GB Roaring (post-compression).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /q/funnel
+{ steps:[{event:"view_landing"},{event:"signup"},{event:"first_purchase"}],
+  window:"7d", segment:{country:"US"}, from:"2026-04-01", to:"2026-05-01" }
+&rarr; { steps:[{count:8.4M, conv:1.0},{count:1.2M, conv:0.143}, ...], by_step_drop_reasons:[...] }
+
+POST /q/retention
+{ acquired_event:"signup", returning_event:"any_active",
+  cohorts:"weekly", from:"2026-01-01", periods:12 }
+&rarr; matrix [cohort][period_offset] = retained_count
+</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[events.clean Kafka] ----+
+                          |
+                          v
+                  [Flink Sessionizer]              <-- streaming, 30m gap
+                  key_by(user_id)                  RocksDB state
+                  window(EventTimeSession)
+                          |
+                          v
+              [sessions.stream Kafka topic]
+                          |
+        +-----------------+--------------------+
+        v                                      v
+  [Hot Cube (ClickHouse)]                 [S3 Parquet lake]
+  partitioned by (project, dt)            sessions / events history
+  ORDER BY (user_id, ts)                          |
+        ^                                          v
+        |                                  [Spark batch sessionizer]   (DDIA Ch. 10)
+        |                                  rebuilds full history nightly
+        +------- bulk load (compaction) ----------+
+                          |
+                  [Query Planner / API]
+</div>
+<p>Two cooperating sessionizers: a <b>streaming</b> Flink job for fresh data and a <b>batch</b> Spark job that re-derives sessions deterministically from raw events nightly. Queries hit the streaming-built hot tier for "now", the batch-built lake for everything else, and the planner unions results when a window crosses the boundary &mdash; the lambda-architecture trade-off discussed in DDIA Ch. 11.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Sessions table</h3>
+<pre>CREATE TABLE sessions (
+  project_id   UInt32,
+  dt           Date,
+  user_id      String,
+  session_id   UUID,
+  start_ts     DateTime64(3),
+  end_ts       DateTime64(3),
+  events       Array(Tuple(name LowCardinality(String), ts DateTime64(3), props Map(String,String))),
+  acq_channel  LowCardinality(String),
+  device       LowCardinality(String)
+) ENGINE=MergeTree
+PARTITION BY (project_id, toYYYYMM(dt))
+ORDER BY    (project_id, user_id, start_ts);</pre>
+<h3>7.2 Cohort bitmaps</h3>
+<pre>active_bitmap (project, day)  -&gt;  RoaringBitmap of user_id_hash
+funnel_step    (project, funnel_def_hash, day, step) -&gt; RoaringBitmap</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Sessionization (the hard part)</h3>
+<p>Stream sessionization keys events by <code>user_id</code> and uses an event-time session window with 30-min gap (DDIA Ch. 11). Two real-world headaches: (a) <b>late events</b> &mdash; mobile reconnects after 7 days &mdash; handled by allowed-lateness + side-output for "session corrections"; (b) <b>state size</b> &mdash; 50M active users in RocksDB; we TTL state at 7 days.</p>
+<h3>8.2 Funnel evaluator</h3>
+<p>Given <code>steps[A, B, C]</code> and window W: walk a user's events in time order, advance a step pointer when matching, reset on window expiry. Emit <code>(user, max_step_reached)</code>. Aggregating gives the funnel. This is O(events_per_user) and parallel across users; the clustered <code>(user_id, ts)</code> sort key makes it a sequential scan.</p>
+<h3>8.3 Retention via bitmaps</h3>
+<p>Cohort C = users whose first <code>signup</code> was in week W. Retention[C][k] = popcount(C  AND  active_bitmap[W+k]). Whole 12-week retention matrix for a 100M-user cohort runs in &lt; 1 s using RoaringBitmap intersections (millions of ops/sec).</p>
+<h3>8.4 Backfill / replay</h3>
+<p>Sessionization logic and cohort definitions live in versioned config. A backfill spins a Spark job over the immutable Parquet lake (DDIA Ch. 10 batch over immutable inputs) producing a new <code>sessions_v{n}</code> table swapped atomically; queries pin to the version to keep history reproducible.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Skewed users:</b> bots/test accounts with 1M events/day blow up Flink state &mdash; cap per-user events/session, isolate via salted secondary key.</li>
+  <li><b>Definition churn:</b> when a PM changes the funnel definition, naive recompute is expensive; we precompute step-bitmaps daily and intersect at query time.</li>
+  <li><b>Hot project:</b> one huge customer dominates the cluster; we isolate them onto a dedicated ClickHouse shard.</li>
+  <li><b>Stream/batch reconciliation:</b> if streaming and batch disagree on a day, batch wins; planner serves batch from the day boundary.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Lambda (stream + batch)</td><td>Fresh + reproducible</td><td>Two pipelines to maintain</td></tr>
+<tr><td>Pure Kappa (stream only)</td><td>One pipeline</td><td>Backfill = full reprocessing of stream; complex</td></tr>
+<tr><td>RoaringBitmap retention</td><td>Sub-second matrix</td><td>Pre-compute + storage cost</td></tr>
+<tr><td>ORDER BY (user_id, ts)</td><td>Funnel = local scan</td><td>Worse for time-range queries</td></tr>
+<tr><td>Versioned definitions</td><td>Reproducible history</td><td>Storage doubles transiently</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 11 Stream Processing</b> &mdash; sessionization is the canonical example; event-time vs. processing-time, watermarks, allowed lateness, side outputs for corrections; "stream as source of truth, materialized views for queries" describes the ClickHouse hot cube.</li>
+  <li><b>Ch. 10 Batch Processing</b> &mdash; nightly Spark sessionizer over immutable Parquet is the textbook MapReduce shuffle-by-key; backfills and definition migrations are batch-on-immutable-input. Lambda vs. Kappa debate sits across Ch. 10/11.</li>
+  <li><b>Ch. 3 Storage &amp; Retrieval</b> &mdash; clustered sort key (user_id, ts) is the column-store equivalent of a B-tree clustered index; Roaring is a compressed bitmap index.</li>
+  <li><b>Ch. 12 Future of Data Systems</b> &mdash; "unbundling the database" is exactly what we're doing: Kafka = log, Flink = derived stream, ClickHouse = materialized view, S3 = archive.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Sessionization is the foundation: get it right and funnel/retention are cheap derivations on top."</li>
+  <li>"I'd run lambda not because I love operating two systems but because product analysts demand reproducible numbers across definition changes &mdash; that needs batch-on-immutable-input."</li>
+  <li>"Bitmaps over user-IDs turn retention from an O(N&times;M) join into O(N) popcount &mdash; that's the trick that makes the UI feel instant."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>RoaringBitmap over user_ids per (event, day)</td>
+      <td>An N&times;M retention grid (e.g., 30 cohorts &times; 90 return-days) over 50M users would be a 4 TB JOIN; bitmaps store each set in ~6 MB and intersect via popcount in &lt;5 ms. This is the trick that turns retention from O(N&times;M) to O(N) and makes the UI feel instant.</td>
+      <td>SQL JOIN on user_id (timeouts at 50M users); HyperLogLog (no exact intersection)</td>
+    </tr>
+    <tr>
+      <td>ClickHouse for ad-hoc funnel/cohort queries</td>
+      <td>Analysts iterate on funnel definitions interactively; each redefinition triggers a fresh scan of 50B events. ClickHouse's vectorized aggregates and <code>windowFunnel()</code> primitive return 7-step funnels in &lt;3 s on a year of data; a row store would take 10+ minutes.</td>
+      <td>Postgres (row store, OOM); BigQuery (good alt, $10/TB scan cost adds up); Druid (weak JOIN)</td>
+    </tr>
+    <tr>
+      <td>Lambda architecture (Spark batch + Flink streaming)</td>
+      <td>Product analysts demand reproducible numbers across funnel-definition changes &mdash; that needs batch-on-immutable-input. Streaming gives today's freshness; nightly Spark over Parquet gives reproducibility. We run two systems not for fun but because no single engine satisfies both constraints.</td>
+      <td>Kappa (streaming-only) (no reproducibility for redefinitions); batch-only (24h staleness)</td>
+    </tr>
+    <tr>
+      <td>Flink stateful sessionization on Kafka</td>
+      <td>"User session" is the foundation of every funnel; getting it right once at the streaming layer means funnel/retention are cheap derivations on top. Flink's keyed-state + event-time windows + watermarks correctly handle 30-min idle gap with late events at 5M events/sec.</td>
+      <td>Spark Streaming (micro-batch, weaker watermarks); custom (re-implement Flink badly)</td>
+    </tr>
+    <tr>
+      <td>Parquet on S3, partitioned by date + bucketed by user_id</td>
+      <td>Funnel batch jobs filter by date range and shuffle on user_id. Date partitioning prunes 99% of the 5 PB lake; user_id bucketing eliminates the shuffle stage in Spark, cutting nightly funnel rebuild from 4 h to 45 min.</td>
+      <td>Date-only partitioning (full shuffle); ORC (smaller ecosystem); CSV (no pushdown)</td>
+    </tr>
+    <tr>
+      <td>Iceberg table format over the Parquet lake</td>
+      <td>Nightly recompute rewrites partitions while analysts are still querying yesterday's snapshot. Iceberg's snapshot isolation gives transactional swap so readers never see half-written data, critical when 50+ analysts are hitting the same tables.</td>
+      <td>Plain Parquet + symlink swap (race conditions); Delta Lake (good alt, less multi-engine)</td>
+    </tr>
+    <tr>
+      <td>HyperLogLog sketches for top-of-funnel reach</td>
+      <td>"Unique users entering funnel step 1 last 90 days" needs no exact count. HLL at 1% accuracy in 16 KB per cohort is millions of times smaller than the underlying user-id set and allows associative merge across days, so adding a day to the window is sub-second.</td>
+      <td>COUNT(DISTINCT) (full scan); exact bitmap (overkill for top-of-funnel)</td>
+    </tr>
+    <tr>
+      <td>Materialized retention cubes (cohort &times; day matrix)</td>
+      <td>The retention chart is the single most-loaded view in the product. Pre-computing the 30&times;90 cohort matrix nightly turns a multi-billion-row scan into a single small read; without it the dashboard would scan 50B events on every refresh.</td>
+      <td>Query-time recompute (slow dashboards); always-on streaming (high cost for stale view)</td>
+    </tr>
+    <tr>
+      <td>Kafka as the event log feeding both pipelines</td>
+      <td>Lambda needs the same event stream feeding batch and stream paths or the two will diverge. Kafka with 7-day retention lets streaming consume live and the daily Spark job consume from offset 0 for full reprocess on definition change.</td>
+      <td>Kinesis (24h retention default); separate ingest paths (batch vs. stream divergence)</td>
+    </tr>
+    <tr>
+      <td>RocksDB for Flink keyed state</td>
+      <td>Sessionization at 5M events/sec keeps state for ~50M active users (~50 GB). RocksDB-backed Flink state spills to local NVMe so we don't pay for 50 GB of RAM per task slot, with 1 ms p99 read on the keyed state path.</td>
+      <td>Heap state (OOM at 50M keys); Redis (network hop kills throughput)</td>
+    </tr>
+    <tr>
+      <td>Bitmap caching layer (Redis with binary values)</td>
+      <td>Hot cohorts (last-7-day signups) are queried by every PM dashboard. Caching the RoaringBitmap blob in Redis with a 1h TTL serves repeat queries in &lt;5 ms without re-running the funnel; cache miss falls through to ClickHouse.</td>
+      <td>Memcached (no binary-safe ops); ClickHouse query cache (per-shape, narrower hit rate)</td>
+    </tr>
+    <tr>
+      <td>Airflow for nightly orchestration</td>
+      <td>The reconciliation job has 12+ stages with cross-dependencies (compaction&rarr;dedup&rarr;sessionize&rarr;rollup&rarr;bitmap-build). Airflow's DAG model with retries and SLAs means a single stage failure doesn't silently corrupt the morning dashboards.</td>
+      <td>Cron + scripts (no dependency management); Dagster (smaller ecosystem at this org's stage)</td>
+    </tr>
+  </tbody>
+</table>

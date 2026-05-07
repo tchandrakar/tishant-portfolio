@@ -1,0 +1,195 @@
+<h1>Design Ranking Service (GBDT to DLRM, feature store, real-time)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">recommendation</span>
+  <span class="tag">ad-tech</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the precision-stage ranker that scores 2000 candidate items per request, returns top 50 ordered by predicted engagement (CTR, watch-time, like). Must integrate a feature store (online + offline), evolve from GBDT (XGBoost) to DLRM-style deep model, handle 580K rec QPS at sub-100ms p99 with multi-objective optimization (CTR x dwell x diversity).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Score (user, item, context) tuples with a multi-task model and combine objectives.</li>
+  <li>Pull 200+ features per request from online feature store.</li>
+  <li>Log all (features, score, label-after-impression) for training.</li>
+  <li>Support model versioning and traffic-split shadow deploys.</li>
+  <li>Re-rank for diversity (max 2 items per creator in top-10).</li>
+  <li>Return calibrated probabilities for downstream auctions/budgets.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> 2000 candidates scored in p99 under 40 ms.</li>
+  <li><b>Scale:</b> 580K QPS * 2000 items = 1.16B scoring ops/sec.</li>
+  <li><b>Freshness:</b> features updated within 5s of user action.</li>
+  <li><b>Model refresh:</b> daily retrain; hourly incremental.</li>
+  <li><b>Availability:</b> 99.95%, fallback to popularity-by-region.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Scoring ops: 1.16B/sec; with batching of 2000, that is 580K model invocations/sec.</li>
+  <li>GPU footprint (DLRM, 5ms per batch of 2000): 580K / 200 = 2900 GPUs (T4-class).</li>
+  <li>Feature store reads: 580K req * (1 user-fetch + 2000 item-fetches batched) = ~1.16B feature reads/sec.</li>
+  <li>Training data: 200M DAU * 200 impressions * 200 features * 4 bytes = 32 TB/day.</li>
+  <li>Online feature store: 1B users * 1KB user feats + 500M items * 2KB item feats = 2 TB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/rank/score   {userId, ctx, candidates:[itemId,sourceScore], k=50}
+                       -> [{itemId, score, components:{ctr,dwell,like}}]
+GET  /v1/features/user/{userId}                         (internal)
+POST /v1/features/item/batch  {itemIds[]}               (internal)
+POST /v1/rank/log    (one-way)  features+scoreId       (server-side)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Orchestrator]
+   | (userId, [2000 itemIds])
+   v
+[Ranker GW] -- batch -- [Feature Store Online (Redis+RocksDB)]
+   |                          ^
+   |                          | upserts
+   v                          |
+[DLRM TF-Serving (GPU)]       [Flink stream job] <- Kafka events
+   |
+   v scored
+[Multi-objective combiner] -> [Diversity re-rank] -> top-50
+                  |
+                  v async log
+              [Kafka] -> [S3 train data] -> [Daily Trainer (GPU)]
+                                                |
+                                                v models -> Model Registry
+</div>
+<p>Walk-through: ranker GW batches 2000 candidates, fetches user once + items once, builds feature tensor, calls TF-Serving, combines objectives, applies diversity, returns top-50. Logs are async-written to Kafka.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Online feature store (Redis + RocksDB tier)</h3>
+<pre>KEY  feat:user:{userId}        VAL protobuf  TTL 24h    (Redis)
+KEY  feat:item:{itemId}        VAL protobuf  TTL none   (RocksDB on SSD)
+KEY  feat:userxitem:{u}:{i}    VAL counters  TTL 7d    (cross-features)</pre>
+<h3>7.2 Offline feature store (Iceberg on S3)</h3>
+<pre>Partitioned by (date, feature_group). Backfilled from raw events daily.
+Online and offline share the schema; trainer joins on event_time for point-in-time correctness.</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Model evolution: GBDT -&gt; DLRM</h3>
+<p>v1 XGBoost: 500 trees, depth 8, ~15ms CPU per 2000 candidates, AUC 0.78. v2 DLRM: dense MLP + sparse embedding tables (32-dim, 100M ids), interaction layer, top MLP. Served on TF-Serving with batching=2000, 5ms GPU. AUC 0.82, +6% engagement online.</p>
+<h3>8.2 Feature store consistency</h3>
+<p>Train-serve skew is the #1 ML bug. Use the same feature transformer library (compiled to both Flink and TF). Online store writes via Flink with at-least-once + idempotent upserts keyed on (entity, feature, ts).</p>
+<h3>8.3 Multi-objective combiner</h3>
+<p>score = w_ctr*log(p_ctr) + w_dwell*p_dwell + w_like*p_like - w_skip*p_skip. Weights tuned via Bayesian optimization on long-term retention metric. Per-surface weights configurable.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>GPU saturation:</b> batch 2000 candidates per request to amortize kernel launch; below 500 candidates falls back to CPU.</li>
+  <li><b>Embedding-table memory:</b> 100M item embeddings * 32 floats = 12 GB; shard with parameter-server pattern, hot-cache top 10M on GPU.</li>
+  <li><b>Train-serve skew:</b> shadow logging compares offline-replayed scores vs online; alert at &gt;0.5% drift.</li>
+  <li><b>Feature staleness:</b> cap age at 5s for "real-time" features, fall back to last-good with staleness flag.</li>
+  <li><b>Cold-cache after deploy:</b> warm pool with synthetic traffic before flipping LB.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>GBDT (XGBoost)</td><td>CPU-cheap, interpretable</td><td>Caps at sparse-feature limit</td></tr>
+<tr><td>DLRM</td><td>Sparse + dense, +6% online</td><td>GPU cost, complex serving</td></tr>
+<tr><td>Online + offline FS</td><td>Train-serve parity</td><td>Two systems, dual writes</td></tr>
+<tr><td>Single-store FS</td><td>Simpler ops</td><td>Either slow or expensive</td></tr>
+<tr><td>Multi-task model</td><td>One forward pass, shared reps</td><td>Loss balancing tricky</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 10 Batch Processing — daily training data prep with Spark; point-in-time joins.</li>
+  <li>Ch. 11 Stream Processing — Flink updates online feature store from Kafka with exactly-once semantics.</li>
+  <li>Ch. 5 Replication — multi-region read replicas for the feature store.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — point-in-time-correct feature joins to avoid label leakage.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"GBDT first, DLRM later. The org needs a working pipeline before it earns the right to a deep model."</li>
+  <li>"Train-serve skew is where ML systems quietly fail. I'd invest in the feature transformer library before adding model complexity."</li>
+  <li>"Calibration matters in ad-tech: a ranker for organic feed only needs ordering, but auction-driven surfaces need calibrated p_click."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>XGBoost (GBDT v1)</td>
+      <td>500 trees of depth 8 score 2000 candidates in ~15ms on CPU at AUC 0.78; ships fast, is interpretable to PMs, and lets the org bring up the entire feature/serving/logging stack before paying GPU cost. Required first-mile choice on the path to DLRM.</td>
+      <td>LightGBM (similar; ecosystem narrower); CatBoost (categorical handling not the bottleneck here).</td>
+    </tr>
+    <tr>
+      <td>DLRM (v2 deep model)</td>
+      <td>Sparse 100M-id embedding tables plus dense MLP plus interaction layer give +6% online engagement at AUC 0.82 over GBDT; mandatory once feature space exceeds GBDT's sparse-feature ceiling for our 200+ feature catalog.</td>
+      <td>Wide &amp; Deep (less effective sparse-dense interaction); pure DNN (no interaction layer hurts CTR).</td>
+    </tr>
+    <tr>
+      <td>TensorFlow Serving on GPU</td>
+      <td>1.16B scoring ops/sec needs batch=2000 per request to amortize GPU kernel launches; TF-Serving's dynamic batching plus model-version traffic split lands DLRM at 5ms per batch and supports shadow deploys without code changes.</td>
+      <td>TorchServe (weaker batching); Triton (strong but extra ops surface vs in-house TF infra).</td>
+    </tr>
+    <tr>
+      <td>Feast / Tecton (feature store)</td>
+      <td>Online + offline parity is the single biggest train-serve skew lever; Feast/Tecton compile one feature definition into both Flink (online write) and Spark (offline backfill), preventing the silent skew that "quietly fails" ML systems per our 0.5% drift alert.</td>
+      <td>Hand-rolled Redis lookups (no offline parity); Hopsworks (heavier ops footprint).</td>
+    </tr>
+    <tr>
+      <td>Redis (online feature store, hot tier)</td>
+      <td>1B users * 1KB user features = 1 TB user state with sub-1ms reads; Redis cluster sharded by user_id is the only store that meets the 580K QPS user-fetch budget inside the 40ms scoring p99.</td>
+      <td>Memcached (no replication primitives); DynamoDB (10ms p99 too slow).</td>
+    </tr>
+    <tr>
+      <td>RocksDB on SSD (item feature tier)</td>
+      <td>500M items * 2KB = 1 TB item features can't fit affordably in RAM; RocksDB on local SSD gives ~2ms p99 reads which is acceptable when item features are read in batches of 2000 with prefetching.</td>
+      <td>Redis (RAM cost ~10x); BigTable (network hop adds 3-5ms).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka</td>
+      <td>Carries impression/engagement events into both feature pipeline and training data lake at 32 TB/day; partitioned by user_id so Flink keyed-state for cross-features stays sticky to one operator.</td>
+      <td>Kinesis (per-shard cap insufficient); Pulsar (less Flink/Spark integration).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink</td>
+      <td>Maintains 5-second-fresh online features via exactly-once Kafka transactional sinks with idempotent upserts keyed on (entity, feature, ts); cited as the train-serve consistency mechanism in DDIA Ch.11.</td>
+      <td>Spark Streaming (5s freshness floor too high); Kafka Streams (cross-topic exactly-once weaker).</td>
+    </tr>
+    <tr>
+      <td>Apache Spark (training pipeline)</td>
+      <td>32 TB/day of training data needs point-in-time joins to avoid label leakage; Spark's broadcast joins plus AsOf-join semantics on event_time deliver the temporally-correct training set required for production ML.</td>
+      <td>Beam/Dataflow (vendor lock); BigQuery (point-in-time joins less ergonomic).</td>
+    </tr>
+    <tr>
+      <td>Apache Iceberg on S3 (offline FS)</td>
+      <td>Partitioned by (date, feature_group) gives O(1) prune for the daily trainer scanning 30+ TB; schema evolution lets us add new features without rewriting historic data, key for the ML iteration loop.</td>
+      <td>Hudi (similar; smaller community); raw Parquet (no schema evolution or atomic writes).</td>
+    </tr>
+    <tr>
+      <td>NVIDIA T4 GPUs (serving)</td>
+      <td>~2900 T4-class GPUs at batch=2000 per request hit the 5ms-per-batch DLRM target at 580K QPS; T4 is cost-optimal for inference vs A100 here because batch sizes are bounded and tensor cores aren't saturated.</td>
+      <td>A100 (3x cost, only 1.5x throughput on this batch size); CPU (200x more boxes).</td>
+    </tr>
+    <tr>
+      <td>Parameter server (sparse embeddings)</td>
+      <td>100M item embedding rows * 32 floats = 12 GB doesn't fit in a single GPU's HBM at scale-out; parameter-server pattern with hot top-10M cached on-GPU keeps the working set fast while overflow rows live on host memory.</td>
+      <td>Sharded GPU model parallelism (cross-GPU bandwidth hurts batch latency); CPU embedding (4-5x slower).</td>
+    </tr>
+    <tr>
+      <td>Bayesian optimization (objective weights)</td>
+      <td>Multi-task weight tuning over (w_ctr, w_dwell, w_like, w_skip) is a 4-d expensive black-box on long-term retention; Bayesian optimization converges in 20-30 trials where grid search would need thousands.</td>
+      <td>Grid search (compute-prohibitive); RL-based weight learning (slow to converge, high variance).</td>
+    </tr>
+    <tr>
+      <td>Model Registry (MLflow-style)</td>
+      <td>Daily retrain plus hourly incrementals plus shadow deploys at 99.95% availability requires versioned model artifacts with traffic-split metadata; the registry is the single source of truth that prevents two-deploy races.</td>
+      <td>Filesystem versioning (no metadata); SageMaker Registry (vendor lock).</td>
+    </tr>
+  </tbody>
+</table>

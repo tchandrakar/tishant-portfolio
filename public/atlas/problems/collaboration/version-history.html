@@ -1,0 +1,147 @@
+<h1>Design Document Version History (snapshots + ops-log + branching)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">collaboration</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the version-history layer that powers "View revision history", "Restore to this version", and "Branch this doc" inside a collaborative editor. We must reconstruct any document state at any past timestamp efficiently, name versions, branch+merge them, and do it for billions of docs without exploding storage. This is essentially Git for live docs, layered on top of an OT or CRDT op log.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Time-travel: open the doc as it was at any past instant.</li>
+  <li>Named versions ("Approved draft v3").</li>
+  <li>Diff between two revisions, attribution per change.</li>
+  <li>Restore: replace current head with an old version.</li>
+  <li>Branching: fork a doc, edit independently, merge back.</li>
+  <li>Retention policy per workspace (e.g. 30 / 90 / forever).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> "open at timestamp T" &lt; 1 s p99 for any T within retention.</li>
+  <li><b>Scale:</b> 1 B docs, 100 B revisions, 5 PB historical storage.</li>
+  <li><b>Cost:</b> &lt; $0.005 / doc / month amortized.</li>
+  <li><b>Durability:</b> 11 9s on the cold tier (S3 std).</li>
+  <li><b>Consistency:</b> a "named" version is immutable forever.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Op throughput in: 5 M ops/s × 200 B compressed = 1 GB/s ingest.</li>
+  <li>Snapshot frequency: every 1,000 ops or 5 min, whichever first → ~250 K snapshots/s globally.</li>
+  <li>Snapshot avg size: 30 KB compressed → 7.5 GB/s into S3.</li>
+  <li>Cold tier: 5 PB total, lifecycle to Glacier after 90 days.</li>
+  <li>Read pattern: long-tail; only ~0.1% of revisions ever opened.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET  /v1/doc/{id}/history?from=&amp;to=        → revisions[] (id, ts, author, label?)
+GET  /v1/doc/{id}/at?ts=                   → materialized doc
+POST /v1/doc/{id}/version  { name, rev }   → versionId
+POST /v1/doc/{id}/restore  { rev }         → newRev
+POST /v1/doc/{id}/branch   { fromRev }     → branchId
+POST /v1/branch/{id}/merge { intoBranch }  → mergeRev
+GET  /v1/doc/{id}/diff?a=&amp;b=               → diff[]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Editor]──ops──&gt;[OT/CRDT engine]──&gt;[Op Log: Spanner / FoundationDB]
+                                          │
+                                          ├─every 1k ops──&gt;[Snapshot Builder]──&gt;[S3 Hot]
+                                          │                                       │
+                                          │                                       └─lifecycle──&gt;[S3 IA / Glacier]
+                                          │
+                                          └─named-version──&gt;[Version Table: Postgres]
+                  [History Service]──reads──&gt;[Op Log] + [Snapshots]
+                                              │
+                                              └─reconstruct(ts) = nearest snapshot + replay tail
+</div>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Op log</h3>
+<pre>doc_ops (doc_id, branch_id, rev BIGINT, parent_rev, author_id, ts, op_blob, snapshot_id?)
+  PK (doc_id, branch_id, rev)</pre>
+<h3>7.2 Snapshots</h3>
+<pre>snapshots (snapshot_id, doc_id, branch_id, base_rev, blob_uri, size, created_at)</pre>
+<p>Snapshot blob is the materialized doc as of <code>base_rev</code>, stored gzip-compressed in S3. Path: <code>s3://snaps/{shard}/{doc_id}/{base_rev}.bin</code>.</p>
+<h3>7.3 Named versions / branches (Postgres)</h3>
+<pre>versions(version_id, doc_id, branch_id, rev, label, author, created_at)
+branches(branch_id, doc_id, parent_branch_id, fork_rev, head_rev, created_at)</pre>
+<p>DDIA Ch.5 motivates separating durable ordered log (Spanner) from indexed metadata (Postgres) — log-structured + relational hybrid.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Snapshot strategy</h3>
+<p>Trigger: every 1,000 ops or 5 min idle. Adaptive: hot docs lengthen the interval (one snapshot per minute max); cold docs do per-1k-op. Goal: bound replay tail to ≤ 1k ops so reconstruction is &lt; 200 ms.</p>
+<h3>8.2 Reconstruct(ts)</h3>
+<pre>1. Look up branch.head, walk back to find rev with ts ≤ T.
+2. Find nearest snapshot s.t. snapshot.base_rev ≤ rev.
+3. Load snapshot blob from S3 (or warm cache).
+4. Apply ops [snapshot.base_rev+1 .. rev] from op log.
+5. Return materialized doc.</pre>
+<p>Cache layer (Redis) keyed by (doc_id, rev) for popular reconstructions (e.g. "yesterday's snapshot" pinned overnight).</p>
+<h3>8.3 Diff</h3>
+<p>Reconstruct A and B; compute structural diff (Myers for text blocks, set-diff for shape props). Cache common diff pairs (head vs each named version).</p>
+<h3>8.4 Branching</h3>
+<p>Branch = new branch_id starting at fork_rev. Edits go to its own op-log range. Cheap: no copy. Storage cost is just the divergent ops.</p>
+<h3>8.5 Merge</h3>
+<p>For CRDT docs: merge is just union of ops + GC. For OT docs: replay branch's ops onto target, transforming each against intervening ops — same code path as live edit, just bulk.</p>
+<h3>8.6 Retention &amp; GC</h3>
+<p>Per-workspace policy. Free tier: keep 30 days of granular ops + named versions forever. Background job rewrites old log ranges as a single coarse snapshot, then deletes ops. Named versions are pinned and never collapsed.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Snapshot write storm:</b> stagger via jitter (snapshot at rev congruent to doc_hash mod 1000).</li>
+  <li><b>S3 GET tail latency:</b> 99.9% &lt; 80 ms but p99.99 spikes to 3 s — keep a Redis warm cache for last-day snapshots.</li>
+  <li><b>Long branches with thousands of divergent ops:</b> snapshot the branch independently after 1k ops.</li>
+  <li><b>Cold reconstruct from Glacier:</b> minutes-to-hours; UI must show "restoring archive" affordance.</li>
+  <li><b>Schema evolution:</b> snapshot blobs versioned with codec_version; readers must handle N-2.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Snapshot every 1k ops</td><td>Bounded reconstruct cost</td><td>~3× storage amplification</td></tr>
+<tr><td>S3 for snapshots, Spanner for op log</td><td>Cheap cold storage, ordered hot log</td><td>Two systems, cross-store consistency edge cases</td></tr>
+<tr><td>Branch as op-log range</td><td>Free to fork; no copy</td><td>Merge is N-way transform on OT</td></tr>
+<tr><td>Lifecycle to Glacier @ 90d</td><td>~75% cost reduction</td><td>Restore latency spikes for old docs</td></tr>
+<tr><td>CRDT-friendly merge</td><td>Trivial set-union</td><td>Tombstone bloat over many merges</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage Engines — log-structured storage; SSTable-like immutability of snapshots.</li>
+  <li>Ch. 5 Replication — single-leader log + replicated snapshots; this design mirrors the leader's WAL pattern.</li>
+  <li>Ch. 11 Stream Processing — op log as event-sourced source of truth; snapshots as materialized views.</li>
+  <li>Ch. 7 Transactions — named-version creation must be linearizable w.r.t. concurrent writes.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Reconstruct = snapshot + tail replay; everything else is plumbing. The snapshot cadence is the single biggest knob."</li>
+  <li>"I'd argue against full event sourcing alone — replay from rev 0 is fine in theory, brutal at p99 over a million-op doc."</li>
+  <li>"For branching, CRDT docs are massively easier than OT; if I were designing the editor and the history together I'd pick a CRDT just for this."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Spanner (op log, OT-backed docs)</td><td>OT requires a totally ordered rev counter per (doc, branch). Spanner's TrueTime + linearizable inserts on (doc_id, branch_id, rev) preserve ordering across regions, which is what makes "restore to rev N" deterministic. 50–100 ms commit latency is fine on the history path.</td><td>FoundationDB (chosen for CRDT-backed docs separately); Postgres (rejected: no native multi-region linearizable writes at 100 B revisions).</td></tr>
+    <tr><td>FoundationDB (op log, CRDT-backed docs)</td><td>CRDT ops are commutative, so we don't need TrueTime — we need ACID multi-key txn to atomically swap a snapshot pointer with op-log truncation. FDB's serializable txns across keys at 1 GB/s ingest are exactly that, at half Spanner's cost.</td><td>Spanner (overkill for CRDT, no ordering needed); DynamoDB (rejected: no multi-key ACID at scale).</td></tr>
+    <tr><td>S3 Hot + IA + Glacier tiers</td><td>5 PB total, only 0.1% of revisions ever read. S3 Standard for last 30 days, IA at 90 days, Glacier afterward — lifecycle gives ~75% cost reduction. Hot S3 GET p99 ≈ 80 ms keeps the &lt; 1 s reconstruct SLA.</td><td>All-hot S3 (rejected: 4× cost, $200K+/mo); HDFS (rejected: ops cost + worse durability than 11 9s); Glacier-only (rejected: minutes-to-hours restore breaks UX).</td></tr>
+    <tr><td>Postgres (named versions + branch metadata)</td><td>"Named versions are immutable forever" needs a relational store with secondary indexes on (doc_id, branch_id, label). Postgres jsonb + btree indexes serve millions of named versions with ACID guarantees on the create-version transaction; the op log stays log-structured.</td><td>Same Spanner table (rejected: mixes concerns, expensive secondary indexes); MongoDB (rejected: weaker txn semantics for "version create must be linearizable").</td></tr>
+    <tr><td>Redis (snapshot cache)</td><td>"Yesterday's snapshot" is opened thousands of times by everyone reviewing what changed overnight. Redis warm cache keyed by (doc_id, rev) caches the 30 KB snapshot blob; sub-ms hit beats S3's 50–80 ms p99 GET on the hottest path.</td><td>CDN edge cache (viable; chose Redis for invalidation control on restore); local in-memory cache (rejected: cold on cross-region failover).</td></tr>
+    <tr><td>Adaptive snapshot strategy</td><td>Hot docs (high op rate) snapshot every 5 min max; cold docs snapshot every 1k ops. Goal: bound replay tail to ≤ 1k ops, keeping reconstruct &lt; 200 ms. Adaptive cadence saves ~40% of snapshot writes vs always-1k on chatty docs.</td><td>Fixed 1k-op cadence (rejected: snapshot storm on hot docs); fixed 5-min cadence (rejected: cold docs replay 10k+ ops).</td></tr>
+    <tr><td>Branch as op-log range (no copy)</td><td>"Free fork" requires not copying op-log entries. New branch_id starting at fork_rev with edits going to its own range means storage cost is just divergent ops. CRDT-friendly merge is set-union; OT merge replays branch ops onto target via the same transform pipeline.</td><td>Full doc copy on fork (rejected: 30 KB × N branches = unfeasible); shallow copy + COW pages (rejected: complex storage layer).</td></tr>
+    <tr><td>Myers diff (text) + set-diff (props)</td><td>Diff between two reconstructed revisions needs two algorithms: Myers O(ND) for character-level text, set-diff O(n) for shape props. Myers is the right tool because of its quality on small edits — used by git diff for the same reason.</td><td>Patience diff (viable but slower for our text-heavy case); structural tree diff only (rejected: poor at character-level text).</td></tr>
+    <tr><td>Snapshot codec versioning</td><td>Snapshot blobs persist for years across schema changes. Embedding codec_version in each blob and requiring readers to handle N-2 keeps us forward-compatible without rewriting 5 PB of historical data.</td><td>One-shot migration (rejected: 5 PB rewrite cost); never evolve schema (rejected: blocks editor evolution).</td></tr>
+    <tr><td>Jittered snapshot writes</td><td>"Every 1k ops" naively triggers synchronously, causing thundering-herd S3 PUT. Jittering by hashing doc_id mod 1000 spreads 250 K snapshots/s evenly across the wall clock, holding S3 PUT p99 stable.</td><td>Synchronous threshold trigger (rejected: write storms); per-shard token bucket (viable; jitter simpler).</td></tr>
+    <tr><td>Kafka (history-event stream)</td><td>Downstream consumers (audit, analytics, AI summaries) need every op + every snapshot creation. Kafka's at-least-once + ordered partitions per doc_id let consumers replay; retention 7 days bridges any consumer outage without data loss.</td><td>Direct DB tail (rejected: tightly couples consumers to op log); SNS/SQS (rejected: no ordering, no replay).</td></tr>
+    <tr><td>Cycle-detected branch graph</td><td>Branches can fork from branches, and merges create DAG edges. Storing parent_branch_id with explicit cycle detection on merge-back avoids accidental loops; reconstruct walks the DAG backward to find the right snapshot in O(depth).</td><td>Linear branch chain (rejected: doesn't model real fork-of-fork); flat branches (rejected: no merge ancestry, breaks 3-way merge).</td></tr>
+    <tr><td>Per-workspace retention policy</td><td>Free tier (30 days granular) vs paid (90 days or forever) maps directly to lifecycle policy on S3 prefix and to op-log GC schedule. Background job collapses old log into a coarse snapshot, trimming the per-doc &lt; $0.005/mo cost target without losing named versions.</td><td>Global 90-day retention (rejected: free-tier cost); never delete (rejected: 5 PB grows linearly forever).</td></tr>
+  </tbody>
+</table>

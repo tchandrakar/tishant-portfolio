@@ -1,0 +1,135 @@
+<h1>Design Spell Checker / Did-You-Mean (edit distance, ngrams)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">search</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the "Did you mean: ___?" service that fronts a large search engine: given a possibly misspelled query (single word or full phrase), return the most likely intended query within ~50 ms. The system must learn from the query log itself — most "correct" spellings are simply the more popular variants — and handle typos, transpositions, missing/added characters, and phonetic confusions across multiple languages.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Single-word correction: <code>"recieve" → "receive"</code>.</li>
+  <li>Multi-word context-aware correction: <code>"new york pissa" → "new york pizza"</code>.</li>
+  <li>Suggest only when confidence exceeds a threshold; otherwise stay silent.</li>
+  <li>Continuously update from the query log (new product names, slang).</li>
+  <li>Multilingual; respect language hint or auto-detect.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 &lt; 50 ms server-side.</li>
+  <li><b>Scale:</b> piggybacks on search QPS — 100 K QPS peak; ~10 % of queries trigger a suggestion.</li>
+  <li><b>Quality:</b> precision &gt; 90 % at the chosen confidence threshold; never suggest something offensive.</li>
+  <li><b>Freshness:</b> new popular terms learnable within ~1 day.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Vocabulary: 10 M unique terms with frequency &gt; 5 in last 90 days; ~5 chars avg → ~50 MB raw, ~15 MB FST-compressed.</li>
+  <li>Bigram model: 200 M (w₁, w₂) pairs × 24 B = 4.8 GB → fits in RAM per node.</li>
+  <li>Candidates per misspelled token: ~50 within edit distance 2; ~200 with phonetic neighbors.</li>
+  <li>Storage of query logs for training: 5 B queries/day × 100 B = 500 GB/day → 30-day window = 15 TB on S3.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /spell/correct
+{ query: "new york pissa", lang: "en", k: 3 }
+   → { suggestions: [{text:"new york pizza", confidence:0.93}, ...],
+       trigger: true }
+POST /spell/feedback {originalQuery, suggestionShown, accepted}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Query] -> [Tokenizer/Normalizer] -> [Candidate Generator]
+                                          |
+                                          v
+                          [Levenshtein Automaton over Term FST]
+                          [Phonetic / SymSpell deletes index]
+                                          |
+                                          v
+                          [Noisy Channel Scorer]  P(c) · P(q|c)
+                          uses [Term LM] + [Bigram LM] + [Char-LM]
+                                          |
+                                          v
+                                    [Threshold &amp; Filter] -> Suggestion
+
+[Query Log] -> Spark daily -> term/bigram counts -> FST + KenLM -> push to servers
+</div>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Term dictionary (Lucene FST)</h3>
+<pre>FST: term -> (count, frequency_rank)
+   - O(L) lookup
+   - supports Levenshtein automaton intersection for k-edit candidates</pre>
+<h3>7.2 SymSpell delete index (alternative)</h3>
+<pre>map: deletes(term, k) -> [original_terms]
+   e.g., delete("receive",1) ⊇ ["eceive","rceive","reeive","recive","receie","receiv"]
+   query lookup: enumerate deletes(q,k), join → fast O(1) candidate gen</pre>
+<h3>7.3 Bigram language model</h3>
+<pre>map: (w_{i-1}, w_i) -> log P(w_i | w_{i-1})   (Kneser-Ney smoothed)</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Candidate generation</h3>
+<p>Two strategies, used together for recall: (a) <b>Levenshtein automaton</b> intersected with the term FST yields all dictionary terms within edit distance ≤ 2 in O(|q|·|states|); (b) <b>SymSpell</b> precomputes delete-only neighborhoods so generation becomes a hash lookup. Phonetic codes (Double Metaphone) catch <code>"fone" → "phone"</code> that pure edit distance misses.</p>
+<h3>8.2 Noisy channel scoring</h3>
+<p>Pick candidate <code>c</code> maximizing <code>P(c|q) ∝ P(c) · P(q|c)</code> where <code>P(c)</code> is a language model probability (unigram for single-word, bigram/trigram for phrases) and <code>P(q|c)</code> is an error model — typically learned from (typed, accepted) pairs in the click log; falls back to weighted edit distance with confusion costs (e.g., adjacent-key substitutions cost less).</p>
+<h3>8.3 Multi-word correction</h3>
+<p>Tokenize → independently generate candidates per token → Viterbi decode over the bigram LM to pick the joint best path. Allows context to fix <code>"piza"</code> → <code>"pizza"</code> in <code>"new york piza"</code> but leave <code>"piza"</code> alone in a Spanish context.</p>
+<h3>8.4 Training</h3>
+<p>Daily Spark job aggregates query frequencies, builds the FST and KenLM bigrams, mines (typo → click → reformulation) pairs from sessions for the error model. Outputs are pushed as immutable artifacts and atomically swapped (DDIA Ch. 10).</p>
+<h3>8.5 Trigger logic</h3>
+<p>Show suggestion only when <code>P(c)/P(q) &gt; τ</code> AND original query has low result quality (few results / low click-through). Avoids the embarrassing case of "correcting" a correctly-spelled rare brand name.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Long words:</b> edit-distance candidate space explodes; cap at 2 edits per token, 3 only for tokens &gt; 8 chars.</li>
+  <li><b>Brand and proper nouns:</b> mine from query log so popular brands self-correct upward and don't get "fixed".</li>
+  <li><b>Multilingual:</b> separate FSTs and LMs per language; route by detected language to avoid cross-lingual nonsense.</li>
+  <li><b>Latency budget:</b> generate candidates and score in parallel across tokens; cap at top 50 candidates per token before Viterbi.</li>
+  <li><b>Safety:</b> never suggest profane or trademark-protected terms — apply a blocklist after scoring.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>FST + Levenshtein automaton</td><td>Compact, exact, supports streaming</td><td>Build cost; harder to update incrementally</td></tr>
+<tr><td>SymSpell deletes</td><td>O(1) candidate lookup</td><td>5–10× memory; delete-only edit model</td></tr>
+<tr><td>Noisy channel (LM × error)</td><td>Theoretically sound, interpretable</td><td>Two models to train and tune</td></tr>
+<tr><td>Neural seq2seq corrector</td><td>Captures long-range context</td><td>Latency, harder to control, hallucinations</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage and Retrieval — FSTs as compact term dictionaries; the same data structure powers Lucene's term index.</li>
+  <li>Ch. 10 Batch Processing — daily Spark job builds the immutable LM and FST artifacts consumed by the online service.</li>
+  <li>Ch. 11 Stream Processing — sessionization of query logs into reformulation pairs that train the error model.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The most important model isn't the spell checker — it's the trigger. Showing a wrong suggestion is far worse than showing none."</li>
+  <li>"Almost all signal comes free from the query log: popular = correct. The error model is a refinement, not the foundation."</li>
+  <li>"For multi-word, Viterbi over a bigram LM is the cheapest way to get context-aware correction without a transformer."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Lucene FST (term dictionary)</td><td>10 M terms × 5 chars compresses from ~50 MB raw to ~15 MB FST, fitting in L3-cache range; the FST natively supports Levenshtein automaton intersection so we get all k≤2 candidates in O(|q|·|states|) without scanning the dictionary.</td><td>HashMap&lt;term, count&gt; (3× memory, no fuzzy match); Trie (1.5× memory, no automaton intersection).</td></tr>
+    <tr><td>Levenshtein automaton</td><td>Exact k≤2 candidate generation against the FST yields ~50 candidates per token in &lt;1 ms with provably correct edit distance; pure brute-force enumeration of 26^5 deletes/inserts would be intractable for the 50 ms p99 budget.</td><td>Brute-force edit enumeration (exponential); BK-tree (O(log) average but worse worst case).</td></tr>
+    <tr><td>SymSpell delete index (parallel path)</td><td>For ultra-low-latency single-word correction, SymSpell precomputes delete neighborhoods so candidate generation is an O(1) hash lookup; we run it in parallel to the Levenshtein path and union for recall, paying 5–10× memory for ~3× lower median latency.</td><td>Levenshtein-only (slower median, fine tail); neural seq2seq (50× cost, hallucinations).</td></tr>
+    <tr><td>Double Metaphone (phonetic codes)</td><td>"fone"→"phone" has edit distance 2 but is a single phonetic substitution; Double Metaphone catches ~15 % of corrections that pure edit distance misses, especially for proper nouns and brand names where users spell phonetically.</td><td>Soundex (English-only, weaker); custom phonetic table (maintenance burden).</td></tr>
+    <tr><td>KenLM (bigram language model)</td><td>200 M bigrams × 24 B = 4.8 GB fits in RAM; KenLM's Kneser-Ney smoothing and trie-based mmap give &lt;5 µs P(w₂|w₁) lookups, which is what makes Viterbi over a 5-token query finish in ~2 ms.</td><td>SRILM (slower, larger memory); neural LM (10× cost, GPU dependency for the &lt;50 ms target).</td></tr>
+    <tr><td>Viterbi decoder (multi-word path)</td><td>For "new york piza", per-token candidates × LM scoring needs the Viterbi DP to find the joint best path in O(T·K²) with K=50 — finishes in &lt;3 ms and gives context-aware correction without a transformer.</td><td>Beam search (lossy, similar cost); brute-force joint enum (exponential in tokens).</td></tr>
+    <tr><td>Apache Spark (daily build pipeline)</td><td>Aggregating 5 B queries/day × 30 days = 15 TB to compute term/bigram counts, mine reformulation pairs, and rebuild FST + KenLM artifacts; Spark's shuffle handles the joins and finishes nightly in ~2 h on a 50-node cluster.</td><td>MapReduce (3× wall-time); Flink batch (less mature ML support).</td></tr>
+    <tr><td>Apache Kafka + sessionization (Flink)</td><td>The error model trains on (typo → reformulated query) pairs mined from sessions; Flink reads the Kafka query log, sessionizes by user/30-min gap, and emits (q1, q2) pairs into S3 for the trainer — exactly-once semantics matter so we don't double-count.</td><td>Spark Streaming sessionization (mini-batch latency, weaker session windows); offline batch sessionization (re-reads everything daily).</td></tr>
+    <tr><td>Confusion-cost weighted edit distance</td><td>QWERTY-adjacent substitutions ("e"→"r") are 5× more likely than diagonal ones; learned per-key confusion costs replace uniform cost-1 edits and lift correction precision from ~85 % to ~92 % at the same recall.</td><td>Uniform Levenshtein (lower precision); per-user confusion model (data-sparse).</td></tr>
+    <tr><td>Trigger threshold model</td><td>P(c)/P(q) &gt; τ combined with low-result-quality signal prevents the embarrassing case of "correcting" a rare brand name; precision &gt; 90 % is enforced by tuning τ on a held-out set, since a wrong suggestion is worse than no suggestion.</td><td>Always-show (precision tanks); learned trigger model (more data, marginal lift).</td></tr>
+    <tr><td>S3 + atomic artifact swap</td><td>FST + KenLM artifacts are ~5 GB; pushing to S3 with versioned keys and having servers download + atomic-swap via symlink rename gives zero-downtime ranking-data updates and instant rollback to the previous version.</td><td>Hot-reload via RPC push (per-server flakiness); rolling restart (latency spike).</td></tr>
+    <tr><td>Bloom-filter blocklist</td><td>Profanity / trademark blocklist has ~500 K entries; a Bloom filter (0.1 % FP, ~1 MB) gives O(1) post-scoring filtering and false positives are acceptable because we just suppress a suggestion — the blocklist is the last gate before user-visible text.</td><td>HashSet (3× memory); regex matcher (slower, harder to update).</td></tr>
+  </tbody>
+</table>

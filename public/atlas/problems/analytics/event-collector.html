@@ -1,0 +1,192 @@
+<h1>Design Real-time Event Collector (HTTP &rarr; Kafka &rarr; S3, billions of events/day)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a global, public-internet event collector &mdash; the front door for clickstream, mobile telemetry, and server-side beacons &mdash; that accepts billions of HTTP POSTs per day, durably enqueues them onto Kafka within milliseconds, and lands them as compacted Parquet files on S3 for downstream analytics. This is the "Snowplow / Segment / Iglu" layer underneath Mixpanel, A/B testing platforms, and ML feature pipelines.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Public HTTPS endpoint, browser-friendly (CORS, GIF pixel, beacon).</li>
+  <li>Schema validation against a registry; reject malformed events with structured error.</li>
+  <li>Idempotency via client-supplied <code>event_id</code> (UUIDv7).</li>
+  <li>At-least-once delivery to Kafka; exactly-once landing to S3 (file-level).</li>
+  <li>Per-tenant rate limiting and authentication (API key + HMAC).</li>
+  <li>S3 lake organized for efficient downstream batch jobs.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 10B events/day baseline, 50B peak (Black Friday); 600K rps p99.</li>
+  <li><b>Latency:</b> p99 ack &lt; 50 ms after Kafka commit; client-perceived &lt; 200 ms globally.</li>
+  <li><b>Durability:</b> 99.9999% (1 in 1M lost is the SLO ceiling).</li>
+  <li><b>Availability:</b> 99.99% (this is a write-only critical path).</li>
+  <li><b>Cost:</b> &lt; $0.05 per million events landed.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>10e9 ev/day &asymp; <b>116K eps avg, 600K eps peak</b>.</li>
+  <li>Per event: ~1.5 KB JSON &rarr; ~15 TB/day raw; ~3 TB/day Snappy/Parquet.</li>
+  <li>Kafka cluster: 1024 partitions @ 100 KB/s avg, 1 MB/s peak &rarr; 6 brokers per region with RF=3.</li>
+  <li>Edge fleet: 600K rps / 5K rps-per-pod = ~120 collector pods/region (3 regions).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/track            Headers: x-api-key, x-signature
+Body: { event_id, ts, tenant, type, props }
+GET  /pixel.gif?d=&lt;b64-json&gt;        // for sandboxed browsers
+POST /v1/batch    [up to 500 events]
+&rarr; 202 Accepted { received: 500, rejected: 0 }
+&rarr; 4xx for schema/auth errors with field-level details
+</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Browser/Mobile/Server] --DNS GeoDNS--&gt; [Anycast LB / CloudFront]
+                                              |
+                                              v
+                                  [Edge Collector Pod (Go)]
+                                  - auth, rate-limit
+                                  - schema-lite check
+                                  - write to Kafka idempotent producer
+                                              |
+                                              v
+                          [Kafka events.raw, RF=3, acks=all, 1024 parts]
+                                              |
+                +-----------------------------+----------------------------+
+                v                                                          v
+       [Validator Stream (Flink)]                                  [Real-time consumers]
+       - registry schema check                                     - feature pipelines
+       - DLQ for invalid                                           - alerting / fraud
+                |
+                v
+        [S3 Sink (Kafka Connect / Flink)]
+        hourly Parquet partitioned by (tenant, dt, hr)
+</div>
+<p>The collector terminates TLS, authenticates, applies a fast structural check, and produces to Kafka with <code>acks=all</code> and an idempotent producer. Only after the Kafka ack do we 202 the client &mdash; this guarantees at-least-once. A separate stream job validates against the schema registry; bad events go to a DLQ, never silently dropped.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Wire envelope</h3>
+<pre>{ event_id: uuid7, tenant: str, type: str,
+  ts_client: epoch_ms, ts_server: epoch_ms,
+  ip, ua, ctx: {...}, props: {...} }</pre>
+<h3>7.2 S3 layout</h3>
+<pre>s3://events/raw/tenant=acme/dt=2026-05-06/hr=14/part-000123.parquet
+s3://events/dlq/tenant=acme/dt=2026-05-06/hr=14/part-000007.json.gz
+_SUCCESS markers per (dt,hr) when all 1024 partitions have committed past hr+1</pre>
+<h3>7.3 Why Parquet?</h3>
+<p>Columnar Parquet over S3 is the canonical analytical lake format (DDIA Ch. 10). It enables predicate push-down, delivers ~5&times; compression over JSON, and is consumable by every analytical engine (Trino, Spark, Athena, Snowflake external tables).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Idempotency</h3>
+<p>Producers send <code>event_id</code>; downstream consumers de-dup using a Bloom filter + 24h Redis set keyed by (tenant, event_id). Kafka's idempotent producer prevents broker-side dup; consumer-side dedup catches client retries.</p>
+<h3>8.2 Schema registry</h3>
+<p>Confluent-style registry keyed by <code>(tenant, event_type, version)</code>; stream validator enforces backward-compatible evolution. Rejected events carry a <code>x-iglu-error</code> reason code.</p>
+<h3>8.3 S3 sink "exactly-once"</h3>
+<p>Flink's two-phase-commit S3 sink writes temp files, on checkpoint atomically renames to final names &mdash; gives effectively exactly-once <em>file landing</em> even though Kafka delivery is at-least-once (DDIA Ch. 11 end-to-end argument).</p>
+<h3>8.4 Backpressure &amp; shedding</h3>
+<p>If Kafka producer queue exceeds threshold, the collector returns 429 with Retry-After. Mobile SDKs honor this and exponentially back off; we never silently drop accepted events.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Connection storm:</b> 600K rps over HTTP/2 = ~50K concurrent conns; tune kernel <code>somaxconn</code>, use connection-reuse on edge LB.</li>
+  <li><b>Tenant skew:</b> one customer launches a campaign &rarr; partition hot-spot; partition by hash(tenant, event_id) instead of tenant alone.</li>
+  <li><b>Small-files on S3:</b> 1024 partitions * 8760 hours = millions of files/year; nightly compaction batch job (DDIA Ch. 10) coalesces &lt; 64 MB files.</li>
+  <li><b>Cold start of new region:</b> bootstrap Kafka MirrorMaker before pointing GeoDNS to avoid a brand-new partition leader storm.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>acks=all on Kafka</td><td>Strong durability, no surprises</td><td>+10 ms producer latency</td></tr>
+<tr><td>At-least-once + dedup</td><td>Simple, robust to retries</td><td>Bloom filter false-positives, transient</td></tr>
+<tr><td>Hourly Parquet partitions</td><td>Cheap downstream Trino queries</td><td>Many small files; needs compaction</td></tr>
+<tr><td>Validate downstream of ack</td><td>Fast 202, never blocks ingest</td><td>Bad events still cost Kafka bytes</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 11 Stream Processing</b> &mdash; Kafka as the unbundled commit log; idempotent producers + transactions; two-phase-commit S3 sinks for end-to-end exactly-once landing; DLQ pattern for poison messages.</li>
+  <li><b>Ch. 10 Batch Processing</b> &mdash; the S3 lake is the canonical immutable batch input; nightly compaction, schema migration via re-write, and downstream MapReduce/Spark jobs all follow Ch. 10 patterns.</li>
+  <li><b>Ch. 8 Trouble with Distributed Systems</b> &mdash; client clock skew makes <code>ts_client</code> unreliable; we retain it but use <code>ts_server</code> for partitioning.</li>
+  <li><b>Ch. 9 Consistency &amp; Consensus</b> &mdash; Kafka ISR with acks=all is a quorum write; choosing acks=1 vs all is the durability/latency knob.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"This is a write-amplified write-only path; my dominant constraint is durability, so I lock in acks=all even though it costs 10 ms."</li>
+  <li>"I'd ack the client only after Kafka commit &mdash; ack-then-Kafka is the classic data-loss footgun."</li>
+  <li>"At 50B events/day Black-Friday peak, the small-files problem on S3 kills downstream queries; the compaction batch job is part of the design, not an afterthought."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Kafka with acks=all + min.insync.replicas=2</td>
+      <td>50B events/day with no tolerance for loss (billing/audit downstream). acks=all costs 5-10 ms latency but guarantees a committed event survives a single-broker failure; ack-then-Kafka is the classic data-loss footgun and is non-negotiable here.</td>
+      <td>acks=1 (loses on broker crash); RabbitMQ mirrored queues (lower throughput, harder ops)</td>
+    </tr>
+    <tr>
+      <td>Stateless HTTP collector behind L7 LB</td>
+      <td>At 5M events/sec peak (Black-Friday), only horizontal scale survives. Stateless pods let us autoscale 100&rarr;1000 instances on CPU without coordination; any state (auth, dedup) lives in Redis or Kafka, never in the collector.</td>
+      <td>Sticky sessions (breaks autoscaling); stateful dedup in collector (kills horizontal scale)</td>
+    </tr>
+    <tr>
+      <td>Protobuf over HTTP/2 for SDK&rarr;collector</td>
+      <td>JSON adds 3&times; payload size; at 50B events/day that's 200+ TB/day of wasted egress. Protobuf shrinks per-event size to ~120 bytes and HTTP/2 multiplexing keeps connection count low for mobile clients on poor networks.</td>
+      <td>JSON over HTTP/1.1 (3&times; bandwidth, head-of-line blocking); MsgPack (weaker tooling)</td>
+    </tr>
+    <tr>
+      <td>Edge regional collectors + cross-region Kafka MirrorMaker</td>
+      <td>Mobile clients in APAC paying 300 ms RTT to us-east-1 will time out under retry storms. Regional collectors give &lt;50 ms ingest latency globally; MirrorMaker async-replicates to the central topic for analytics without putting RTT on the client path.</td>
+      <td>Single-region (high mobile loss); active-active with conflict resolution (overkill)</td>
+    </tr>
+    <tr>
+      <td>Idempotency-key dedup via Redis (24h TTL)</td>
+      <td>Mobile SDKs retry aggressively on network blips; without dedup we'd ship 5-10% duplicate events to billing. SHA1(idempotency_key) lookup in a Redis cluster (~1 M ops/sec, 1 ms p99) is the only structure cheap enough at 5M events/sec.</td>
+      <td>DB-level UNIQUE (write contention); Bloom filter (false positives drop real events)</td>
+    </tr>
+    <tr>
+      <td>S3 + Parquet sink with hourly compaction job</td>
+      <td>Streaming Kafka&rarr;S3 produces millions of tiny files; the small-files problem on S3 kills downstream Spark queries (each file = 1 task). An hourly compaction batch job rewrites to ~512 MB Parquet files, a designed-in part of the pipeline, not an afterthought.</td>
+      <td>No compaction (Spark OOM); Avro (row-oriented, no column pruning)</td>
+    </tr>
+    <tr>
+      <td>Schema registry (Confluent) with backward-compat enforcement</td>
+      <td>50+ client teams ship SDK upgrades on independent timelines. Backward-compat enforcement at registration time prevents one team's rename from silently breaking the warehouse loader, the failure mode that costs days of backfill at 50B events/day.</td>
+      <td>No schema (downstream chaos); Protobuf without registry (no compat checks)</td>
+    </tr>
+    <tr>
+      <td>Token-bucket rate limiter per API key</td>
+      <td>One bug in a customer's SDK can DDoS our cluster at 100&times; their normal rate. Per-key token bucket in Redis gives O(1) check at 5M events/sec and isolates noisy tenants without affecting the long tail of well-behaved customers.</td>
+      <td>Global limit (good actors throttled); per-IP limit (mobile NATs share IPs)</td>
+    </tr>
+    <tr>
+      <td>HMAC-signed event payloads</td>
+      <td>Public collector endpoints invite spoofing; a forged event in billing is a $-impacting incident. HMAC with per-tenant rotating keys is &lt;10 µs to verify and gives cryptographic source authentication, far cheaper than mTLS at SDK scale.</td>
+      <td>mTLS (client cert distribution painful for mobile); plain API key (replayable)</td>
+    </tr>
+    <tr>
+      <td>Async batch fsync to local disk before Kafka send</td>
+      <td>If the collector crashes between accept and Kafka produce, events are lost. A small WAL on local NVMe with batched fsync (every 5 ms) bounds loss to &lt;10K events even on hard kill, while keeping p99 ingest latency under 20 ms.</td>
+      <td>No WAL (silent data loss); fsync per request (kills throughput)</td>
+    </tr>
+    <tr>
+      <td>OpenTelemetry for collector self-observability</td>
+      <td>The collector itself processes 50B events/day; we need spans on its hot path or we're flying blind during incidents. OTel SDK + OTLP export integrates with the same tracing backend the rest of the platform uses, no extra infra.</td>
+      <td>StatsD (metrics only, no traces); custom logging (no causality across hops)</td>
+    </tr>
+    <tr>
+      <td>30-day raw event archive on S3 Glacier</td>
+      <td>Compliance and dispute resolution require replaying any historical event. Glacier at $1/TB/month makes 30 days of raw 50B events/day (~6 PB) affordable; retrieval latency is fine because audits are non-interactive.</td>
+      <td>Hot S3 (10&times; cost); no archive (compliance/legal exposure)</td>
+    </tr>
+  </tbody>
+</table>

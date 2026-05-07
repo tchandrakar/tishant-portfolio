@@ -1,0 +1,76 @@
+<h1>Consensus: Raft &amp; Paxos in plain English</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">consensus</span>
+  <span class="tag">raft</span>
+  <span class="tag">paxos</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p><b>Consensus</b> is the problem of getting a group of unreliable machines to agree on a single value, in a single order, even though some of them will crash, lag, or disagree about what time it is. <b>Paxos</b> proved it was possible (1989). <b>Raft</b> (2014) made it teachable. Both elect a <i>leader</i> who serializes writes into a replicated log; followers acknowledge each entry, and an entry is "committed" once a <i>majority</i> (a quorum) has it on disk. From the outside, the cluster looks like one consistent machine that never forgets.</p>
+
+<h2>Why it matters</h2>
+<p>Anything that needs to be true everywhere — a config registry, a primary election, a distributed lock, a row in a CP database — sits on top of consensus. etcd, ZooKeeper, Consul, CockroachDB, Spanner, and Kafka's KRaft mode are all consensus systems wearing different hats. Without consensus, two nodes can both believe they're leader (split-brain) and corrupt your data forever.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>etcd / Consul:</b> Raft for cluster metadata; powers Kubernetes' control plane.</li>
+  <li><b>ZooKeeper:</b> Zab (a Paxos cousin) for coordination, used by HBase and old-school Kafka.</li>
+  <li><b>Spanner:</b> Multi-Paxos per shard, with TrueTime for external consistency.</li>
+  <li><b>CockroachDB / TiDB:</b> Raft per-range, hundreds of consensus groups per cluster.</li>
+</ul>
+
+<h2>The mental model (Raft)</h2>
+<div class="ascii-diagram">      term=7, leader=N1
+   +------+        +------+        +------+
+   |  N1  |&lt;------&gt;|  N2  |&lt;------&gt;|  N3  |
+   +------+        +------+        +------+
+      |               |               |
+   log: [x=1, y=2, z=3]  [x=1, y=2, z=3]  [x=1, y=2]
+                                       ^^ lagging follower
+
+   1. Client write -&gt; leader N1
+   2. N1 appends to its log, sends AppendEntries to N2, N3
+   3. Once 2 of 3 (majority) ack -&gt; entry committed
+   4. Leader applies to state machine, returns to client
+   5. Followers apply once they learn commitIndex
+</div>
+<p>If N1 dies, N2 or N3 starts an election by bumping the <i>term</i> and asking for votes. A candidate wins only if a majority votes for it AND its log is at least as up-to-date as theirs — that's how Raft guarantees no committed entry is ever lost.</p>
+
+<h2>Paxos vs Raft: same shape, different vibes</h2>
+<ul>
+  <li><b>Paxos</b> is two phases: <i>prepare</i> (claim a ballot) and <i>accept</i> (propose a value). Multi-Paxos amortizes phase 1 by keeping a stable leader.</li>
+  <li><b>Raft</b> bakes leadership in from the start: <i>leader election</i>, <i>log replication</i>, <i>safety</i>. It's Multi-Paxos with the rough edges sanded off.</li>
+  <li>Both need <b>2f+1</b> nodes to tolerate <b>f</b> failures. 3 tolerates 1, 5 tolerates 2.</li>
+  <li>Both require <b>persistent</b> state (current term, voted-for, log) — fsync before responding.</li>
+</ul>
+
+<h2>Costs and trade-offs</h2>
+<ul>
+  <li><b>Latency:</b> every write is a round-trip to a majority. In a 3-region deployment, that's cross-region RTT on the critical path.</li>
+  <li><b>Throughput ceiling:</b> a single leader serializes writes. Sharding into many Raft groups (one per range) is the standard fix.</li>
+  <li><b>Reads:</b> linearizable reads need either a quorum read or a "leader lease." Stale reads from any follower are cheap but eventually consistent.</li>
+  <li><b>Membership changes</b> (adding/removing nodes) are the hardest part to get right — use joint consensus.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Running an even number of nodes (4 nodes still need 3 votes — same fault tolerance as 3, double the cost).</li>
+  <li>Putting the consensus log on the same disk as the application — fsync contention kills latency.</li>
+  <li>Assuming "leader = always correct"; a partitioned old leader can still serve stale reads without a lease.</li>
+  <li>Trying to scale write throughput by adding nodes — more followers = slower commits, not faster.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> A 5-node Raft cluster is split 2-3 by a network partition. Which side keeps serving writes? What happens to clients connected to the minority side?
+  <br/>
+  <b>Hint:</b> Only the side with a majority (3) can elect a leader and commit. The minority's leader (if any) steps down once it can't reach a quorum on heartbeats; clients there see timeouts or "not leader" errors. When the partition heals, the minority's uncommitted log entries are overwritten.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-consensus-raft-paxos">Design a Raft/Paxos service</a> — leader election, log replication, snapshots.</li>
+  <li><a href="#problem/design-distributed-lock">Design a distributed lock</a> — fencing tokens on top of consensus.</li>
+  <li><a href="#problem/design-spanner-style">Design Spanner-style DB</a> — Paxos per shard + TrueTime.</li>
+</ul>

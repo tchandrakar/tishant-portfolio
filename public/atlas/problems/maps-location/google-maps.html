@@ -1,0 +1,189 @@
+<h1>Design Google Maps (tile serving + routing + Places)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">search</span>
+  <span class="tag">cdn</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a planet-scale mapping platform that renders interactive vector and raster tiles for the entire Earth, computes turn-by-turn driving/walking/transit routes in under a second, indexes ~250 M points-of-interest (Places), and ingests live traffic from a billion mobile probes. Three sub-systems must coexist: <b>tile pipeline</b>, <b>routing engine</b>, and <b>Places search</b>. Optimise for read-mostly traffic, sub-200 ms cold-tile latency, and cost-per-tile (a single global re-render is petabytes).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Pan/zoom map at 22 zoom levels, both raster (PNG/WebP) and vector (Mapbox MVT) tiles.</li>
+  <li>A→B routing across driving, walking, biking, transit; alternative routes; ETA with live traffic.</li>
+  <li>Places autocomplete (&lt;100 ms p50), reverse-geocode lat/lng → address.</li>
+  <li>Street-level imagery (Street View) with 360 panoramas.</li>
+  <li>User contributions: edits, photos, reviews, "Your Timeline" location history.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> tile p99 &lt; 200 ms, route p99 &lt; 800 ms, autocomplete p99 &lt; 150 ms.</li>
+  <li><b>Scale:</b> 1B+ MAU, 25 B tile requests/day, 10 B route requests/day, 5 B autocomplete/day.</li>
+  <li><b>Availability:</b> 99.99% for tile/Places, 99.95% for routing.</li>
+  <li><b>Freshness:</b> traffic &lt; 2 min, Places edits &lt; 24 h, base map &lt; 14 days.</li>
+  <li><b>Footprint:</b> petabytes of tiles, exabytes of Street View imagery.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 25 B tiles/day ≈ 290 K rps avg, 1 M peak. Routes ≈ 115 K rps avg.</li>
+  <li>Tile storage: 22 zooms, &gt; 4^22 ≈ 17 T tiles theoretical; sparse populated set ≈ 50 B tiles × 30 KB = 1.5 PB per render of vector; raster pyramid ≈ 5 PB.</li>
+  <li>Road graph: ~150 M nodes, ~400 M edges globally; CH-augmented graph ≈ 80 GB in RAM per region shard.</li>
+  <li>Probe ingest: 1 B devices × 1 ping/30 s peak = 33 M events/s; compressed at 30 B = 1 GB/s into Kafka.</li>
+  <li>Bandwidth: avg vector tile 18 KB → 25 B × 18 KB ≈ 450 TB/day egress (CDN absorbs &gt;95%).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/tiles/{layer}/{z}/{x}/{y}.mvt           → vector tile bytes
+GET   /v1/route                                    ?origin=lat,lng&dest=lat,lng&mode=driving
+POST  /v1/places/autocomplete   {q, lat, lng}      → [{placeId, label, score}]
+GET   /v1/places/{placeId}                         → details, photos, hours
+GET   /v1/geocode               ?address=...       → [{lat,lng,placeId}]
+POST  /v1/probes                {deviceId, [pings]} → 204</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Mobile/Web] → [Edge CDN: 150+ POPs] ──cache miss──▶ [Tile API GW]
+                                                          │
+       ┌──────────────────────────┬──────────────────────┼──────────────────────┐
+       ▼                          ▼                      ▼                      ▼
+  [Tile Renderer]            [Routing Svc]         [Places Svc]          [Probe Ingest]
+   ↑ Mapnik/Vector            ↑ CH road graph       ↑ ES + Bigtable       ↓ Kafka
+   │                          │                     │                     │
+  [Tile Cache: Bigtable] [Graph shards: RAM]  [Place index: ES]   [Flink → traffic.tiles]
+       ▲                          ▲                      ▲                      │
+       │                          │                      │                      ▼
+       └──────────────[Spanner: master OSM-like edits]───┴──────────[Live traffic store]
+</div>
+<p>Tiles: client requests <code>/z/x/y</code>; CDN serves 95%+ from edge. On miss, Tile API checks Bigtable; if absent, dispatches to renderer pool that pulls geometry from Spanner-backed feature store and writes back. Routing: API hashes origin region, forwards to a CH graph shard; live-traffic edge weights merged via in-memory overlay updated every 60 s. Places: ES handles autocomplete with edge-ngrams; full details from Bigtable keyed by placeId.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Tile metadata (Bigtable)</h3>
+<pre>row_key = sha1(layer)#z#tile_xy_morton
+columns: blob (mvt), etag, version, rendered_at
+TTL: derived layers 14d; static base layer infinite</pre>
+<h3>7.2 Road graph (custom on RocksDB + RAM)</h3>
+<pre>nodes(node_id, lat, lng, country_shard)
+edges(src, dst, length_m, free_flow_s, road_class, restrictions_bitmap)
+ch_shortcuts(src, dst, weight, contracted_via)</pre>
+<h3>7.3 Places (Elasticsearch + Bigtable)</h3>
+<pre>ES doc: {place_id, name_ngrams, geohash7, category, popularity}
+BT row: place_id → {photos[], hours, reviews_ref}</pre>
+<h3>7.4 Why this mix?</h3>
+<p>Bigtable for blob-ish tiles + Places (write-once-read-many, cheap range scans by Morton code). Spanner for transactional map edits — global ACID matters when one editor splits a road. ES purpose-built for ngram autocomplete with geo-filtering. RocksDB+RAM for routing graph because traversals must be sub-millisecond.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Tile pipeline (DDIA Ch. 10 batch)</h3>
+<p>Nightly Spark job reads OSM-derived feature tables, runs Mapnik-style stylesheet, emits MVTs partitioned by Morton key into Bigtable. Incremental "dirty tile" path: editors mark bbox → SQS-fan-out → only affected z=14 parents re-render, children invalidated lazily by ETag bump.</p>
+<h3>8.2 Routing engine</h3>
+<p>Contraction Hierarchies pre-compute (1-time, ~6 h per continent) shrinks bidirectional Dijkstra from 400 M-edge graph to ~3 ms p99 lookups. Live traffic injects multiplicative edge factors via shared-memory ring buffer; CH validity is preserved because shortcuts stay correct under monotonic weight increases (we re-rank only top-k candidates).</p>
+<h3>8.3 Places autocomplete</h3>
+<p>Two-stage: ES prefix lookup with geo-filter (5 km radius around device) returns top-50; ranker (LightGBM) re-scores with personalisation, click-through priors, and live business hours.</p>
+<h3>8.4 Traffic ingest (DDIA Ch. 11 stream)</h3>
+<p>Probes → Kafka (sharded by tile_id) → Flink windowed aggregator (1 min tumbling) → per-edge speed median → publishes to traffic.tiles topic consumed by routing front-ends.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot tiles (Times Square z=18):</b> push-pin to every CDN POP, shielded origin, separate "hot tier" with 30 s TTL.</li>
+  <li><b>Cross-region routes (NYC → LA):</b> overlay graph of ~5 K boundary nodes pre-computed; query stitches 2 region searches + overlay.</li>
+  <li><b>Bigtable hot rows:</b> Morton ordering creates locality but also hotspots — salt with 4-bit prefix on writes to spread across tablets.</li>
+  <li><b>Probe storms (rush hour):</b> client-side coalescing, server back-pressure via Kafka quotas.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Vector tiles (MVT) over raster</td><td>10× smaller, client-side restyle</td><td>Heavier client GPU; older devices struggle</td></tr>
+<tr><td>Contraction Hierarchies vs A*</td><td>1000× speedup at query time</td><td>Hours of pre-compute; harder to update</td></tr>
+<tr><td>Spanner for edits</td><td>Global ACID, no split-brain</td><td>Expensive, write latency 50-100 ms</td></tr>
+<tr><td>ES for Places</td><td>Rich text + geo + facets</td><td>Index rebuilds painful at 250 M docs</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 10 Batch Processing — nightly Spark tile re-render pipeline.</li>
+  <li>Ch. 11 Stream Processing — Kafka + Flink for live traffic.</li>
+  <li>Ch. 6 Partitioning — Morton-coded tile keys, region shards for road graph.</li>
+  <li>Ch. 9 Consistency — Spanner for ACID map edits vs eventual for tiles.</li>
+  <li>Ch. 12 The Future — multi-DC active-active for read traffic.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd separate the three sub-systems with hard API boundaries; tiles are the cheap, cacheable workhorse and pay for the long tail of routing."</li>
+  <li>"The hardest part is keeping CH valid under live traffic — I'd discuss the 'turn restrictions + monotonic weight' invariant explicitly."</li>
+  <li>"Places at 250 M docs is where ES starts hurting; I'd shard by country and front it with a learned-bloom prefix filter."</li>
+  <li>"For an MVP, skip CH and use bidirectional Dijkstra on a single metro graph — ship in 2 sprints, then iterate."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Bigtable (tile blobs + Places details)</td>
+      <td>Morton-coded row keys keep neighbouring tiles physically adjacent on tablets, so a 9-cell viewport scan hits ~3 tablets instead of 9. At 25 B tile reads/day and 5 PB raster pyramid, we need cheap range scans on a write-once-read-many blob, which is exactly Bigtable's sweet spot.</td>
+      <td>S3 (no range scans, 100 ms p99 cold); Cassandra (worse compaction at petabyte scale); HBase (Bigtable is the managed equivalent).</td>
+    </tr>
+    <tr>
+      <td>Spanner (master OSM-like edits)</td>
+      <td>When an editor splits a road or moves a POI, we need global ACID — two simultaneous edits on the same edge in NYC and Tokyo must serialise or we corrupt the graph. TrueTime gives external consistency across continents at the cost of 50-100 ms write latency, which is fine for editor workflows.</td>
+      <td>CockroachDB (similar but smaller ecosystem); MySQL with cross-region replication (no global serialisability); DynamoDB (no SQL joins for editor UI).</td>
+    </tr>
+    <tr>
+      <td>S2 cells (geo indexing for Places)</td>
+      <td>Equal-area hierarchical cells let us cover a 5 km autocomplete radius with ~9 cells regardless of latitude. Geohash distorts area near poles by 2x and breaks at antimeridian; for 250 M Places with a global query distribution this matters for relevance fairness.</td>
+      <td>Geohash (rectangle distortion); H3 (hex shape complicates radius cover math); Quadtree (no equal-area guarantee).</td>
+    </tr>
+    <tr>
+      <td>Contraction Hierarchies (CH) on RocksDB+RAM</td>
+      <td>Plain Dijkstra on 400 M edges costs ~10 s/query — at 115 K rps avg that's 1.15 M cores. CH preprocesses (~6 h per continent) into shortcuts that cut visited nodes 1000×, hitting 1-3 ms p99 on continental routes within an 80 GB RAM footprint per shard.</td>
+      <td>A* with great-circle heuristic (~200 ms — too slow at 400 K peak rps); ALT with 16 landmarks (~10× speedup, still 50 ms); plain bidirectional Dijkstra (~1 s).</td>
+    </tr>
+    <tr>
+      <td>Customisable CH (CCH) for live traffic</td>
+      <td>Pure CH freezes weights, but live traffic shifts edge times every 60 s. CCH separates structure pre-compute from a 5 s "customisation" pass that re-applies fresh weights, letting us push traffic factors continuously without invalidating the 1000× speedup.</td>
+      <td>Re-running CH from scratch (6 h, impossible per minute); real-time A* (200 ms p99 violates SLA); arc-flags (similar speedups but harder to update).</td>
+    </tr>
+    <tr>
+      <td>Elasticsearch (Places autocomplete)</td>
+      <td>5 B autocomplete/day requires sub-100 ms prefix matching against 250 M docs with geo-filter and category facets. Edge-ngrams + geo_distance + custom scoring is exactly the workload ES is tuned for; we accept the painful 250 M-doc reindex cost (sharded by country) as the price of feature richness.</td>
+      <td>Trie-based custom service (no facets); Solr (ecosystem smaller); FoundationDB+custom ngram (rebuild it ourselves — not worth two engineers).</td>
+    </tr>
+    <tr>
+      <td>Kafka + Flink (probe ingest pipeline)</td>
+      <td>33 M probes/s = 1 GB/s sustained, with bursty rush-hour spikes. Kafka sharded by tile_id provides locality so per-edge aggregators stay on one node; Flink's 1-min tumbling windows + checkpoints give exactly-once aggregation, hitting the 2-min freshness SLA.</td>
+      <td>Kinesis (1 MB/s/shard limit forces 1000s of shards); Spark Streaming (microbatches add latency); Pulsar (ops overhead, smaller talent pool).</td>
+    </tr>
+    <tr>
+      <td>Mapnik vector tiles (MVT)</td>
+      <td>MVT averages 18 KB vs ~80 KB for raster PNG at z=14, cutting CDN egress from ~2 PB/day to 450 TB/day at our 25 B request volume. Client-side restyle also lets us serve dark mode and language overlays without re-rendering 50 B tiles server-side.</td>
+      <td>Raster PNG (4× bandwidth, server restyle); WebP raster (smaller but still server-side restyle); 3D tiles (overkill for 2D pan/zoom).</td>
+    </tr>
+    <tr>
+      <td>CDN (150+ edge POPs)</td>
+      <td>95%+ of tile requests are repeats at popular zooms — Manhattan z=14 gets millions of hits/hour. Pushing the long-tail-flattened 50 GB hot working set to every POP brings p99 from 200 ms (origin) to 30 ms (edge) and absorbs &gt;95% of 290 K rps off the origin tier.</td>
+      <td>Origin-only with bigger Bigtable cluster (10× cost, worse latency); single-region CDN (cross-Atlantic RTT kills mobile UX).</td>
+    </tr>
+    <tr>
+      <td>Spark (nightly tile re-render)</td>
+      <td>OSM-derived feature tables are TB-scale; Mapnik render across 50 B tiles is embarrassingly parallel. A nightly Spark job partitions by Morton parent and writes back to Bigtable in 6-8 h, using DDIA Ch. 10 batch semantics — idempotent, replayable, no streaming complexity for static base layers.</td>
+      <td>Flink batch (less mature for TB shuffles); Beam on Dataflow (vendor lock-in); custom MapReduce (reinvent the wheel).</td>
+    </tr>
+    <tr>
+      <td>LightGBM (Places ranker)</td>
+      <td>Two-stage retrieval-then-rank: ES returns top-50 candidates, LightGBM re-scores with 30+ features (distance, click-priors, hours, personalisation) in &lt;5 ms per query. Trees handle non-linear feature interactions cheaply; we don't need a deep model when the candidate set is already tight.</td>
+      <td>Deep neural ranker (50 ms inference, 10× cost); pure ES BM25 (no personalisation); XGBoost (similar but LightGBM trains 2× faster on our 1B click logs).</td>
+    </tr>
+    <tr>
+      <td>Morton (Z-order) curve for tile keys</td>
+      <td>Bigtable row-key sort order determines locality. Morton interleaves x/y bits so a 2D viewport (a square in tile space) maps to a small number of 1D row ranges — typically 2-4 — making "fetch the 16 tiles around me" a couple of range scans instead of 16 random reads.</td>
+      <td>Hilbert curve (~10% better locality but 3× more code); plain row-major (column scan is 1D, terrible for viewport); raw geohash strings (no native int support).</td>
+    </tr>
+  </tbody>
+</table>

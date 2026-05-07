@@ -51,6 +51,13 @@ const DEFAULT_WINDOWS: Record<string, Omit<WindowState, 'isOpen' | 'isMinimized'
     position: { x: 140, y: 60 },
     size: { width: 700, height: 550 },
   },
+  atlas: {
+    id: 'atlas',
+    title: "Architect's Atlas — System Design Vault",
+    icon: 'library',
+    position: { x: 80, y: 50 },
+    size: { width: 1100, height: 680 },
+  },
 };
 
 export function useWindowManager() {

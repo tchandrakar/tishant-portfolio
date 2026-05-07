@@ -1,0 +1,210 @@
+<h1>Design Consensus (Raft and Paxos walkthrough)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a fault-tolerant consensus protocol that lets a cluster of N nodes agree on an ordered log of commands despite up to f = floor((N-1)/2) crash failures and an asynchronous, lossy network. This is the substrate of etcd, ZooKeeper (ZAB), Consul, CockroachDB, TiKV, Spanner, MongoDB elections, Kafka KRaft, and every modern strongly-consistent distributed system. The interview wants two artifacts: a precise Raft walkthrough (leader election, log replication, safety, membership change) and a contrast with classic Paxos / Multi-Paxos (DDIA Ch. 9 "Consensus" and Ch. 8 "Trouble with Distributed Systems").</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Replicated state machine semantics: every replica applies the same commands in the same order.</li>
+  <li>Linearizable reads and writes against the cluster.</li>
+  <li>Tolerate f crash failures with N = 2f+1 nodes; remain safe under arbitrary network partitions.</li>
+  <li>Online membership change without downtime.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Safety:</b> at most one decision per log slot, ever, even across leadership changes.</li>
+  <li><b>Liveness:</b> progress when a majority is up and can communicate within ~election timeout.</li>
+  <li><b>Commit latency:</b> 1 RTT to a majority; ~1-3 ms within a DC, 50-150 ms cross-region.</li>
+  <li><b>Throughput:</b> 10k-100k ops/s/group with batching+pipelining.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>5-node cluster tolerates 2 failures; 7-node tolerates 3 (diminishing returns due to majority size).</li>
+  <li>Per-op fsync at every replica; batch 100-1000 ops per fsync to amortize.</li>
+  <li>Log storage = state-machine command rate * retention until snapshot.</li>
+  <li>Snapshot every ~100 MB of log; compaction reclaims pre-snapshot entries.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Client
+propose(cmd) -&gt; {ok, index} | {redirect, leader} | NotLeader
+read(query, {linearizable: true}) -&gt; result            // via ReadIndex
+// Internal RPC (Raft)
+RequestVote(term, lastLogIdx, lastLogTerm)
+AppendEntries(term, prevIdx, prevTerm, entries[], leaderCommit)
+InstallSnapshot(term, lastIdx, lastTerm, data)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">          clients
+             |
+             v
+   +---------------+        +----------+
+   |  Leader (T=7) | -----&gt; | Follower |  AppendEntries(prev, e[])
+   |               | -----&gt; | Follower |
+   |  log: [...]   | -----&gt; | Follower |
+   +---------------+        +----------+
+        ^      ^
+        |      | RequestVote on timeout
+   Candidate (term T=8)
+
+  States:  Follower  --timeout--&gt;  Candidate  --majority--&gt;  Leader
+                                       |                       |
+                                       +--- higher term ------+
+
+  Log:  index : 1 2 3 4 5 6 7 ...
+        term  : 1 1 2 3 3 3 4
+        cmd   : x y z a b c d
+        commit at majority &gt;= index AND entry term == currentTerm.</div>
+<p>Walk-through: Raft elects a leader for a term; the leader is the sole source of log entries. Followers append, the leader commits an entry once a majority has it (in the leader's current term — the famous safety bug fix in figure 8 of the Raft paper). Committed entries are applied to the state machine in order and acknowledged to clients.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 On-disk Raft state</h3>
+<pre>persistent: currentTerm, votedFor, log[]   (must fsync before reply)
+volatile  : commitIndex, lastApplied
+leader    : nextIndex[i], matchIndex[i]
+log entry : (index, term, command, type)</pre>
+<h3>7.2 Snapshots</h3>
+<p>State machine periodically dumps its state and the included <code>(lastIdx, lastTerm)</code>. Log prior to that index is truncated. Slow followers receive InstallSnapshot RPCs to catch up — essential for membership changes and recovery from long partitions.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Leader election</h3>
+<p>Each follower starts a randomized election timeout (e.g., 150-300 ms). On expiry it bumps term, votes for itself, requests votes. A vote is granted iff (a) the requester's term &gt;= ours, (b) we haven't voted in this term, and (c) the requester's log is at least as up-to-date as ours (last-log-term then last-log-index). Majority wins. Randomization breaks split votes.</p>
+<h3>8.2 Log replication &amp; safety</h3>
+<p>Leader assigns the next index, appends locally, sends AppendEntries to all followers with <code>(prevIndex, prevTerm)</code> as a consistency check. Followers reject if their log doesn't match — leader decrements <code>nextIndex</code> and retries until it finds the divergence point, then overwrites the suffix. <b>Safety invariants</b> (Raft figure 3): election safety, leader append-only, log matching, leader completeness, state-machine safety. The non-trivial bit is "a leader may only commit entries from its current term" to avoid the figure-8 bug.</p>
+<h3>8.3 Linearizable reads</h3>
+<p>Three options: (1) commit a no-op via the log (1 RTT, simple), (2) <i>ReadIndex</i> — record commit index, send heartbeat to majority to confirm leadership, then wait for state machine to apply up to that index (no log write), (3) <i>leases</i> — leader proves it holds an unexpired lease and reads locally (clock-skew bound). Etcd defaults to ReadIndex.</p>
+<h3>8.4 Membership changes</h3>
+<p>Naive simultaneous swap can split a cluster into two majorities. Raft's solution is <i>joint consensus</i>: transition through C_old,new where decisions need majorities of both configs, then to C_new. Single-server changes are a simpler restricted case used in etcd.</p>
+<h3>8.5 Paxos contrast</h3>
+<ul>
+  <li><b>Basic Paxos:</b> two phases — Prepare(n) collects promises, Accept(n,v) commits a value for one slot.</li>
+  <li><b>Multi-Paxos:</b> elect a stable distinguished proposer (effectively a leader) and skip Phase 1 for subsequent slots; otherwise indistinguishable from Raft on the wire.</li>
+  <li><b>EPaxos:</b> leaderless, exploits commutativity, fast-path 1 RTT to fast quorum (3f/2 for f=2).</li>
+  <li><b>Flexible Paxos:</b> Q1 (prepare) and Q2 (accept) only need to overlap, not be majorities — enables grid quorums.</li>
+</ul>
+<p>Raft chose understandability over flexibility (as the paper title states); Paxos is more general but historically harder to implement correctly. ZAB (ZooKeeper) is a primary-backup variant tuned for state-machine replication.</p>
+<h3>8.6 Failure scenarios</h3>
+<ul>
+  <li><b>Leader crash mid-replication:</b> entries on a minority may be overwritten by a new leader with longer/equal log; safe by leader-completeness.</li>
+  <li><b>Network partition:</b> a leader on the minority side cannot commit (no majority); the majority elects a new term and proceeds. The old leader steps down on receiving higher term.</li>
+  <li><b>Disrupting candidate:</b> a partitioned node bumps terms continuously; PreVote (Raft extension) prevents term inflation.</li>
+</ul>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Single-group throughput cap:</b> one fsync chain per group; shard the keyspace into many Raft groups (TiKV, CockroachDB).</li>
+  <li><b>Cross-region commit latency:</b> 1 RTT to majority. Mitigation: place majority in primary region, use witness/learner replicas elsewhere.</li>
+  <li><b>Heartbeat overhead:</b> O(N) per tick; co-locate groups and batch heartbeats (MultiRaft).</li>
+  <li><b>Read-mostly workloads:</b> use leases or follower reads with safe-time to scale reads horizontally.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Raft over Paxos</td><td>Easier to implement; strong leader simplifies invariants</td><td>Less flexible; throughput tied to single leader</td></tr>
+<tr><td>EPaxos / leaderless</td><td>1 RTT in geo; load-balanced</td><td>Complex conflict detection; rare implementations</td></tr>
+<tr><td>Lease-based reads</td><td>Local reads; high throughput</td><td>Requires bounded clock drift</td></tr>
+<tr><td>5 nodes vs 3</td><td>Survives 2 failures</td><td>Higher commit latency, more storage</td></tr>
+<tr><td>Multi-Raft sharding</td><td>Linear scaling</td><td>Cross-shard transactions need 2PC</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 9 "Consensus" — Total order broadcast equivalence; epoch numbering and quorums.</li>
+  <li>Ch. 9 "Distributed Transactions and Consensus" — 2PC's relationship to consensus and the "membership and coordination services" pattern.</li>
+  <li>Ch. 8 "Trouble with Distributed Systems" — unbounded delays, faulty clocks, why fencing tokens matter for split-brain.</li>
+  <li>Ch. 9 "Linearizability" — the safety property consensus implements.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd reach for Raft as the implementation, but I'd describe consensus abstractly as total-order broadcast — that framing makes 2PC, Spanner, and Kafka KRaft fall out as instances."</li>
+  <li>"The figure-8 bug is the gotcha — a freshly elected leader cannot commit old-term entries on its own, only by piggybacking a current-term entry."</li>
+  <li>"For geo deployments I'd shard with Multi-Raft and use Spanner-style read leases; pure single-leader Raft hits a wall around 30k ops/s/group on typical hardware."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Raft (over classic Paxos)</td>
+      <td>The strong-leader model collapses several Paxos correctness conditions into one invariant ("only the leader appends") and gives an explicit leader election protocol. DDIA Ch. 9 explicitly notes that operational consensus systems converged on Raft because invariant-checking is straightforward, while Multi-Paxos is wire-equivalent but harder to reason about.</td>
+      <td>Multi-Paxos (more flexible quorums, but ambiguous leader role makes implementation error-prone — see Chubby paper); EPaxos (1 RTT geo wins but rare in practice, complex conflict graph).</td>
+    </tr>
+    <tr>
+      <td>N = 2f+1 odd cluster size (typically 3 or 5)</td>
+      <td>Majority quorum is the smallest reliable failure-detector under DDIA Ch. 8's asynchronous-network assumptions. 5 nodes tolerate 2 failures while keeping the majority small (3) for low commit latency; 7 gives diminishing returns because every commit waits for 4 acks.</td>
+      <td>Even N (e.g., 4) — same fault tolerance as 3 but more commit cost; N=3 (only tolerates 1 failure — risky during rolling restarts).</td>
+    </tr>
+    <tr>
+      <td>Randomized election timeout (150-300 ms)</td>
+      <td>Breaks split votes between simultaneous candidates without coordination — the elegant property that makes Raft elections terminate quickly. Range covers typical inter-DC RTT plus jitter so a healthy leader's heartbeat always preempts the timeout.</td>
+      <td>Fixed timeout (split votes recur indefinitely); priority-based election (requires global priority oracle — chicken-and-egg).</td>
+    </tr>
+    <tr>
+      <td>PreVote extension</td>
+      <td>A partitioned node otherwise increments its term on every timeout, so when it rejoins it disrupts the live leader by causing a step-down. PreVote checks if a real election would succeed before bumping term — fixes the "disrupting candidate" failure mode flagged in §8.6.</td>
+      <td>Naive election (term inflation causes spurious leadership churn); pre-election barrier (custom solution, less battle-tested than PreVote).</td>
+    </tr>
+    <tr>
+      <td>Log matching + leader-completeness invariants</td>
+      <td>The two safety properties from Raft figure 3: identical (index, term) means identical log prefix; an elected leader has every committed entry. Together they guarantee state-machine safety without per-entry consensus, simplifying the proof DDIA Ch. 9 references.</td>
+      <td>Per-entry Paxos (correct but high-overhead); chain replication (simpler but reconfiguration is hard, no leader-driven catch-up).</td>
+    </tr>
+    <tr>
+      <td>Current-term commit rule (Raft figure 8 fix)</td>
+      <td>A leader may not commit an entry from a prior term solely on majority replication — it must piggyback a current-term entry. This closes the famous figure-8 safety bug where an old entry could be silently overwritten after re-election.</td>
+      <td>Naive "majority means committed" (the original bug — corrupts the replicated state machine on specific election sequences).</td>
+    </tr>
+    <tr>
+      <td>fsync of currentTerm, votedFor, log[] before reply</td>
+      <td>These three fields must survive a crash or election safety breaks (a node could vote twice in the same term). DDIA Ch. 8's "unreliable storage" hammer: trusting OS page cache here is a correctness bug, not a performance issue.</td>
+      <td>Async persistence (election safety violations on crash); separate file per field (more fsyncs per RPC — kills throughput).</td>
+    </tr>
+    <tr>
+      <td>Batching + pipelining of AppendEntries</td>
+      <td>One fsync amortizes 100-1000 entries; pipelining lets the leader send the next batch before the previous batch is acked. Together they take a single Raft group from ~1k ops/s to 30k+ ops/s — the §9 throughput target.</td>
+      <td>Per-entry RPC (fsync-bound at ~1k ops/s); batching only without pipelining (RTT-bound; cannot saturate disk).</td>
+    </tr>
+    <tr>
+      <td>ReadIndex for linearizable reads</td>
+      <td>Records the current commit index, sends a heartbeat to confirm leadership, then waits for state-machine apply — no log write, no fsync per read. The etcd default and the right balance between correctness (no stale reads) and throughput (no extra log entries).</td>
+      <td>No-op log entry per read (1 fsync per read — kills read throughput); leader leases (faster but require bounded clock drift — DDIA Ch. 8 warns); follower reads without safe-time (stale).</td>
+    </tr>
+    <tr>
+      <td>Leader leases (with bounded clock drift)</td>
+      <td>A timed lease lets the leader serve reads locally without a heartbeat round-trip — order-of-magnitude read throughput win when clock infrastructure is solid. Falls back to ReadIndex when the lease is questionable.</td>
+      <td>Pure ReadIndex (1 RTT per read — caps geo read throughput); leases on best-effort clocks (correctness violation under skew — DDIA Ch. 8).</td>
+    </tr>
+    <tr>
+      <td>Joint consensus (C_old,new) for membership change</td>
+      <td>The naive simultaneous swap can produce two disjoint majorities under network partition, both committing different values. Joint consensus requires a majority of both old and new configs during the transition — Raft's safety-preserving membership change.</td>
+      <td>Stop-the-world reconfiguration (requires downtime); single-server changes only (limits operational flexibility — though etcd uses this restricted form).</td>
+    </tr>
+    <tr>
+      <td>Snapshots with InstallSnapshot RPC</td>
+      <td>Without snapshots, the log grows unbounded and slow followers can never catch up. Snapshotting the state machine and truncating the log keeps storage bounded; InstallSnapshot replaces a stale follower's state in one transfer instead of replaying GBs of log.</td>
+      <td>No snapshots (unbounded log growth — operational blowup); copy-on-write state-machine snapshots only (fine for in-memory state, hard for disk-resident KVs).</td>
+    </tr>
+    <tr>
+      <td>Multi-Raft / sharded groups (TiKV / CockroachDB pattern)</td>
+      <td>A single Raft group is bottlenecked by one fsync chain. Sharding the keyspace into thousands of independent groups, each with its own Raft, scales linearly. The §9 mitigation for the single-group throughput cap.</td>
+      <td>Single huge Raft group (caps cluster throughput at one group's rate); EPaxos (leaderless balances load but conflict resolution is complex at scale).</td>
+    </tr>
+    <tr>
+      <td>Witness / learner replicas (non-voting)</td>
+      <td>Geo deployments need replicas in remote regions for read locality and disaster recovery, but voting replicas in remote regions add their RTT to every commit. Non-voting learners receive the log without participating in quorum — the standard Spanner / CockroachDB pattern for cross-region reads.</td>
+      <td>All voting replicas across regions (every commit pays max-region RTT); async DC-level shipping outside Raft (loses linearizability for that region's reads).</td>
+    </tr>
+  </tbody>
+</table>

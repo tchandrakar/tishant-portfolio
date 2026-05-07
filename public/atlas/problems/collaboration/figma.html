@@ -1,0 +1,133 @@
+<h1>Design Figma (CRDT, multiplayer cursors, vector graphics sync)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">collaboration</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a browser-based multiplayer vector design tool. Many designers edit the same canvas concurrently — moving rectangles, editing vector paths, nesting frames — while seeing each other's cursors and selections in real time. The data model is a <b>tree of objects with properties</b>, not text, so we use <b>CRDTs</b> (specifically a tree CRDT + LWW maps) instead of OT. Real Figma uses a custom Rust+C++ multiplayer server with a tree CRDT very similar to Yjs.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Tree of objects: page → frame → group → shape, arbitrary nesting.</li>
+  <li>Move, resize, restyle, reparent, delete, undo/redo per user.</li>
+  <li>Multiplayer cursors, selection halos, follow-mode.</li>
+  <li>Components / instances with overrides (additional CRDT layer).</li>
+  <li>Branching &amp; merge of design files.</li>
+  <li>Offline-first: edit while disconnected, merge later without a central referee.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 cursor echo &lt; 30 ms within region; property echo &lt; 80 ms.</li>
+  <li><b>Scale:</b> 50 M MAU, 5 M concurrent multiplayer sessions, 200 M files.</li>
+  <li><b>File size:</b> p99 file = 250 MB serialized, 10 M nodes.</li>
+  <li><b>Convergence:</b> strong eventual consistency; same set of ops → same state regardless of order.</li>
+  <li><b>Availability:</b> 99.95% on the multiplayer path.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Cursor updates: 5 M sessions × 30 Hz × 16 B = ~2.4 GB/s aggregate (most in-region).</li>
+  <li>Edit ops: avg 4 ops/s/active-user × 1 M concurrently active = 4 M ops/s, ~250 B each → 1 GB/s.</li>
+  <li>File storage: 200 M files × avg 30 MB = 6 PB; hot tier 600 TB on NVMe.</li>
+  <li>Op log retention: 30 days hot, infinite cold (S3 Glacier) for version history.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>WS  /v1/file/{fileId}/multiplayer        → { sessionId, peerId, snapshot, vectorClock }
+WS  C2S { type:"op",   ops:[{nodeId,prop,value,clock}] }
+WS  C2S { type:"cursor", x,y,viewport }
+WS  S2C { type:"op",   ops:[...], originPeer }
+WS  S2C { type:"presence", peers:[{id,name,color,cursor,sel}] }
+GET /v1/file/{fileId}/snapshot?rev=     → binary CRDT doc
+POST /v1/file/{fileId}/branch            → branchId</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client (WASM CRDT)]──WS──&gt;[Edge PoP]──&gt;[MP Router]──&gt;[Multiplayer Server]
+                                                          │   (per-file actor, Rust)
+                                                          ├─&gt;[CRDT in RAM]
+                                                          ├─&gt;[Op log: FoundationDB]
+                                                          └─&gt;[Snapshot: S3]
+                                              [Pub/Sub bus] for cursor/presence
+</div>
+<p>Each open file is hosted by exactly one MP Server actor. Edits are applied to an in-memory CRDT and broadcast. The CRDT runs identically in the browser (WASM) so clients can apply remote ops and edit offline.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 CRDT shape</h3>
+<pre>Doc = Map&lt;NodeId, Node&gt;
+Node = {
+  id: GUID,
+  parent: LWW&lt;NodeId&gt;,        // tree CRDT (Kleppmann move-tree)
+  index: Fractional&lt;Position&gt;, // ordering siblings
+  props: LWWMap&lt;String, Value&gt;,
+  text:  Yjs.YText (only for text layers)
+}</pre>
+<h3>7.2 Op log (FoundationDB)</h3>
+<p>Keyed by (file_id, lamport_ts, peer_id). FDB gives ordered range scans + ACID multi-key txn for snapshotting. DDIA Ch.5 covers leaderless replication patterns; here we use it as a serialization point per file.</p>
+<h3>7.3 Snapshots</h3>
+<p>Every 5,000 ops we serialize the CRDT (Yjs-style update encoding, ~typically 30% of naive JSON) to S3. Loading = snapshot + ops since.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Tree CRDT</h3>
+<p>Naive parent-LWW lets two concurrent moves create a cycle (A→B and B→A). Figma-style fix (Kleppmann 2020 "Move op for tree CRDT"): each move op carries the old parent; on merge, replay ordered by Lamport ts and undo any op that would create a cycle. Conflict-free, deterministic, ~O(n) replay cost — fine because moves are rare.</p>
+<h3>8.2 Sibling ordering</h3>
+<p>Fractional indexing (LSEQ-like). Inserting between A(0.5) and B(0.6) yields C(0.55). After ~50 inserts in the same gap we rebalance the file.</p>
+<h3>8.3 Cursors / presence</h3>
+<p>Never go through the CRDT. Separate UDP-like channel (WebTransport) at 30 Hz. Server just relays — no persistence, no ordering guarantees.</p>
+<h3>8.4 Undo</h3>
+<p>Per-user undo stack of inverse ops. Because CRDT ops are commutative, undoing a remote-modified node still works without "spooky" effects on other users.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Huge files (10 M nodes):</b> CRDT memory ≈ 1.5 GB; we stream-load by viewport, lazily hydrating subtrees.</li>
+  <li><b>Hot file (1k editors in a design review):</b> the single MP Server saturates at ~50k ops/s; we relay reads through edge fanout servers.</li>
+  <li><b>Op log growth:</b> Yjs garbage collection drops tombstones once all peers have acknowledged a vector clock.</li>
+  <li><b>Failover:</b> actor lease in etcd; on crash, new actor replays last snapshot + tail (under 2 s for 95% of files).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>CRDT vs OT</td><td>Decentralized merge, true offline, no transform-function bugs</td><td>~2× payload, tombstone bloat, complex tree-move semantics</td></tr>
+<tr><td>Yjs-style encoding</td><td>30% of naive JSON; battle-tested</td><td>Custom binary format, hard to debug</td></tr>
+<tr><td>Single actor per file</td><td>Linear ops within file, simple</td><td>Per-file ceiling on writes</td></tr>
+<tr><td>Cursors out-of-band</td><td>30 Hz cheap, no log pollution</td><td>Cursor jumps possible if user types fast</td></tr>
+<tr><td>Fractional indexing</td><td>Cheap concurrent inserts</td><td>Periodic rebalance needed</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-leader / leaderless replication; Figma is effectively leaderless within a session.</li>
+  <li>Ch. 9 Consistency — strong eventual consistency (CRDT) vs linearizability (Docs/OT); the trade-off is at the heart of this design.</li>
+  <li>Ch. 7 Transactions — actor model gives single-writer serializability per file.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"CRDTs win here because the data is a tree of properties, not a 1-D string — OT's transform functions get exponentially worse on trees."</li>
+  <li>"The killer correctness bug is the move-cycle problem; I'd cite Kleppmann's 2020 paper as my reference solution."</li>
+  <li>"Tombstone GC is the silent killer at scale; I'd build the vector-clock tracker on day 1, not day 100."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Yjs-style CRDT</td><td>The data is a tree of properties, not a 1-D string — OT's transform pairs explode combinatorially on trees. CRDT gives strong eventual consistency, true offline edit, and ~30% of naive JSON via run-length encoding, surviving our 250 MB p99 file budget.</td><td>OT/Jupiter (rejected: tree-move transforms are an open research problem); Automerge (viable; rejected for slower merge perf at 10 M nodes vs Yjs).</td></tr>
+    <tr><td>Kleppmann move-tree CRDT</td><td>Naive parent-LWW lets concurrent moves form cycles (A→B, B→A). Kleppmann 2020's algorithm replays moves in Lamport order and undoes any cycle-creating op, deterministic and conflict-free at O(n) replay since moves are rare (&lt; 1% of ops).</td><td>Parent-LWW (rejected: cycle bug); centralized move serialization (rejected: kills offline edit promise).</td></tr>
+    <tr><td>Rust multiplayer server</td><td>Each MP Server hosts a per-file actor that saturates at ~50k ops/s. Rust's no-GC tail latency keeps p99 property echo &lt; 80 ms even at 1 M concurrent active editors; tokio's per-task scheduling beats Go's GC pauses on hot files.</td><td>Go (rejected: 5–20 ms GC pauses break 30 ms cursor SLO); Java (rejected: same GC issue + 2× memory).</td></tr>
+    <tr><td>WASM CRDT in browser</td><td>Identical Yjs binary running on client and server means clients apply remote ops, edit offline, and rebase locally without a server roundtrip. WASM build is 80 KB gzipped and 5–10× faster than a JS port for our 4 M ops/s aggregate.</td><td>Pure JS Yjs (rejected: too slow for 10 M-node files on mobile); custom JSON-patch (rejected: no offline merge guarantees).</td></tr>
+    <tr><td>FoundationDB (op log)</td><td>Keys (file_id, lamport_ts, peer_id) need ordered range scans plus ACID multi-key txns to atomically swap a snapshot pointer with op-log truncation. FDB's serializable isolation across keys is rare in NoSQL and matches per-file actor's serialization point.</td><td>Spanner (rejected: 50–100 ms commit latency hurts our 80 ms echo SLO); DynamoDB (rejected: no multi-key ACID at our scale).</td></tr>
+    <tr><td>S3 (snapshot store)</td><td>200 M files × 30 MB = 6 PB. S3 at $0.023/GB/mo and 11 9s durability dominates the cost equation; snapshot-every-5,000-ops keeps recovery to 1–2 s tail replay, masking the 50 ms S3 GET latency.</td><td>HDFS (rejected: ops cost); GCS (viable, comparable; chose S3 for region overlap with edge PoPs).</td></tr>
+    <tr><td>Fractional indexing (LSEQ-like)</td><td>Sibling order under concurrent insert needs cheap conflict-free position keys. Inserting between 0.5 and 0.6 yields 0.55 with no coordination — O(1) and works offline. We rebalance after ~50 inserts in the same gap to bound key length.</td><td>Linked-list CRDT (rejected: O(n) traversal for "move by 5"); integer indices with reorder ops (rejected: writes amplify under churn).</td></tr>
+    <tr><td>WebTransport (cursors/presence)</td><td>5 M sessions × 30 Hz × 16 B = 2.4 GB/s of cursor traffic; loss is tolerable, latency is not. WebTransport's QUIC datagram mode skips head-of-line blocking and beats WebSocket by ~20 ms p99 on lossy mobile links.</td><td>WebSocket (rejected: TCP HoL on packet loss adds 100 ms+ stalls); WebRTC data channel (rejected: STUN/TURN ops complexity for relay-only use case).</td></tr>
+    <tr><td>etcd (actor lease)</td><td>One actor per file means we need a fencing token to prevent split-brain on failover. etcd's lease + revision number gives a 2 s replay-and-resume window, well under our 99.95% availability SLO.</td><td>ZooKeeper (rejected: heavier ops); custom Redis lock (rejected: no consensus-grade fencing).</td></tr>
+    <tr><td>Vector-clock GC</td><td>Yjs tombstones grow forever without GC; on a 10 M-node file with 6 months of churn that's 1.5 GB RAM. Tracking per-peer vector clock and dropping tombstones once all known peers ack the clock keeps RAM bounded.</td><td>No GC (rejected: file becomes unloadable); time-based purge (rejected: breaks long-offline clients merging in).</td></tr>
+    <tr><td>Pub/Sub bus (cursor relay)</td><td>Cursors are out-of-band from the CRDT. A topic per file with at-most-once relay (we drop on backpressure) is the right semantics — stale cursors are useless. ~2.4 GB/s spread across regional Pub/Sub keeps fanout cheap.</td><td>CRDT-encoded cursors (rejected: pollutes op log, 50× write amplification); Redis pub/sub (rejected: per-file shard hotspots).</td></tr>
+    <tr><td>Viewport-streamed loading</td><td>10 M-node files exceed mobile RAM. Server streams subtrees by viewport and lazy-hydrates on scroll, keeping initial parse to &lt; 800 ms even on a 250 MB file. CRDT structure makes partial loads safe — sync ops still apply.</td><td>Full-file load (rejected: OOM on mobile); server-rendered raster (rejected: no offline edit).</td></tr>
+  </tbody>
+</table>

@@ -1,0 +1,72 @@
+<h1>Distributed time: Lamport, vector clocks, HLC</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">clocks</span>
+  <span class="tag">causality</span>
+  <span class="tag">ordering</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Wall-clock time on distributed nodes is a lie — NTP drifts, leap seconds happen, VM hosts hiccup. To order events <i>correctly</i>, systems use <b>logical clocks</b> that capture causality (who happened before whom) instead of trusting the wall. <b>Lamport timestamps</b> give a total order. <b>Vector clocks</b> detect concurrency. <b>Hybrid Logical Clocks (HLC)</b> combine logical safety with human-readable wall-clock values.</p>
+
+<h2>Why it matters</h2>
+<p>You can't say "the latest write wins" without defining "latest." If node A's clock is 200 ms ahead of node B's, a write at A timestamped <i>after</i> B's write but actually <i>before</i> it (in real causality) silently overwrites the truth. Replication conflicts, distributed snapshots, MVCC visibility, debug log alignment — they all need a notion of time that doesn't lie.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>DynamoDB / Riak:</b> vector clocks (now version vectors) to detect concurrent updates and surface them as siblings.</li>
+  <li><b>CockroachDB:</b> HLC for transaction timestamps; close-enough to wall time but provably monotonic.</li>
+  <li><b>Cassandra:</b> client-supplied microsecond wall timestamps for last-write-wins — famously fragile.</li>
+  <li><b>Spanner:</b> TrueTime — a <i>physical</i> clock with a known uncertainty interval, backed by GPS and atomic clocks.</li>
+</ul>
+
+<h2>Lamport timestamps</h2>
+<div class="ascii-diagram">  Node A:  1 -- 2 -- 3 -- ... -- 7 (recv from B, max(3,6)+1 = 7)
+                  \                /
+                   send msg ts=3  /
+                    \            /
+  Node B:  1 -- 2 -- 3 -- 4 -- 5 -- 6
+</div>
+<p>Each node holds a counter. On every local event, increment. On send, attach the counter. On receive, set <code>local = max(local, received) + 1</code>. Result: if event X causally precedes Y, then <code>ts(X) &lt; ts(Y)</code>. The converse is <i>not</i> true — small timestamp doesn't prove causality. Ties are broken by node ID for a total order.</p>
+
+<h2>Vector clocks</h2>
+<p>A Lamport stamp can't tell concurrent events apart. A <b>vector clock</b> is one counter per node: <code>[A:3, B:5, C:2]</code>. Update rules:</p>
+<ul>
+  <li>Local event on A: increment A's slot.</li>
+  <li>Send: attach the whole vector.</li>
+  <li>Receive: take elementwise max, then increment your own slot.</li>
+</ul>
+<p>Compare two vectors: if every component of V1 ≤ V2 (and one is strictly less), V1 happened-before V2. Otherwise they're <b>concurrent</b> — the system must surface a conflict (siblings) or merge (CRDT). The cost: vector size grows with cluster size, which is why production systems prune or use dotted version vectors.</p>
+
+<h2>Hybrid Logical Clocks (HLC)</h2>
+<p>HLC is the practical compromise: a 64-bit timestamp where the high bits are a wall-clock time (ms) and the low bits are a logical counter. On every event, take <code>max(physical_now, last_hlc) </code>; if equal, bump the logical counter. Result: timestamps are within a few ms of wall-clock (so logs and metrics line up), but strictly monotonic and causally consistent across nodes that exchange messages.</p>
+<div class="ascii-diagram">  HLC = (wall_ms : logical_counter)
+  ----------------------------------
+  A local event @ wall=1000:  (1000, 0)
+  A sends to B, attaches      (1000, 0)
+  B's wall=999, receives:     (1000, 1)   &lt;-- max(physical, recv) + bump
+  B local event @ wall=1001:  (1001, 0)
+</div>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Using <code>System.currentTimeMillis()</code> as a write timestamp — clock skew silently loses data.</li>
+  <li>Assuming Lamport order implies causality — it doesn't, only the reverse.</li>
+  <li>Letting vector clocks grow unbounded as nodes come and go — prune retired entries.</li>
+  <li>Trusting NTP "to the millisecond" — typical skew is 10–100 ms; cloud VMs can spike to seconds.</li>
+  <li>Using HLC across data centers without bounded NTP drift — uncertainty creeps into the physical part.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> A user updates their profile twice in 200 ms. Replica A receives <code>name=Bob</code> at wall=12:00:00.100 (its clock). Replica B receives <code>name=Robert</code> at wall=12:00:00.050 (its clock, but actually <i>after</i> A's write in real time — B's clock is slow). Last-write-wins by wall time picks "Robert." Is that correct? How would vector clocks resolve it?
+  <br/>
+  <b>Hint:</b> Wall-time LWW is wrong: the slow clock loses real updates. With vector clocks, the two writes from the same client would be causally ordered (each carries the previous version vector), so the second write strictly dominates the first regardless of wall time.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-dynamodb">Design DynamoDB</a> — version vectors and sibling resolution.</li>
+  <li><a href="#problem/design-spanner-style">Design Spanner-style DB</a> — TrueTime and external consistency.</li>
+  <li><a href="#problem/design-distributed-transactions">Design distributed transactions</a> — HLC for MVCC visibility.</li>
+</ul>

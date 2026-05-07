@@ -1,0 +1,218 @@
+<h1>Design Fraud Detection at Scale (real-time ML scoring)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">payments</span>
+  <span class="tag">recommendation</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Score every payment in real time (≤ 50 ms) and decide approve / step-up-auth / decline. Inputs: the txn itself, 90-day user history, device/IP/geo signals, network features (graph of accounts), and merchant context. Outputs: a probability of fraud, an explanation, and a verdict. Volume: 5 K TPS sustained, 50 K TPS Black Friday peak, 5 B txns/year.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Inline scoring API: txn in → verdict out, &lt; 50 ms p99.</li>
+  <li>Feature store with point-in-time correctness (no train-serve skew).</li>
+  <li>Rule engine merchants/analysts can edit (e.g., "block if BIN=X and amount &gt; $1k").</li>
+  <li>Graph features: accounts, devices, IPs as nodes; edges = shared use within 30 days.</li>
+  <li>Manual review queue with explanation + feedback loop into training.</li>
+  <li>Backtesting framework on labeled history (chargebacks as ground truth, ~30–60 day label lag).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 &lt; 50 ms inline; budget split: 5 ms feature fetch, 10 ms model, 35 ms slack.</li>
+  <li><b>Scale:</b> 50 K TPS peak × ~300 features = 15 M feature lookups/s.</li>
+  <li><b>Recall vs precision:</b> target 80% recall at 1% false-positive rate (FPR) — every basis point of FPR = real $$$ in lost legitimate sales.</li>
+  <li><b>Model freshness:</b> features ≤ 5 s stale; model retrained weekly, A/B-rolled.</li>
+  <li><b>Availability:</b> 99.99% (failure-mode → fallback rule engine, never fail-open on high-risk).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Feature store: 500 M users × 300 features × 8 B = 1.2 TB hot (Redis); cold tier 50 TB (Cassandra).</li>
+  <li>Event ingest: 50 K TPS × 1 KB = 50 MB/s into Kafka; 7-day retention × 86400 s = 30 TB.</li>
+  <li>Graph: ~2 B edges (accounts↔devices↔IPs); JanusGraph on Cassandra, 800 GB.</li>
+  <li>Model inference: 1 GBT model × 50 K QPS / 5 K QPS per node = 10 inference nodes (with headroom: 30).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/risk/score
+  Body: {txnId, userId, amount, currency, ip, deviceFP, merchantId,
+         paymentMethod, billingAddr, shippingAddr, ...}
+  → {score: 0.0..1.0, decision: APPROVE|STEP_UP|DECLINE,
+     reasonCodes: ["high_velocity_24h","new_device","ip_proxy"],
+     modelVersion: "gbm_v37"}
+
+POST /v1/risk/feedback
+  Body: {txnId, label: FRAUD|LEGIT, source: chargeback|manual_review}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Payment Svc] ──score──► [Risk Gateway]
+                              │
+            ┌─────────────────┼─────────────────────────┐
+            ▼                 ▼                         ▼
+      [Feature Store]    [Model Server]           [Rule Engine]
+       Redis (hot)       (Triton/TFServ)          (decision tree)
+       Cassandra (cold)        │                        │
+            ▲                  ▼                        │
+            │            [Graph Lookup]                 │
+            │            (JanusGraph)                   │
+            │                                           │
+            │                  ▼                        │
+            │            [Verdict Combiner] ◄───────────┘
+            │                  │
+            │                  ▼
+            │           [Audit log → S3]
+            │
+       [Feature Pipeline]
+       Flink streaming
+            ▲
+            │
+       [Kafka: txn, login, click events]</div>
+<p>Two scoring paths run in parallel: ML model and rule engine. The combiner takes max(score_ml, score_rule) and applies thresholds. Rules are the safety net when the model misbehaves on novel attacks.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Feature store (online)</h3>
+<pre>Redis Cluster:
+  KEY user:{user_id}:features → HASH {
+    txn_count_1h: 3,
+    txn_amount_24h: 412.50,
+    distinct_ip_7d: 2,
+    avg_txn_amount_30d: 89.21,
+    ...
+  }
+  TTL: 90 days; updated by Flink within 2-5 s of source event.</pre>
+<h3>7.2 Offline store (training)</h3>
+<p>Parquet on S3, partitioned by date and feature group. Point-in-time joins ensure training labels see only data available at txn time (no leakage). Feast or in-house equivalent ties online + offline definitions to one source.</p>
+
+<h3>7.3 Why this split?</h3>
+<p>Strong consistency on features is wrong: we'd rather see a 3-second-old aggregate than block a payment for 200 ms. Eventual consistency with bounded lag is the right SLA. (DDIA Ch.11: stream-stream joins for velocity features.)</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Feature pipeline (Flink)</h3>
+<p>Tumbling windows of 1m, 5m, 1h, 24h, 7d, 30d. Each event fans out into ~6 windowed counters. Watermark = max(event_time) − 5 s; allowed lateness 60 s. State backend: RocksDB; checkpoint to S3 every 30 s (DDIA Ch.11 stream stateful processing).</p>
+
+<h3>8.2 Model serving</h3>
+<p>Gradient-boosted trees (XGBoost/LightGBM) for the primary model: 5 ms inference, interpretable via SHAP. A neural side-model handles sequence features (last 50 user txns via Transformer encoder). Both run in Triton; the gateway calls them in parallel and combines via stacking.</p>
+
+<h3>8.3 Graph features</h3>
+<p>Pre-computed nightly: PageRank on the account-device-IP graph; community detection identifies fraud rings. At scoring time, a 1-hop lookup ("how many fraud-flagged accounts share my device fingerprint?") fits in 3 ms.</p>
+
+<h3>8.4 Feedback &amp; retraining</h3>
+<p>Chargebacks arrive 30–60 days after txn; a labeling service joins them back to the original score, computes the label, and writes to the offline store. Weekly retrain on a rolling 180-day window; champion/challenger A/B with 5% shadow traffic before promotion.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Feature fetch fan-out:</b> mget 300 keys → use field grouping in Redis hash to fetch 1 key returning 300 fields; cuts RTT 50×.</li>
+  <li><b>Cold-start users:</b> if no history, fall back to merchant + device priors; never block a first-time legitimate user without step-up.</li>
+  <li><b>Model thundering herd at deploy:</b> gradual rollout 1%→10%→50%→100% with auto-rollback on FPR spike.</li>
+  <li><b>Adversarial drift:</b> fraudsters probe; monitor feature distributions (KL divergence) and trigger emergency retrain when a feature drifts &gt; 3σ.</li>
+  <li><b>Graph blowup:</b> a single bad device can connect 10 K accounts; cap node degree, treat super-nodes specially.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Inline ML (block before commit)</td><td>Stops fraud at source</td><td>Adds latency; harder model SLAs</td></tr>
+<tr><td>Eventually consistent features</td><td>Cheap, scalable</td><td>5 s blind spot for fast-moving attacks</td></tr>
+<tr><td>GBT primary model</td><td>Fast, interpretable</td><td>Misses sequence patterns alone</td></tr>
+<tr><td>Rules + ML combiner</td><td>Safety net for novel attacks</td><td>Rule sprawl; needs governance</td></tr>
+<tr><td>Step-up auth tier</td><td>Captures uncertain region without losing sales</td><td>Friction risk for genuine users</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 11 Stream Processing</b> — Flink stateful windowing, watermarks, exactly-once via checkpointed state are the engine of the feature pipeline.</li>
+  <li><b>Ch. 11 Stream Processing</b> — change data capture from the txn database into Kafka; the same event drives both real-time features and offline training data.</li>
+  <li><b>Ch. 7 Transactions</b> — the score itself is read-only and not part of the payment txn, but the <i>verdict's binding</i> to the payment uses the same idempotency-key pattern; we never re-score a replayed payment with stale features.</li>
+  <li><b>Ch. 9 Consensus</b> — model registry (active version) is a small linearizable KV store on etcd; nodes coordinate on which model to serve.</li>
+  <li><b>Ch. 5 Replication</b> — Redis cluster with async replication; we tolerate a few seconds of lag and document the SLA.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Fraud is an adversarial system, not a static one — the architecture must support feature drift detection and weekly retraining as a first-class operation, not a research exercise."</li>
+  <li>"I'd never let the ML model decline alone; a human-readable rule engine is the off-switch when the model goes bad at 3 a.m."</li>
+  <li>"Train-serve skew is the silent killer; one source of truth for feature definitions, used by both Flink (online) and Spark (offline)."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Flink — feature pipeline core</td>
+      <td>50 K TPS peak × 6 windowed counters per event = ~300 K state mutations/s with windows from 1m to 30d. Flink's RocksDB state backend, watermark-based event time, and exactly-once checkpointed state (DDIA Ch.11) is the only mature engine that handles this windowing without dropping or double-counting on restart.</td>
+      <td>Kafka Streams (state size limits at 30-day windows); Spark Streaming (micro-batch latency exceeds 5 s feature freshness target).</td>
+    </tr>
+    <tr>
+      <td>Kafka — event ingest backbone</td>
+      <td>50 MB/s × 7-day retention = 30 TB; Kafka's partition-ordered log is what lets the same txn event drive both real-time features (Flink) and offline training (Spark) — DDIA Ch.11 stream-table duality. Replay capability is essential when retraining model on a fixed historical window.</td>
+      <td>Pulsar (less ops familiarity); Kinesis (worse retention economics, weaker replay ergonomics at 30 TB).</td>
+    </tr>
+    <tr>
+      <td>Redis — online feature store (hot)</td>
+      <td>50 K TPS × ~300 features = 15 M lookups/s with a 5 ms budget. Redis Hash-per-user (single key returns all 300 fields in one RTT) cuts fan-out 50×; 1.2 TB hot tier across cluster shards. Stale by &lt; 5 s is acceptable — we'd rather a slightly old aggregate than block a payment.</td>
+      <td>Memcached (no hash data structure for fan-out); DynamoDB (latency floor &amp; cost at this QPS).</td>
+    </tr>
+    <tr>
+      <td>Cassandra — cold feature tier</td>
+      <td>50 TB of warm/cold features (90+ days, infrequent reads) suit Cassandra's write-heavy wide-column model. Eventual consistency is acceptable here because the ML inference is itself probabilistic — a stale feature does not compromise correctness, only marginal recall.</td>
+      <td>HBase (heavier ops); S3 + Athena (latency too high for fallback feature reads).</td>
+    </tr>
+    <tr>
+      <td>Postgres (SSI) — model registry &amp; rules</td>
+      <td>The active model version, rule definitions, and audit-of-rule-changes need ACID with strong consistency — a stale rule that says "block all txns &gt; $10" deployed by mistake is a real outage. SSI (DDIA Ch.7) catches conflicting rule edits by analysts.</td>
+      <td>etcd alone (ok for active model pointer; insufficient for full rule history); MySQL (no proper SSI for editor write skew).</td>
+    </tr>
+    <tr>
+      <td>JanusGraph (on Cassandra) — fraud graph</td>
+      <td>2 B edges (account ↔ device ↔ IP); 1-hop lookup at score time ("how many fraud-flagged accounts share this device?") fits in 3 ms. Cassandra storage handles 800 GB graph data with horizontal write scale.</td>
+      <td>Neo4j (single-master write bottleneck at our ingest rate); native graph in Spark (offline only, can't serve inline).</td>
+    </tr>
+    <tr>
+      <td>Triton / TF-Serving — model server</td>
+      <td>Gradient-boosted tree inference at 5 ms p99 + transformer side-model in parallel. Triton's dynamic batching + GPU multiplexing fits 50 K QPS across ~30 nodes with headroom; protocol-buffer-based RPC keeps overhead low inside the 50 ms total budget.</td>
+      <td>Sagemaker endpoints (cost &amp; cold-start jitter); custom Python servers (no batching, ~3× more nodes).</td>
+    </tr>
+    <tr>
+      <td>etcd (Raft) — model version pointer</td>
+      <td>"Which model is live?" must be linearizable across all 30 inference nodes (DDIA Ch.9): a half-rolled-out version where some nodes serve v37 and some v38 corrupts A/B metrics. Raft-replicated KV is exactly the primitive.</td>
+      <td>ZooKeeper (heavier ops burden); database polling (race window during deploy).</td>
+    </tr>
+    <tr>
+      <td>S3 + Parquet — offline training store</td>
+      <td>Point-in-time joins on 5 B txns/yr × 90-day window need columnar scan. Parquet partitioned by date and feature group lets Spark read only relevant columns; matches the durability + cost profile of cold training data perfectly.</td>
+      <td>Cassandra (column reads inefficient for analytics); single Postgres warehouse (cost &amp; scan throughput).</td>
+    </tr>
+    <tr>
+      <td>Idempotency keys (verdict binding)</td>
+      <td>The score is read-only, but the <i>verdict's binding to the payment</i> reuses the txnId-keyed idempotency pattern (DDIA Ch.7). We never re-score a replayed payment with stale features — same key returns the same verdict, even if features have moved on.</td>
+      <td>Re-score on every retry (non-deterministic outcomes; merchant disputes); cache score by feature snapshot (storage + miss complexity).</td>
+    </tr>
+    <tr>
+      <td>Saga — fail-closed verdict combiner</td>
+      <td>If model server is unreachable inside the 50 ms budget, the rule engine alone is the safety net (verdict = max(score_ml, score_rule)). No 2PC across model + rules — the combiner takes whichever finishes first and applies thresholds. Saga-style compensating step-up auth replaces declines on uncertain scores.</td>
+      <td>Synchronous join with both required (latency + cascading failure); ML-only (no off-switch when model goes bad).</td>
+    </tr>
+    <tr>
+      <td>2PC — explicitly rejected</td>
+      <td>Inline scoring is on a strict 50 ms p99 budget; 2PC across feature store + model + rule engine would add coordinator round-trips and tie availability to the slowest participant. Independent calls with combiner is the correct shape for an inference path.</td>
+      <td>Saga / parallel calls (chosen); RPC chaining (latency adds, no gain).</td>
+    </tr>
+    <tr>
+      <td>Per-merchant rate limit / circuit breaker</td>
+      <td>50 K TPS comes unevenly — Black Friday spikes one merchant 100×. Per-merchant token bucket prevents one bad actor from starving inference capacity for everyone else; circuit breaker on model server protects the rule-only fallback path.</td>
+      <td>Global rate limit (one merchant starves all); no limit (cascading inference latency).</td>
+    </tr>
+    <tr>
+      <td>Drift monitor (KL divergence on features)</td>
+      <td>Adversarial drift is a first-class threat: fraudsters probe and shift feature distributions. Watching KL &gt; 3σ on the live feature stream and triggering emergency retrain is what keeps the 80% recall / 1% FPR target stable across weeks.</td>
+      <td>Schedule-only retrain (lags real attacks by days); manual review-only (doesn't scale to 5 B txns/yr).</td>
+    </tr>
+  </tbody>
+</table>

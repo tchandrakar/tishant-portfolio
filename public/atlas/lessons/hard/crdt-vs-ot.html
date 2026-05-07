@@ -1,0 +1,73 @@
+<h1>CRDTs vs OT for collaborative editing</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">crdt</span>
+  <span class="tag">ot</span>
+  <span class="tag">collaboration</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>When two people edit the same document at the same time, you have to merge their changes without losing intent. <b>Operational Transformation (OT)</b> sends operations through a central server that <i>transforms</i> each op against concurrent ops so the end state converges. <b>CRDTs</b> (Conflict-free Replicated Data Types) attach unique IDs and partial-order metadata to every character or field so concurrent edits can be merged on any replica with no coordination — same inputs, same final state, regardless of order.</p>
+
+<h2>Why it matters</h2>
+<p>Google Docs, Figma, Notion, Linear, and Apple Notes all need <i>real-time multi-user editing</i> with offline support, undo, and presence. The choice between OT and CRDT decides whether your sync layer is a clever centralized algorithm (OT) or a peer-to-peer-friendly data structure (CRDT). It also drives storage cost, conflict semantics, and how nasty your edge cases get when network partitions heal.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Google Docs:</b> OT (Jupiter algorithm) — central server transforms ops; battle-tested for two decades.</li>
+  <li><b>Figma:</b> Custom CRDT-like tree with last-writer-wins on properties; server is the source of truth but clients merge optimistically.</li>
+  <li><b>Apple Notes / iCloud:</b> CRDT — needed for offline iPhone edits that sync later.</li>
+  <li><b>Automerge / Yjs:</b> Open-source CRDT libraries; Yjs powers many startups doing local-first apps.</li>
+  <li><b>Linear / Notion:</b> Hybrid — CRDT-ish per-block, with a central server arbitrating structural moves.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">OT (centralized transform)
+  Client A: insert("X", pos=3) ---\
+                                    >--[ Server transforms ]--> ops to B, C
+  Client B: delete(pos=2)      ---/
+
+CRDT (commutative merge)
+  Client A: insert(id=A1, after=A0, "X")
+  Client B: insert(id=B1, after=A0, "Y")
+  Any replica merges by ID order:  A0 -> A1 -> B1   (deterministic)
+</div>
+<p>OT requires every concurrent op to be transformed against every other op the server has accepted; the server is the linearization point. CRDTs avoid the transform by giving every edit a globally unique ID and a rule (e.g. "insert-after this ID, tie-break by site ID") so any two replicas that have seen the same set of ops converge — even if they saw them in different orders.</p>
+
+<h2>Trade-offs</h2>
+<ul>
+  <li><b>Metadata cost:</b> CRDTs carry tombstones for deleted characters and per-character IDs. A 1MB doc with heavy editing can balloon to 5–10MB. Yjs and Automerge have spent years compressing this.</li>
+  <li><b>Server simplicity:</b> CRDT servers can be dumb relays (great for P2P, offline-first). OT servers are the brain — harder to scale horizontally.</li>
+  <li><b>Intent preservation:</b> OT can encode richer "user intent" rules (e.g., "if you bolded a word and I deleted it, drop the bold"). CRDTs default to mechanical convergence; intent rules are bolted on.</li>
+  <li><b>Undo:</b> Undo in OT is famously hard — inverse-transform an op against everything that happened after. CRDTs make undo a first-class op (mark tombstone live again).</li>
+  <li><b>Rich structure:</b> Trees (like Figma's scene graph) need specialized CRDTs (Move CRDT, RGA-tree). Naive CRDTs corrupt under concurrent moves.</li>
+</ul>
+
+<h2>Anti-patterns and failure modes</h2>
+<ul>
+  <li><b>Rolling your own OT:</b> Transform functions must satisfy TP1 (and ideally TP2) properties. Getting this wrong silently corrupts documents days later. Use a library.</li>
+  <li><b>CRDT without garbage collection:</b> Tombstones never collected; doc grows forever, cold-start gets slower every week.</li>
+  <li><b>Treating presence cursors as CRDT data:</b> Cursors are ephemeral. Putting them in the merged doc creates massive history bloat. Use a separate awareness/presence channel.</li>
+  <li><b>Concurrent tree moves:</b> Two users move folder A under B and B under A simultaneously. Without a Move CRDT this creates a cycle or silently drops one move.</li>
+  <li><b>Assuming CRDT = no server:</b> You still need auth, persistence, snapshotting, and access control. CRDT only solves the merge problem.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Picking CRDT "because it's modern" when a single-region OT server would solve it in 1/10th the code.</li>
+  <li>Forgetting that ACL/permission changes are NOT a CRDT — they need linearization (you don't want eventually-consistent "who can read this").</li>
+  <li>Not benchmarking with realistic edit traces (10k ops over a week) — both approaches look fine on small docs.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're designing a collaborative spreadsheet. Cells hold formulas that reference other cells. Two users edit the same cell offline for 30 minutes, then both reconnect. Do you reach for OT or a CRDT, and how do you handle the formula references?
+  <br/>
+  <b>Hint:</b> Think about what "merge" even means for a formula. Is the cell value a string, an AST, or a CRDT register? What if user A renames the column that user B's formula references?
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-google-docs">Design Google Docs</a> — OT vs CRDT, presence, offline, history.</li>
+  <li><a href="#problem/design-figma">Design Figma</a> — multiplayer tree CRDT for a scene graph.</li>
+</ul>

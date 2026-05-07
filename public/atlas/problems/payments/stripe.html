@@ -1,0 +1,202 @@
+<h1>Design Stripe (payments-as-API for merchants)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">payments</span>
+  <span class="tag">ecommerce</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a developer-first payments platform: a merchant integrates a single REST API and gets card acceptance across 135 currencies, 3DS, subscriptions, payouts, fraud (Radar), and webhooks. The product is the <b>API surface</b>: idempotent, predictable, and absurdly available. Behind it sits a card-network gateway, a ledger, risk, and a connector mesh to acquirers (Visa/Mastercard/Amex direct or via processors).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Create PaymentIntent → confirm → capture (auth/capture or auto-capture).</li>
+  <li>Tokenize card (PAN never touches merchant servers; PCI scope minimization).</li>
+  <li>Subscriptions: recurring billing, dunning, proration.</li>
+  <li>Payouts to connected accounts (Stripe Connect): split, hold, schedule.</li>
+  <li>Webhooks with at-least-once delivery, signed, retried with exponential backoff up to 3 days.</li>
+  <li>Radar: real-time fraud score; rules engine merchants can edit.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>API availability:</b> 99.999% for /charges and /payment_intents (5 nines is the brand promise).</li>
+  <li><b>Latency:</b> p99 &lt; 200 ms for charge.create (excluding network round-trip to acquirer).</li>
+  <li><b>Scale:</b> 500 M API requests/day at peak (~6 K RPS sustained, 50 K RPS spikes on Cyber Monday).</li>
+  <li><b>Idempotency:</b> any request safely retryable for 24 hours.</li>
+  <li><b>Compliance:</b> PCI-DSS Level 1, SOC 2, regional data residency (EU, IN, BR).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Charges: ~10 B/year ≈ 320/s avg, 50 K/s peak; storage 10 B × 4 KB × 5 yrs ≈ 200 TB.</li>
+  <li>Webhook fan-out: 1 charge → ~6 events × 2 endpoints/merchant = 12 deliveries; ~3 K deliveries/s avg.</li>
+  <li>Token vault: 2 B PCI tokens × 200 B = 400 GB (HSM-backed).</li>
+  <li>Idempotency store: 24 h × 320 RPS × 2 KB = 55 GB (Redis with TTL).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/payment_intents     {amount, currency, payment_method, customer}
+                             Header: Idempotency-Key: ...
+                             → {id, client_secret, status: requires_action|succeeded}
+POST /v1/payment_intents/{id}/confirm
+POST /v1/payment_intents/{id}/capture {amount_to_capture}
+POST /v1/refunds             {payment_intent, amount}
+POST /v1/webhook_endpoints   {url, enabled_events[]}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Merchant SDK] → [Edge/Anycast] → [API GW] → [Idempotency Cache (Redis)]
+                                                  │
+                                                  ▼
+                                         [PaymentIntent Svc]
+                              ┌──────────────────┼──────────────────┐
+                              ▼                  ▼                  ▼
+                       [Token Vault]      [Ledger (Postgres)]   [Risk/Radar]
+                       (HSM)              [Mongo for objects]   (Flink + ML)
+                                                  │
+                                                  ▼
+                                          [Acquirer Connectors]
+                                       (Visa/MC/Amex/local rails)
+                                                  │
+                                                  ▼
+                                          [Kafka: events]
+                                                  │
+                                          [Webhook Dispatcher]
+</div>
+<p>Stripe's real internal stack uses MongoDB for object storage (objects are largely document-shaped) plus a separate strongly-consistent ledger. We accept that pattern: <b>Mongo for the object</b> (PaymentIntent state machine), <b>Postgres for the money</b>.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 PaymentIntent (Mongo)</h3>
+<pre>{ _id: "pi_xxx", amount: 2500, currency: "usd",
+  status: "requires_capture",
+  charges: [{id: "ch_xxx", outcome: "approved"}],
+  client_secret: "...", created: 1730000000,
+  livemode: true, idempotency_key: "...", merchant_id: "acct_xxx" }</pre>
+<h3>7.2 Ledger (Postgres, sharded by merchant_id)</h3>
+<pre>CREATE TABLE postings (
+  posting_id BIGSERIAL,
+  txn_id     UUID,
+  account    BIGINT,    -- merchant balance / fees / reserve
+  amount     NUMERIC(20,4),
+  currency   CHAR(3),
+  posted_at  TIMESTAMPTZ,
+  PRIMARY KEY (account, posting_id)
+);</pre>
+<p>Why split? The PaymentIntent doc evolves through 8+ states; doc DB is natural. The ledger needs serializable invariants: every txn balances to zero per currency. <b>DDIA Ch.7 SSI</b> on the merchant_balance row prevents over-payout when two refunds race.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Idempotency</h3>
+<p>Two-tier: Redis (hot, 24 h TTL) backed by Postgres unique constraint (durable). On request, lookup key → if present and request hash matches, return cached response; if hash differs, return 409. Critical: we record the response <i>only after</i> the side effect completes, but we record the <i>in-flight</i> marker before, so a crash mid-call resolves to a clean retry.</p>
+
+<h3>8.2 Webhook delivery</h3>
+<p>Events written to Kafka via the <b>transactional outbox</b> in the same Postgres txn as the ledger write. Dispatcher pulls, signs (HMAC-SHA256), and POSTs. Retries: 1 m, 5 m, 30 m, 2 h, 6 h, … capped at 3 days. Per-merchant rate limit prevents one slow endpoint from starving others (DDIA Ch.11: backpressure via partition assignment).</p>
+
+<h3>8.3 Acquirer connectors</h3>
+<p>Each card network has a stateful TCP session with heartbeats. Connectors are stateless, backed by a session pool. Timeouts are <b>asymmetric</b>: we time out at 8 s but treat the txn as <b>UNKNOWN</b> not failed — and reconcile with the network's daily file the next day.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot merchant on Black Friday:</b> shard merchant ledger by (merchant_id, day_bucket) so writes spread across partitions; aggregate balance via a materialized view refreshed every minute.</li>
+  <li><b>Webhook poison endpoint:</b> per-endpoint circuit breaker; deliveries quarantined to a slow lane.</li>
+  <li><b>Acquirer outage:</b> retryable error path falls through to a backup connector (different processor for the same scheme).</li>
+  <li><b>5-nines API:</b> active-active multi-region with cell-based isolation; idempotency keys are cell-affinitized via consistent hashing so retries land on the same cell.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Mongo for objects + Postgres for ledger</td><td>Best of both: flexible state machine + ACID money</td><td>Two systems to keep in sync; needs outbox</td></tr>
+<tr><td>Cell-based active-active</td><td>Blast radius small; 5-nines achievable</td><td>Cross-cell ops (transfers) need coordination</td></tr>
+<tr><td>UNKNOWN as a first-class state</td><td>Honest about acquirer timeouts; no double-charge</td><td>Merchant UX must handle "pending" charges</td></tr>
+<tr><td>Webhook at-least-once</td><td>No lost events</td><td>Merchants must dedupe on event_id</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 7 Transactions</b> — idempotency keys are the canonical "idempotent operation" example; SSI on merchant_balance avoids write skew on concurrent payouts/refunds; single-object atomic writes power the in-flight marker.</li>
+  <li><b>Ch. 7 Transactions</b> — discussion of "exactly-once" reframed as "at-least-once + idempotency" is literally the Stripe API contract.</li>
+  <li><b>Ch. 9 Consensus</b> — Raft (etcd) for connector leader election so only one node owns a card-network session; linearizable reads of PaymentIntent status.</li>
+  <li><b>Ch. 11 Stream Processing</b> — transactional outbox + Kafka for webhooks; reprocessing on dispatcher restart.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The API contract <i>is</i> the system: idempotency, versioning, and predictable errors are first-class architectural concerns, not afterthoughts."</li>
+  <li>"I'd push back on 'exactly-once'; what we deliver is at-least-once events plus deterministic deduping — that's what Kafka and stripe.com both actually do."</li>
+  <li>"Reconciliation with acquirer settlement files runs nightly; it's the safety net for every UNKNOWN."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Postgres (SSI) — money ledger</td>
+      <td>10 B charges/yr need serializable isolation on merchant_balance: two concurrent refunds would both pass an "available &gt;= refund" check under read-committed (DDIA Ch.7 write skew). SSI aborts the loser; app retries. Single-node ACID for charge + ledger + idempotency in one COMMIT.</td>
+      <td>MySQL (no true SSI); Aurora (close, but we want predictable autovacuum behavior under 50 K RPS spikes).</td>
+    </tr>
+    <tr>
+      <td>MongoDB — PaymentIntent objects</td>
+      <td>The PaymentIntent state machine has 8+ states and per-merchant variant fields (3DS challenges, partial captures, statement descriptors). Document model fits naturally; per-document atomicity is sufficient since money lives in Postgres. Matches Stripe's actual production split.</td>
+      <td>Postgres JSONB (works but losing schema-flex evolution speed); DynamoDB (no rich queries on charges array).</td>
+    </tr>
+    <tr>
+      <td>Cassandra — explicitly rejected for ledger</td>
+      <td>LWW + tunable consistency cannot enforce sum=0 invariants or detect write skew on merchant_balance. Eventual consistency on money is a correctness bug, not a tradeoff. Used only for high-volume append-only telemetry (request logs).</td>
+      <td>n/a — this is the rejection.</td>
+    </tr>
+    <tr>
+      <td>Kafka — webhook event bus</td>
+      <td>3 K webhook deliveries/s × at-least-once × 3-day retry window needs durable replayable log. Per-merchant partitioning gives ordered delivery and natural backpressure (DDIA Ch.11): one slow endpoint can't starve others, since assignment is per-partition.</td>
+      <td>SQS (no replay, no per-key ordering); Pub/Sub (weaker ordering at our scale).</td>
+    </tr>
+    <tr>
+      <td>Flink — Radar fraud features</td>
+      <td>Velocity (txns/min), distinct-card counts, and BIN-level aggregates need windowed stateful joins on the live charge stream. Flink's exactly-once checkpointed state (DDIA Ch.11) keeps features correct even after dispatcher restarts; 5 K avg / 50 K peak TPS is well within envelope.</td>
+      <td>Kafka Streams (state grows past per-task limits at our retention); Spark Streaming (micro-batch latency exceeds our 200 ms p99 budget).</td>
+    </tr>
+    <tr>
+      <td>Redis — idempotency hot cache</td>
+      <td>50 K RPS × 24 h TTL = 55 GB of keys; Redis returns prior responses in &lt; 1 ms so retries don't re-enter the orchestrator. Backed by Postgres unique index for durability — Redis loses on failover, Postgres doesn't.</td>
+      <td>Memcached (no persistence option); in-process cache (no cross-cell consistency).</td>
+    </tr>
+    <tr>
+      <td>HSM (token vault)</td>
+      <td>2 B PCI tokens × 200 B = 400 GB of PANs that are PCI-DSS Level 1 in scope. HSM tokenization isolates the vault to a tiny audited surface so the rest of the platform stays out-of-scope (regulatory, not just technical).</td>
+      <td>Software KMS only (fails PCI Level 1 audit); third-party tokenization (latency + vendor lock).</td>
+    </tr>
+    <tr>
+      <td>Saga (cell-based) — over 2PC</td>
+      <td>5-nines availability requires cell isolation; 2PC across cells would couple their failure domains. Saga with compensating refunds tolerates a cell going dark without losing the API contract. Idempotency keys are cell-affinitized via consistent hashing so retries land where the original lives.</td>
+      <td>Distributed 2PC (XA) — kills cell isolation; Spanner txns (vendor lock, cost).</td>
+    </tr>
+    <tr>
+      <td>2PC — used only inside Postgres</td>
+      <td>Single-DB 2PC (prepared txn) is fine to bind charge insert + ledger postings + idempotency update atomically. We never extend it across services or regions because coordinator failure semantics (DDIA Ch.9) destroy the 99.999% target.</td>
+      <td>App-level dual writes (correctness bug); cross-service XA (latency &amp; coordinator risk).</td>
+    </tr>
+    <tr>
+      <td>Idempotency-Key — two-tier (Redis + PG)</td>
+      <td>Required for "any request safely retryable for 24 h." Two-tier: hot path through Redis (sub-ms), correctness path through Postgres UNIQUE constraint inside the same txn as the side effect (DDIA Ch.7). Hash mismatch returns 409 to catch client bugs.</td>
+      <td>Redis-only (loses on failover); request-body hash only (no client-controlled retry semantics).</td>
+    </tr>
+    <tr>
+      <td>Transactional outbox (Debezium → Kafka)</td>
+      <td>Webhook events must commit atomically with the charge — dual-writing to Kafka risks dropped events. Outbox table written inside the Postgres txn; Debezium tails WAL and publishes (DDIA Ch.11). Zero event loss even on Kafka outage.</td>
+      <td>Direct Kafka publish in handler (lost events); LISTEN/NOTIFY (not durable, no replay).</td>
+    </tr>
+    <tr>
+      <td>etcd (Raft) — connector leadership</td>
+      <td>Each card-network TCP session must have exactly one owner (Visa won't tolerate parallel sessions for the same BIN); leader election via Raft (DDIA Ch.9) gives linearizable lease + failover under 5 s.</td>
+      <td>ZooKeeper (heavier ops); Consul (weaker linearizability story).</td>
+    </tr>
+    <tr>
+      <td>Double-entry ledger (postings)</td>
+      <td>Stripe takes a fee, the merchant gets net, the platform takes a slice — every charge writes ≥3 balanced entries summing to zero per currency. Deferred constraint enforces conservation at commit; reconciliation against acquirer files is mathematically possible only because of double-entry.</td>
+      <td>Single-row balance (no audit, no proof of conservation, no point-in-time).</td>
+    </tr>
+  </tbody>
+</table>

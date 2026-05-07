@@ -1,0 +1,191 @@
+<h1>Design PayPal (P2P payments, multi-currency, fraud)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">payments</span>
+  <span class="tag">ecommerce</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a global P2P and merchant payments platform: users link bank accounts, debit/credit cards, and balances across 25+ currencies; send money to other users or pay merchants; refunds, chargebacks, holds, and a fraud-aware risk layer keep the platform honest. The core engineering challenge is a system that <b>never loses money, never double-pays, and never books a half-transfer</b> — even when networks fail mid-call.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Send/receive money P2P (intra-PayPal) and to external bank accounts via ACH/SEPA/SWIFT.</li>
+  <li>Multi-currency wallets with FX conversion at quoted rate (60-second quote TTL).</li>
+  <li>Merchant checkout: authorize, capture, void, refund. Idempotent against retries.</li>
+  <li>Disputes &amp; chargebacks (180-day window for cards), holds, and reserves.</li>
+  <li>Real-time fraud / risk scoring before commit; manual review queue for soft-decline.</li>
+  <li>Statements, transaction history, exports for tax (1099-K).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Correctness:</b> zero double-debit, zero phantom credit. Money is conserved.</li>
+  <li><b>Latency:</b> P2P transfer commit p99 &lt; 800 ms; merchant authorize p99 &lt; 400 ms.</li>
+  <li><b>Scale:</b> 430 M active accounts, ~25 B transactions/year (~800 TPS avg, 5 K TPS peak Black Friday).</li>
+  <li><b>Availability:</b> 99.99% for authorize/capture; 99.95% for ledger reads.</li>
+  <li><b>Compliance:</b> PCI-DSS, AML/KYC, SOX, GDPR; 7-year audit retention.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: avg 800 writes/s × 5 storage rows per txn (ledger entries + journal) ≈ 4 K writes/s; reads 50 K/s.</li>
+  <li>Storage: 25 B txns/yr × 2 KB/row × 7 yrs ≈ 350 TB ledger; replicated 3× in primary + 1 cold = 1.4 PB.</li>
+  <li>Fraud features: 200 features × 4 B × 5 K TPS = 4 MB/s into the model serving tier.</li>
+  <li>FX quote cache: 25² currency pairs × 1 KB × 100 K active quotes = ~62 MB (Redis).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/payments         {senderId, recipientId, amount, currency, idempotencyKey}
+                          → {txnId, status: PENDING|CAPTURED|DECLINED}
+POST /v1/payments/{id}/capture {amount} → {status}
+POST /v1/payments/{id}/refund  {amount, reason, idempotencyKey}
+GET  /v1/wallets/{userId}/balances    → [{currency, available, pending}]
+POST /v1/fx/quote         {from, to, amount} → {quoteId, rate, expiresAt}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] → [Edge/WAF] → [API GW] ──► [Payment Orchestrator]
+                                          │   (Saga coordinator)
+                ┌─────────────────────────┼──────────────────────────┐
+                ▼                         ▼                          ▼
+         [Risk/Fraud Svc]         [Ledger Svc]                [FX Svc]
+         (Flink + ML)             (Postgres + 2PC)            (Redis quotes)
+                                          │
+                                          ▼
+                                   [Kafka: txn-events]
+                                          │
+                          ┌───────────────┼────────────────┐
+                          ▼               ▼                ▼
+                  [Notifications]   [Reporting/DWH]   [Settlement Svc]
+                                                       (ACH/SEPA gateways)
+</div>
+<p>The orchestrator implements a <b>saga</b>: reserve funds → fraud check → debit sender → credit recipient → emit event. Each step has a compensating action; we prefer saga over distributed 2PC because cross-region locks would tank latency (DDIA Ch.9: coordinator is a single point of contention).</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Ledger (Postgres, sharded by account_id)</h3>
+<pre>CREATE TABLE ledger_entries (
+  entry_id     BIGSERIAL,
+  txn_id       UUID NOT NULL,
+  account_id   BIGINT NOT NULL,
+  amount       NUMERIC(20,4) NOT NULL,  -- signed
+  currency     CHAR(3) NOT NULL,
+  posted_at    TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, entry_id)
+) PARTITION BY HASH(account_id);
+
+CREATE UNIQUE INDEX ux_idem ON payments(idempotency_key);</pre>
+<p>Double-entry: every txn writes ≥2 rows summing to zero per currency. We use Postgres for the ledger because we need <b>serializable isolation on the account row</b> (DDIA Ch.7: SSI catches write skew that would let two concurrent withdrawals both pass a balance check).</p>
+
+<h3>7.2 Why not Cassandra for ledger?</h3>
+<p>LWW eventual consistency is unsafe for money: a delayed replica could resurrect a spent balance. We use Cassandra only for append-only event/audit logs.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Idempotency &amp; exactly-once</h3>
+<p>Client sends <code>Idempotency-Key</code>. The orchestrator inserts (key, request_hash, txn_id) with <code>UNIQUE</code> constraint <i>before</i> any side effect. Replay returns the cached response. The payment row is committed in the <b>same Postgres transaction</b> as the ledger debit — leveraging single-node ACID instead of cross-service 2PC (DDIA Ch.7: linearizable single-row writes are far cheaper than distributed atomic commit).</p>
+
+<h3>8.2 Fraud scoring</h3>
+<p>Inline path: 30 ms budget. Features come from (a) Redis hot cache (last-1h velocity), (b) feature store (90-day aggregates pre-computed by Flink). Gradient-boosted model returns score 0–1; threshold 0.85 = decline, 0.6–0.85 = step-up auth (3DS / OTP).</p>
+
+<h3>8.3 FX</h3>
+<p>Quotes are signed JWTs with TTL=60s. Settlement at quoted rate; the FX desk holds a hedge book reconciled hourly.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot account contention</b> (e.g. a marketplace seller): shard the account into <i>sub-ledgers</i> by hash(txn_id mod N), aggregate on read.</li>
+  <li><b>Cross-region writes:</b> pin an account to its home region; cross-region transfers go through a <i>two-phase saga</i> with reservation rows.</li>
+  <li><b>Kafka backpressure:</b> downstream slowness must never block the synchronous commit; we use a <i>local outbox table</i> drained by a CDC connector (Debezium) — guarantees no event is lost (DDIA Ch.11 transactional outbox pattern).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Saga over 2PC</td><td>No distributed locks, region-tolerant</td><td>Compensations are app-level; harder to reason about</td></tr>
+<tr><td>Postgres ledger</td><td>SSI, mature, proven</td><td>Sharding is manual; hot accounts need sub-ledgers</td></tr>
+<tr><td>Synchronous fraud check</td><td>Blocks bad txns before commit</td><td>Adds 20–40 ms to p99</td></tr>
+<tr><td>Idempotency via DB unique key</td><td>Bulletproof</td><td>Requires client to generate keys</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 7 Transactions</b> — Serializable Snapshot Isolation prevents write skew on balance checks; single-object atomic writes underpin the idempotency table; the chapter's discussion of "exactly-once via idempotent operations" is the core of the orchestrator.</li>
+  <li><b>Ch. 7 Transactions</b> — read-committed isn't enough; we need SSI for the "balance &gt;= amount" predicate.</li>
+  <li><b>Ch. 9 Consensus</b> — leader election on the orchestrator (Raft via etcd) for in-flight saga state; linearizability arguments for why the ledger commit must be totally ordered per account.</li>
+  <li><b>Ch. 11 Stream Processing</b> — transactional outbox + CDC for at-least-once event publication.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with a single-region Postgres ledger and saga orchestrator; multi-region active-active comes only after we've proved the invariants in one region — distributed money is hard enough without distributed consensus."</li>
+  <li>"The hardest part is the boundary between fraud (eventually consistent ML) and the ledger (strongly consistent SSI) — I treat fraud's verdict as an input, not a participant in the transaction."</li>
+  <li>"Reconciliation is non-negotiable: a daily job re-derives every balance from the entry log and pages on any drift."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Postgres (SSI) — ledger</td>
+      <td>800 TPS avg / 5 K TPS peak fits a single sharded primary. SSI (DDIA Ch.7) catches write skew on the "balance &gt;= amount" predicate so two concurrent withdrawals can't both pass; same-txn idempotency row + ledger debit gives single-node ACID instead of cross-service 2PC.</td>
+      <td>MySQL (no SERIALIZABLE that catches phantom write skew cleanly); CockroachDB (overkill at this TPS, higher commit latency).</td>
+    </tr>
+    <tr>
+      <td>Cassandra — audit/event log only</td>
+      <td>Append-only audit trail (350 TB ledger × 7 yrs) fits Cassandra's wide-column write throughput perfectly — but only because audit is write-once and never asks "is the balance right". LWW eventual consistency would resurrect a spent balance, so it never touches money rows.</td>
+      <td>HBase (operationally heavier, fewer ops in our shop); S3 Parquet (cheaper but worse for time-range scans on hot audit).</td>
+    </tr>
+    <tr>
+      <td>Kafka — txn-events bus</td>
+      <td>4 K writes/s × N consumers (notifications, DWH, settlement) needs durable fan-out with replay. Partition by account_id preserves per-account ordering — required so "debit then credit" events are never reordered downstream (DDIA Ch.11 total order per partition).</td>
+      <td>RabbitMQ (no replay, weaker ordering guarantees); AWS SQS (no partition ordering, lossy at our retention).</td>
+    </tr>
+    <tr>
+      <td>Flink — fraud feature pipeline</td>
+      <td>200 features × 5 K TPS = 4 MB/s of stateful aggregation across 1m–90d windows; Flink's RocksDB state + checkpointed exactly-once (DDIA Ch.11) is the only mature option for windowed velocity features with sub-second freshness.</td>
+      <td>Kafka Streams (state size limits at 90-day windows); Spark Structured Streaming (micro-batch latency floor too high for inline scoring).</td>
+    </tr>
+    <tr>
+      <td>Redis — FX quote &amp; fraud hot cache</td>
+      <td>62 MB FX quote book + 200-feature 1h velocity per user needs sub-ms p99 reads inside the 30 ms fraud budget. JWT-signed quotes mean clients can replay without DB hits. Bounded staleness is acceptable here — money still commits in Postgres.</td>
+      <td>Memcached (no data structures for hash-of-features); local in-process cache (cache stampede + cross-region invalidation problems).</td>
+    </tr>
+    <tr>
+      <td>Saga orchestrator (custom + etcd)</td>
+      <td>Reserve → fraud → debit → credit → emit spans 4 services across regions; 2PC would put a coordinator lock on every account row across regions (DDIA Ch.9: coordinator is single point of contention). Saga with compensating reversals lets the rail keep flowing during partial failures.</td>
+      <td>Distributed 2PC (XA) — rejected: cross-region locks blow the 800 ms p99; Temporal/Cadence considered for v2.</td>
+    </tr>
+    <tr>
+      <td>2PC — explicitly rejected for cross-region</td>
+      <td>For 430 M accounts spread across regions, 2PC would require synchronous coordinator round-trips per commit — fundamentally incompatible with 99.99% availability when any region flaps. We use it only inside a single Postgres txn (ledger + idempotency row).</td>
+      <td>Saga (chosen); Spanner TrueTime (used by competitors, but we'd inherit the cost &amp; lock-in).</td>
+    </tr>
+    <tr>
+      <td>Idempotency keys — UNIQUE constraint</td>
+      <td>Client-generated key + Postgres UNIQUE index gives bulletproof at-most-once semantics for retries (DDIA Ch.7: "exactly-once = at-least-once + idempotent"). Insert before side effect; commit response in same txn as ledger debit.</td>
+      <td>Redis-only dedup (loses on failover); request hashing alone (false negatives when client retries with new timestamp).</td>
+    </tr>
+    <tr>
+      <td>Double-entry ledger (sum=0 per currency)</td>
+      <td>Money cannot be created or destroyed — every of our ~25 B txns/year writes ≥2 balanced entries. Deferred SQL constraint enforces it at commit so no application bug can produce a phantom credit. The integrity invariant is in the database, not in code.</td>
+      <td>Single-entry "balance" column (rejected: no audit trail, no point-in-time, no proof of conservation).</td>
+    </tr>
+    <tr>
+      <td>Debezium (CDC) — transactional outbox</td>
+      <td>Ledger commit + Kafka publish must be atomic; we write to an outbox table inside the same Postgres txn (DDIA Ch.11 transactional outbox), Debezium tails WAL and republishes. Zero lost events even if Kafka is down at commit time.</td>
+      <td>Dual-write (ledger + Kafka directly) — rejected, classic correctness bug; Postgres LISTEN/NOTIFY (not durable, no replay).</td>
+    </tr>
+    <tr>
+      <td>etcd (Raft) — saga &amp; FX desk leader</td>
+      <td>The orchestrator's in-flight saga state needs a linearizable KV with leader election (DDIA Ch.9 Raft). 5 K peak TPS of saga state changes well within etcd's envelope; lease semantics handle node failures cleanly.</td>
+      <td>ZooKeeper (heavier, JVM ops burden); Consul (weaker linearizability story for our use).</td>
+    </tr>
+    <tr>
+      <td>Sub-ledgers — hot account contention</td>
+      <td>A marketplace seller can receive 1 K txns/s alone; SSI on a single row would abort half. Hash(txn_id) mod N spreads writes across N sub-rows; the read path sums them. Trade-off: one extra GROUP BY per balance read.</td>
+      <td>Optimistic concurrency on a single row (abort rate too high); Redis counter (loses durability).</td>
+    </tr>
+  </tbody>
+</table>

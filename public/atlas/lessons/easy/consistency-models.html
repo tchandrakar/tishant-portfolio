@@ -1,0 +1,72 @@
+<h1>Consistency models: strong, eventual, causal, RYW, monotonic</h1>
+<div class="meta-row">
+  <span class="tag diff-Easy">Easy</span>
+  <span class="tag">consistency</span>
+  <span class="tag">distributed-systems</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>A consistency model is a contract between a storage system and its clients about <em>what reads are allowed to return</em> after a sequence of writes. Strong consistency promises every read sees the latest write; eventual consistency promises only that, given enough quiet time, replicas converge. In between sit a family of weaker but useful guarantees — read-your-writes, monotonic reads, causal — that fix specific surprises without paying full coordination cost.</p>
+
+<h2>Why it matters</h2>
+<p>Pick too strong a model and you pay in latency, availability, and dollars. Pick too weak and your users see disappearing posts, time-traveling counters, and "I just clicked save and it's gone." Most production bugs in distributed apps are <em>consistency-model mismatches</em>: a developer assumed strong, the database delivered eventual, and the gap showed up in production at 2&nbsp;AM.</p>
+
+<h2>The five models, ranked from strong to weak</h2>
+<ul>
+  <li><b>Strong (linearizable):</b> reads see the most recent committed write, globally. Behaves as if there were one copy. Expensive — needs consensus.</li>
+  <li><b>Causal:</b> if write A happened-before write B (e.g., a reply to a post), every replica that sees B also sees A. Independent writes can appear in any order.</li>
+  <li><b>Read-your-writes (RYW):</b> after <em>you</em> write, your subsequent reads from the same session see your write. Other users may not yet.</li>
+  <li><b>Monotonic reads:</b> once you've read a value, you'll never read an older one. No time travel.</li>
+  <li><b>Eventual:</b> if writes stop, all replicas converge. Until then, anything goes.</li>
+</ul>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Spanner / etcd / Zookeeper:</b> linearizable — used for configuration, leases, metadata.</li>
+  <li><b>DynamoDB strong-read mode:</b> linearizable per key (one extra hop, pay 2x RCU).</li>
+  <li><b>S3 (since 2020):</b> strong read-after-write on objects.</li>
+  <li><b>Cassandra QUORUM:</b> approximates strong reads via R+W&gt;N.</li>
+  <li><b>Social-media feeds:</b> usually eventual, often patched with RYW so you see your own post immediately.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  STRONG       CAUSAL         RYW          MONOTONIC      EVENTUAL
+  ----------------------------------------------------------------
+  global      respects       my session    no going        converges
+  total        happens-       sees my       backwards       eventually
+  order        before         writes
+  ----------------------------------------------------------------
+  &lt;-- more coordination, higher latency / less availability --&gt;
+  &lt;-------- weaker contract, cheaper, more available -------&gt;
+</div>
+<p>Each step right loosens the contract and buys availability or latency. Crucially, the weaker models are <em>composable</em>: a session that gets RYW + monotonic reads + causal feels almost-strong to a single user, while letting different users see slightly different states.</p>
+
+<h2>Picking a model — a cheat sheet</h2>
+<ul>
+  <li><b>Money / inventory / locks:</b> linearizable. Don't be clever.</li>
+  <li><b>User profile, posts, comments:</b> RYW + causal usually nails the "feels right" bar.</li>
+  <li><b>Likes / view counts / analytics:</b> eventual is fine; users won't notice a 2-second drift.</li>
+  <li><b>Chat / collaborative docs:</b> causal at minimum, often plus CRDTs for merge.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Assuming "we replicate synchronously" means strong — it doesn't, unless you also coordinate writes.</li>
+  <li>Promising eventual to users who do read-modify-write loops; lost updates are guaranteed without versioning.</li>
+  <li>Mixing replicas in one request — round-robin reads to async replicas violate monotonic reads.</li>
+  <li>Forgetting that "session" guarantees vanish when the user reconnects to a different node.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Your Twitter-like timeline shows 200ms-stale posts to readers, but a user who just tweeted should see their own tweet at the top instantly. Which consistency guarantees do you need, and which can stay eventual?
+  <br/>
+  <b>Hint:</b> The whole feed doesn't need to be strong. Think about what's "their session" vs. "everyone else's view."
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-twitter">Design Twitter timeline</a> — eventual + RYW patching.</li>
+  <li><a href="#problem/design-dynamodb">Design DynamoDB</a> — eventual default, strong on demand.</li>
+  <li><a href="#problem/design-google-docs">Design Google Docs</a> — causal + CRDT convergence.</li>
+</ul>

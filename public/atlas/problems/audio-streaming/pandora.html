@@ -1,0 +1,158 @@
+<h1>Design Pandora (radio-style personalized streaming)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">audio-streaming</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design Pandora, a lean-back personalized radio service. Unlike Spotify, the user does not pick exact tracks &mdash; they seed a "station" with an artist/song, and the system streams a never-ending sequence of related tracks. Users give thumbs-up/thumbs-down feedback that immediately shapes the station. The core technical asset is the Music Genome Project: ~450 hand-labeled musicological attributes per track. Skips are rate-limited (DMCA radio compliance). The system must handle station generation, streaming, real-time feedback adaptation, and audio ad insertion for free tier.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Create a station from any seed (track, artist, genre, or mix of seeds).</li>
+  <li>Continuous playback of related tracks; no user-chosen track order.</li>
+  <li>Thumbs-up / thumbs-down feedback adjusts station immediately.</li>
+  <li>Skip enforcement: max 6 skips per station per hour (free tier).</li>
+  <li>"My Stations" persistence across devices.</li>
+  <li>Audio ad insertion every ~15 minutes for free users.</li>
+  <li>"Why this song?" explanation surfacing genome attributes.</li>
+  <li>Replay/rewind for paid tier (Pandora Plus/Premium).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> next-track selection under 100ms (must arrive before current track ends to avoid silence).</li>
+  <li><b>Scale:</b> 50M MAU, 6M paid, peak 2M concurrent stations.</li>
+  <li><b>Availability:</b> 99.95% playback.</li>
+  <li><b>Compliance:</b> DMCA &mdash; no on-demand selection on free tier; skip caps; no playing the same artist twice within 3 hours of station start.</li>
+  <li><b>Personalization quality:</b> thumbs-down adjustment within next 1&ndash;2 tracks.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Catalog:</b> 2M tracks &times; 2 bitrates (64k, 192k AAC) &times; ~3MB avg = ~12 TB.</li>
+  <li><b>Tracks played/day:</b> 15M DAU &times; 30 tracks/day = 450M tracks/day = ~5K plays/sec avg.</li>
+  <li><b>Egress:</b> 450M &times; 3MB = 1.35 PB/day from CDN.</li>
+  <li><b>Feedback events:</b> 15M DAU &times; 10 thumbs/skips = 150M/day = ~1.7K writes/sec.</li>
+  <li><b>Station generation calls:</b> next-track called every ~3.5min &times; 2M concurrent = ~10K QPS, plus instant on skip/thumbs.</li>
+  <li><b>Genome data:</b> 2M tracks &times; 450 attributes &times; 4B = 3.6 GB &mdash; entirely in memory across reco fleet.</li>
+  <li><b>Ad impressions:</b> 30M ads/day for free tier = ~350 QPS to ad server.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/station            {seed:{type, id}}            -&gt; {stationId}
+GET   /v1/station/{id}/next  ?lastTrackId=&amp;feedback=      -&gt; {trackId, streamUrl, adBreak?}
+POST  /v1/station/{id}/feedback {trackId, signal:'up'|'down'} -&gt; 204
+POST  /v1/station/{id}/skip  {trackId}                    -&gt; {allowed, remainingSkips}
+GET   /v1/me/stations                                     -&gt; {stations[]}
+GET   /v1/track/{id}/why                                  -&gt; {attributes[], scores[]}
+POST  /v1/playback/heartbeat {stationId, trackId, posMs}  -&gt; 204</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] --&gt; [CDN audio] -- [S3]
+   |
+   +--&gt; [API GW]
+            |
+            +--&gt; [Station Svc]    --&gt; [Redis: live station state]
+            |       |
+            |       +--&gt; [Reco Engine] -- [Genome KV (in-mem)] -- [User Profile Store: Cassandra]
+            |
+            +--&gt; [Feedback Svc]   --&gt; [Kafka: feedback events] --&gt; user profile updater
+            +--&gt; [Skip Counter]   --&gt; [Redis: per-station counters with TTL]
+            +--&gt; [Ad Svc]         --&gt; [Ad Server]
+
+[Kafka] -&gt; [Spark batch] -&gt; nightly user-taste model retrain -&gt; pushed to Reco Engine
+</div>
+<p>Walk-through: client requests next track. Station service consults the live in-memory station state (last 50 tracks, current taste vector) and asks the Reco Engine for a candidate set, filters by DMCA rules and recently-played, and returns the chosen track + signed CDN URL. Feedback events flow through Kafka and update the user profile within a couple of seconds.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Music Genome (in-memory KV, replicated)</h3>
+<pre>track_genome[track_id] = float32[450]  // hand-labeled attributes
+artist_index[artist_id] = list&lt;track_id&gt;
+3.6 GB total, replicated to every reco node.</pre>
+<h3>7.2 Station state (Redis)</h3>
+<pre>HSET station:{id}
+  seedIds, ownerUserId, tasteVector (450f),
+  recentTracks (last 50 ids), recentArtists (last 20),
+  skipCount, skipResetTs</pre>
+<h3>7.3 Feedback log (Kafka -&gt; Cassandra)</h3>
+<pre>CREATE TABLE feedback (
+  user_id bigint, station_id uuid, ts timestamp,
+  track_id uuid, signal text,
+  PRIMARY KEY ((user_id, station_id), ts)
+);</pre>
+<h3>7.4 User taste profile (Cassandra)</h3>
+<pre>user_profile(user_id, taste_vector_blob, updated_at, station_count)</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Reco engine (next-track selection)</h3>
+<p>The station's <code>tasteVector</code> is a 450-dim weighted vector (genome attributes). Candidate generation: cosine similarity between station vector and all 2M track vectors, top-K (~500) returned in ~5ms via SIMD batch dot-products on the in-memory KV. Filters applied: not played in last 50 tracks; same artist not within last 3 hours; not in user's "banned" list (thumbs-down history). Final selection samples weighted by similarity to inject diversity (epsilon-greedy 10%).</p>
+<h3>8.2 Real-time feedback adaptation</h3>
+<p>Thumbs-up: station vector += 0.05 &times; track_genome (normalized).<br>Thumbs-down: station vector -= 0.10 &times; track_genome, plus add track to "banned" set in Redis, plus skip current.<br>Updates land in Redis synchronously so the next <code>/next</code> call sees them immediately. Async path persists to Cassandra for cross-device consistency.</p>
+<h3>8.3 DMCA-compliant skip enforcement</h3>
+<p>Skip counter in Redis: <code>INCR skips:{stationId}:{hourBucket}</code> with 1h TTL. If &gt;6 in current hour, return <code>{allowed:false, retryAfterSec:N}</code>. Premium users bypass.</p>
+<h3>8.4 Ad insertion</h3>
+<p>Free tier: every ~15 min of listen time, the next-track response includes <code>adBreak: {adId, durationMs, adUrl}</code> instead of (or before) the next track. The Ad Service decides creative based on user demographics and current track context.</p>
+<h3>8.5 Why this song?</h3>
+<p>Computed at request time: top-5 genome attributes where station vector and track vector both have high values, e.g., "syncopated rhythm + minor key + female vocals". Cached for 24h since vectors evolve slowly.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Cosine over 2M tracks per request:</b> SIMD + early-exit beam over 450 dims; or pre-cluster tracks (k-means 1000 clusters) and only score top 5 clusters.</li>
+  <li><b>Genome memory:</b> 3.6 GB fits one node, but we replicate per region for latency. Updates rare (curators add tracks).</li>
+  <li><b>Redis station state hot keys:</b> sticky-route session to a partition; Redis Cluster of 64 shards.</li>
+  <li><b>Skip enforcement under retries:</b> Lua script for atomic INCR+CHECK to avoid double-counts.</li>
+  <li><b>New-track cold start:</b> curators backfill 450 attributes within 24h; meanwhile the track is shadow-eligible only for stations with high seed similarity.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Hand-labeled genome vs ML embeddings</td><td>Explainable, accurate; "why this song"</td><td>Expensive curation, slow to add tracks</td></tr>
+<tr><td>Brute-force cosine over 2M</td><td>Simple, exact</td><td>Doesn't scale past ~10M tracks &mdash; need ANN</td></tr>
+<tr><td>Redis sync feedback</td><td>Sub-second adaptation</td><td>Loss of feedback if Redis crashes (mitigate with AOF)</td></tr>
+<tr><td>Server-decided next track vs client-assembled</td><td>Tight DMCA control</td><td>Higher API QPS</td></tr>
+<tr><td>Pre-clustered candidate gen</td><td>10x faster</td><td>Missed serendipity from far clusters</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-region Redis with async cross-region replication for taste continuity.</li>
+  <li>Ch. 6 Partitioning — Redis cluster sharded by station_id; reco nodes by track_id range for parallel scoring.</li>
+  <li>Ch. 7 Transactions — Lua scripts give atomic compound ops on skip counters.</li>
+  <li>Ch. 11 Stream Processing — Kafka feedback log is the canonical truth; profile store is a derived read-model.</li>
+  <li>Ch. 12 Future of Data Systems — change-data-capture from feedback log into ML feature pipeline.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Pandora's edge is explainability via the Music Genome &mdash; an ML embedding could match accuracy but loses the 'why this song' UX. I'd hybridize: genome for explanation + neural embeddings for candidate gen at scale."</li>
+  <li>"DMCA radio rules are not a footnote &mdash; skip caps and artist-repeat windows are baked into the request path, not bolted on."</li>
+  <li>"Feedback latency is the personalization moat &mdash; I'd treat sub-second taste-vector updates as a hard SLO."</li>
+  <li>"For multi-seed stations (e.g., Beatles + Radiohead) I'd weight seed influence dynamically based on recent thumbs &mdash; users naturally pull stations toward one seed over time."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>In-memory KV (custom genome store)</b></td><td>The 3.6 GB genome table (2M tracks x 450 float32 attributes) must be hit on every next-track call to compute cosine similarity in &lt;5ms; replicating it into every reco-node's RAM eliminates network hops and lets SIMD batch dot-products run at memory bandwidth.</td><td>Redis — too much serialization overhead per scoring call; on-disk Cassandra — would blow the 100ms next-track SLA</td></tr>
+    <tr><td><b>Redis</b></td><td>Live station state (last 50 tracks, taste vector, skip counts) is read+written on every next-track call at 10K+ QPS; sub-ms reads keep the next-track SLA, and Redis Cluster sharded by <code>station_id</code> sustains 2M concurrent stations.</td><td>Memcached — no Lua scripts for atomic skip counters; in-process state — breaks across SFU node restarts</td></tr>
+    <tr><td><b>Redis AOF persistence</b></td><td>Loss of station state means losing seconds of feedback that just moved the taste vector — a UX regression; AOF every-second flush bounds loss to ~1s per crash, an acceptable trade vs the cost of fully durable writes.</td><td>RDB snapshots — can lose minutes; sync writes to disk — kills throughput</td></tr>
+    <tr><td><b>Redis Lua scripts</b></td><td>DMCA skip enforcement (max 6 skips/hour) requires atomic INCR-and-check to avoid double-counts under client retries; a Lua script runs server-side as a single transaction without a CAS round-trip.</td><td>WATCH/MULTI — extra round trip; client-side check — race condition</td></tr>
+    <tr><td><b>Cassandra</b></td><td>User taste profiles (450-dim vectors) and feedback history grow unbounded across 50M users; Cassandra's append-friendly model with per-user partitions handles 1.7K writes/sec and survives multi-region replication for cross-device taste continuity.</td><td>Postgres — vertical scale ceiling; DynamoDB — vendor lock</td></tr>
+    <tr><td><b>Kafka</b></td><td>Feedback events (150M/day thumbs and skips) are the canonical event log for retraining nightly Spark models; partition by <code>user_id</code> for ordered per-user updates and multiple consumers (profile updater, ML feature pipeline) read independently.</td><td>Kinesis — vendor lock; in-DB triggers — couples ML to OLTP</td></tr>
+    <tr><td><b>Spark</b></td><td>Nightly retrain of the user-taste model over 150M-event feedback log is embarrassingly parallel; Spark MLlib with the existing data lake integration is the cheapest path to refresh per-user offsets to genome attributes.</td><td>Flink batch — less mature ML libraries; single-node Python — won't scale to 50M users</td></tr>
+    <tr><td><b>S3</b></td><td>12 TB catalog of two-bitrate AAC variants needs durable storage with CDN integration; small enough that intelligent tiering doesn't matter much, but the 11-nines durability protects against the irreplaceable mastering fees per track.</td><td>HDFS — no CDN integration; self-managed object store — capex</td></tr>
+    <tr><td><b>CDN</b></td><td>1.35 PB/day egress at consistent 3 MB/track size hits cache hit ratios &gt;98% because Pandora's catalog is small (2M tracks) and reuse is high — a major cost win versus on-demand Spotify-style listening.</td><td>Direct origin — bandwidth cost prohibitive; multi-CDN — premature optimization at our scale</td></tr>
+    <tr><td><b>SIMD batch dot products</b></td><td>Cosine over 2M tracks per next-track call needs raw CPU; AVX2 fused-multiply-add lanes process 8 floats/cycle, giving full 450-dim scoring at memory speed — the difference between a 5ms and 50ms next-track latency.</td><td>GPU — overkill, network round trip dominates; pure-Java loop — 5x slower</td></tr>
+    <tr><td><b>k-means clustering (1000 clusters)</b></td><td>As catalog grows past 10M tracks, brute-force cosine breaks the 100ms SLA; pre-clustering tracks lets the reco engine score only the top-5 nearest clusters first, cutting work 200x with minimal recall loss.</td><td>HNSW ANN — loses explainability via genome; KD-tree — degrades at high dim</td></tr>
+    <tr><td><b>AAC (64k / 192k)</b></td><td>AAC at 64 kbps is acceptable for free-tier mobile while 192 kbps satisfies premium audiophiles; two bitrates are sufficient because Pandora is lean-back (no need for full HLS ladder) and DMCA forbids on-demand bitrate gaming.</td><td>HLS multi-bitrate — overkill for radio UX; MP3 — worse compression than AAC</td></tr>
+    <tr><td><b>Ad server (e.g., FreeWheel/DFP)</b></td><td>~350 QPS audio ad decisions need an industry ad server that handles auctions, frequency caps, and reporting to advertisers; reusing existing ad-tech avoids rebuilding the IAB-compliant integrations from scratch.</td><td>Self-built ad engine — multi-quarter project; programmatic-only — loses direct campaigns</td></tr>
+    <tr><td><b>WebSocket (push for cross-device)</b></td><td>Station feedback on phone must propagate to the user's Echo within seconds for "lean-back" UX consistency; persistent WS to a per-user channel pushes vector deltas without polling.</td><td>Long-poll — higher overhead at 50M MAU; pure pull — too slow for cross-device feedback</td></tr>
+  </tbody>
+</table>

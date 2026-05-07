@@ -1,0 +1,71 @@
+<h1>Approximate algorithms at interview scale</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">probabilistic</span>
+  <span class="tag">streaming</span>
+  <span class="tag">data-structures</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>When you need a number now from a stream of billions — "is X in the set?", "how many distinct users today?", "what are the top 100 hashtags?", "what's the p99 latency?" — exact answers cost too much memory and CPU. Approximate algorithms trade a bounded, tunable error for orders of magnitude less space. The five you must know cold are <b>Bloom filter</b> (membership), <b>HyperLogLog</b> (cardinality), <b>Count-Min sketch</b> (frequency), <b>Misra-Gries / Space-Saving</b> (top-K), and <b>t-digest</b> (quantiles).</p>
+
+<h2>Why it matters</h2>
+<p>Most "scale" interview questions secretly hinge on one of these. "Track unique visitors per URL" → HLL. "Spam-check before hitting the DB" → Bloom. "Trending hashtags" → Count-Min + Space-Saving. "Latency dashboards across 10k hosts" → t-digest. Knowing the math intuition (not the proof) lets you say "we use a 12 KB HLL per URL with ~2% error" instead of "uh, we'd... store all of them?"</p>
+
+<h2>Bloom filter — membership</h2>
+<p><b>Question:</b> "is x in the set S?" Answer: <i>definitely not</i>, or <i>probably yes</i>. Use <code>k</code> hash functions to set <code>k</code> bits in an <code>m</code>-bit array. To check, AND those bits. <b>False positives only</b>; never false negatives. The math: with <code>n</code> insertions, optimal <code>k = (m/n) ln 2</code>, giving FPR ≈ <code>0.6185^(m/n)</code>. Rule of thumb: <b>~10 bits per element ≈ 1% FPR</b>; ~14 bits ≈ 0.1%. So a 1B-item Bloom at 1% costs ~1.25 GB vs. ~24 GB to store the keys themselves.</p>
+<p><b>Variants:</b> Counting Bloom (allows delete, ~4x space), Cuckoo filter (better cache locality, supports delete, slightly tighter), Scalable Bloom (grows when filling).</p>
+
+<h2>HyperLogLog — cardinality</h2>
+<p><b>Question:</b> "how many distinct items in this stream?" Idea: hash each item to a uniform random bit string. The maximum number of leading zeros you've ever seen is a logarithmic estimate of cardinality (if you've seen <code>k</code> leading zeros, you've probably seen ~<code>2^k</code> distinct items). One register is noisy; HLL splits the hash into <code>p</code> bucket bits + the rest, keeps the max-leading-zero per bucket, and harmonic-means the buckets.</p>
+<p><b>The math:</b> with <code>m = 2^p</code> buckets, standard error ≈ <code>1.04 / sqrt(m)</code>. So <code>m = 2^14 = 16384</code> buckets uses ~12 KB and gives ~0.81% error — for <i>any</i> cardinality, even billions. HLLs <b>merge</b> trivially (per-bucket max), so you can pre-aggregate per-shard and combine.</p>
+
+<h2>Count-Min sketch — frequency</h2>
+<p><b>Question:</b> "how many times did key x appear?" Use a <code>d × w</code> matrix of counters and <code>d</code> independent hashes. To increment: hash x with each of the d hashes, increment <code>matrix[i][h_i(x)]</code>. To query: return the <b>min</b> across the d rows. Hash collisions only ever <i>over</i>-count, so the min is the tightest upper bound.</p>
+<p><b>The math:</b> set <code>w = ⌈e/ε⌉</code> and <code>d = ⌈ln(1/δ)⌉</code>. Then with probability ≥ <code>1-δ</code>, error ≤ <code>ε · ||a||_1</code> where <code>||a||_1</code> is total stream weight. Picking ε=0.001, δ=0.01: w≈2718, d≈5, total ~14k counters ≈ 56 KB. Use it for heavy-hitter candidates, coupled with a small heap for top-K.</p>
+
+<h2>Top-K — Misra-Gries and Space-Saving</h2>
+<p><b>Question:</b> "what are the most frequent K items in a stream?" Exact top-K needs O(N) space. <b>Misra-Gries</b> keeps <code>k-1</code> counters; on each item, increment its counter if present, else if there's an empty slot use it, else <i>decrement every counter by 1</i> (and evict zeros). Guarantees: any item with frequency &gt; <code>N/k</code> is in the table; counter values lower-bound true counts (errors up to <code>N/k</code>).</p>
+<p><b>Space-Saving</b> (Metwally et al.) is the practical refinement: when the table is full and a new item arrives, replace the <i>minimum-counter</i> item — but inherit its counter and add 1. This gives both lower bounds (counter − error) and upper bounds (counter), and tracks heavy hitters far more accurately at the same memory. Top-K is typically Space-Saving with k×c slots (c=2–10 for safety) plus a min-heap for fast eviction.</p>
+
+<h2>t-digest — quantiles</h2>
+<p><b>Question:</b> "what's the p50, p99, p99.9 of this stream?" Naive quantile needs all data; reservoir sampling has fixed error per quantile but loses tail accuracy where you need it most. <b>t-digest</b> (Ted Dunning) keeps a sorted set of weighted centroids over the value range, where centroid weight is <i>small near the tails</i> (p1, p99, p999) and <i>large in the middle</i>. Concretely it bounds the size of each centroid by <code>k(q) = δ · q(1-q)</code> for some compression δ; this packs centroids near 0 and 1 and spreads them out near 0.5.</p>
+<p><b>The math/intuition:</b> the relative error on a quantile q is roughly proportional to <code>q(1-q)/δ</code>, so error at p99 (q=0.99) is ~100× smaller than at p50. Typical δ=100 gives ~100 centroids, ~few KB, with sub-1% relative error at the extremes. Like HLL, t-digests <b>merge</b>: per-host digests combine into a global one without re-streaming raw data.</p>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  Question                  Structure         Space        Error
+  ---------------------     ---------------   ----------   ------------------
+  is x in S?                Bloom / Cuckoo    ~10 bits/n   FP only, tunable
+  |distinct items|          HyperLogLog       12 KB        ~1% std-error
+  count(x) freq             Count-Min         tens of KB   over-count, ε·N
+  top-K heavy hitters       Space-Saving      O(K)         miss <= N/K freq
+  p50/p99/p999 latency      t-digest          few KB       small at tails
+
+  All of these:
+   - one-pass
+   - mergeable (per-shard -> global)
+   - constant or sub-linear memory
+</div>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Using a Bloom filter when you need <i>counts</i> (use Count-Min) or distinct counts (use HLL).</li>
+  <li>Sizing HLL by data volume — its size is <i>independent</i> of N. Pick by error tolerance.</li>
+  <li>Forgetting Count-Min over-counts. Pair it with Space-Saving for unbiased top-K.</li>
+  <li>Computing quantiles by averaging per-host p99s. Quantiles do not average; merge t-digests instead.</li>
+  <li>Treating false positives in a Bloom as harmless when downstream is expensive (e.g., DB lookup is cheaper than the wrong path).</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Design a real-time "trending now" service for a social app: 200k posts/sec, find the top 100 hashtags over the last 1 hour with &lt;2% relative error and unique-author counts per tag with ~1% error. What structures, what sizes, how do you merge across shards?
+  <br/>
+  <b>Hint:</b> Per-tag HLL (12–16 KB each) for unique authors. Sliding-window Count-Min (e.g., 10 × 6-minute panes) plus a Space-Saving top-200 per shard. Merge HLLs by per-bucket max; merge top-K by union and re-rank. The whole thing fits in memory on one node.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-trending-topics">Design trending topics</a> — Count-Min + Space-Saving in production form.</li>
+  <li><a href="#problem/design-distributed-cache">Design a distributed cache</a> — Bloom filters as negative-lookup short-circuits.</li>
+  <li><a href="#problem/design-metrics-system">Design a metrics system</a> — t-digest is how Datadog/Prometheus-flavored systems do quantile rollups.</li>
+</ul>

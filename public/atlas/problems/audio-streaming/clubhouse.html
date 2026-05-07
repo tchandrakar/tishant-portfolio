@@ -1,0 +1,169 @@
+<h1>Design Clubhouse / Twitter Spaces (live audio rooms with WebRTC)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">audio-streaming</span>
+  <span class="tag">messaging</span>
+  <span class="tag">video-streaming</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a live audio room product (Clubhouse / Twitter Spaces / X Spaces) where any user can host a virtual room with multiple speakers and thousands of listeners. Speakers exchange real-time audio with sub-300ms mouth-to-ear latency; listeners receive a near-real-time mix. Users in audience can "raise hand" and be promoted to speaker. Rooms can be public, private, or social-graph-gated. Optional features: recording, captions, moderation (mute, kick), reactions. The system must handle WebRTC media routing at scale, room presence/state, social-graph notifications, and abuse moderation.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Create/join room (public, private, follower-only).</li>
+  <li>Up to 12 simultaneous speakers; up to 10K listeners per room.</li>
+  <li>Raise hand &rarr; host promotes to speaker; demote/kick.</li>
+  <li>Mute/unmute, push-to-talk option, speaker indicator.</li>
+  <li>Real-time reactions (clap, heart) &mdash; non-audio.</li>
+  <li>Optional recording; optional live captions.</li>
+  <li>Room discovery: hallway feed of rooms hosted by people you follow.</li>
+  <li>Notifications when followed creator starts a room.</li>
+  <li>End-of-room recap; replay (recorded rooms).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> speaker-to-speaker mouth-to-ear under 300ms p95 globally; speaker-to-listener under 1s.</li>
+  <li><b>Scale:</b> 100K concurrent rooms peak; one room can hit 10K listeners; 50M MAU.</li>
+  <li><b>Availability:</b> 99.95%; a single SFU node failure must not kill the room.</li>
+  <li><b>Quality:</b> Opus 32 kbps mono is sufficient; jitter buffer on client.</li>
+  <li><b>Moderation:</b> abuse signal-to-action under 60s for safety reports.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Concurrent users:</b> 100K rooms &times; avg 50 listeners + 5 speakers = ~5.5M concurrent participants peak.</li>
+  <li><b>Speaker uplink:</b> 5 speakers &times; 32 kbps &times; 100K rooms = 16 Gbps inbound to SFUs.</li>
+  <li><b>Listener downlink:</b> 5.5M users &times; 32 kbps avg = 176 Gbps egress (mostly via SFU/CDN).</li>
+  <li><b>Signaling QPS:</b> join/leave/mute = ~10 events/user/session &times; 5.5M = 55M events; over a 30-min avg = ~30K signaling QPS.</li>
+  <li><b>Recordings:</b> assume 20% rooms recorded &times; avg 60min &times; 32 kbps = ~14 MB/room &times; 20K = 280 GB/day.</li>
+  <li><b>Notifications fanout:</b> popular host with 1M followers &times; "started a room" = 1M push-notifs in 30s = ~33K/sec.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/rooms              {title, type, topics[]}        -&gt; {roomId, joinToken}
+POST  /v1/rooms/{id}/join                                    -&gt; {sfuUrl, ice, role:'listener'}
+POST  /v1/rooms/{id}/raise-hand                              -&gt; 204
+POST  /v1/rooms/{id}/promote {userId}                        -&gt; 204 (host only)
+POST  /v1/rooms/{id}/mute    {userId}                        -&gt; 204 (host)
+POST  /v1/rooms/{id}/leave                                   -&gt; 204
+WS    /v1/rooms/{id}/events                                  &lt;-- presence, reactions, role changes
+POST  /v1/rooms/{id}/record  {start|stop}                    -&gt; 204
+GET   /v1/hallway                                            -&gt; {rooms[]}
+POST  /v1/report             {roomId, userId, reason}        -&gt; 204</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]
+   |  WebRTC media (UDP/SRTP)         WebSocket signaling
+   v                                       v
+[SFU node] &lt;--cascade--&gt; [SFU peer]    [Signaling Svc] -- [Redis pub/sub: room state]
+   |                                       |
+   +--&gt; [Mixer/Recorder] -- [S3]           +--&gt; [Room Mgr] -- [Postgres: rooms, roles]
+   |                                       +--&gt; [Presence Svc] -- [Redis]
+   |                                       +--&gt; [Notif Svc] -- [Kafka -&gt; FCM/APNs]
+   |
+   +--&gt; [Caption Svc (ASR)] --&gt; WS to clients
+
+[Edge: TURN servers] for NAT traversal
+[Hallway/Feed Svc] -- [Cassandra: live rooms by follow-graph]
+</div>
+<p>Walk-through: client signals via WebSocket to acquire a SFU URL + ICE creds. WebRTC PeerConnection established to nearest SFU; the SFU forwards each speaker's RTP to other participants (no decode/encode). Across regions, SFUs cascade to one another. Recording forks an RTP copy to a mixer that produces a single Opus file. Signaling state (who's in, who's a speaker) lives in Redis, mirrored to Postgres for durability.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Room metadata (PostgreSQL)</h3>
+<pre>CREATE TABLE rooms (
+  room_id uuid PRIMARY KEY, host_id bigint,
+  title text, type text, started_at timestamptz,
+  ended_at timestamptz, recording_url text
+);
+CREATE TABLE room_members (
+  room_id uuid, user_id bigint, role text,  -- host|speaker|listener
+  joined_at timestamptz, PRIMARY KEY (room_id, user_id)
+);</pre>
+<h3>7.2 Live presence (Redis)</h3>
+<pre>HSET room:{id}:presence userId -&gt; "{role,sfuNode,joinedAt}"
+SET  room:{id}:speakerCount  (atomic INCR/DECR)
+PUBLISH room:{id}:events  {type, payload}</pre>
+<h3>7.3 Hallway feed (Cassandra)</h3>
+<pre>CREATE TABLE follow_rooms (
+  user_id bigint,            -- the follower
+  started_at timestamp,
+  room_id uuid, host_id bigint, title text,
+  PRIMARY KEY (user_id, started_at, room_id)
+) WITH default_time_to_live = 14400;  -- 4h auto-expire</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 SFU media plane</h3>
+<p>Selective Forwarding Unit (mediasoup or custom Pion-based) receives Opus RTP from each speaker and forwards to all other participants in the room. No mixing on hot path = no encode/decode = lowest CPU. Each SFU node handles ~2K concurrent connections; we shard rooms across nodes by <code>room_id</code> hash and use cascading: large rooms span multiple SFUs that peer with each other (n &times; m forwarding mesh).</p>
+<h3>8.2 Cascading for 10K-listener rooms</h3>
+<p>Single SFU caps at ~2K. For larger rooms, primary SFU forwards to <em>edge SFUs</em> (one per region). Edge SFUs serve listeners locally. Speakers always join the primary; listeners get assigned to the geographically-nearest edge.</p>
+<h3>8.3 Signaling &amp; presence</h3>
+<p>WebSocket gateway terminates client connections, delegates room state to Redis pub/sub. Promote/demote = Postgres update + Redis publish + per-client SDP renegotiation (transition from recvonly to sendrecv transceiver).</p>
+<h3>8.4 Recording &amp; replay</h3>
+<p>An auxiliary "ghost" participant subscribes to all speaker streams via the SFU and writes mixed Opus to local disk; on room end, the file is uploaded to S3 and re-encoded to AAC for HLS replay. CDN serves replay with adaptive bitrate.</p>
+<h3>8.5 Live captions</h3>
+<p>SFU forks raw PCM to a streaming ASR (e.g., Whisper-stream / Google Streaming STT). Captions broadcast over the WS event channel; clients render them with ~1.5s lag.</p>
+<h3>8.6 Moderation</h3>
+<p>Abuse reports go to a queue; a parallel ASR + classifier flags hate-speech in near-real-time. Severe matches auto-mute the speaker pending review; the host receives a notification.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>SFU CPU:</b> dominated by SRTP encrypt; bare-metal nodes with AES-NI; 1 vCPU per ~150 forwarded streams.</li>
+  <li><b>NAT traversal:</b> coturn TURN fleet for ~15% of users behind symmetric NAT; egress costs are real.</li>
+  <li><b>Cascading mesh failure:</b> if an edge SFU dies, listeners auto-failover to peer edge or primary; speakers see a 1&ndash;2s glitch.</li>
+  <li><b>Hot-host fanout:</b> when a 10M-follower account starts a room, push notifications batched + rate-limited; hallway feed write uses fanout-on-read for celebrities.</li>
+  <li><b>Signaling spikes on a viral room:</b> WS fleet horizontally scaled; sticky session by room_id.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>SFU vs MCU (mixer)</td><td>Lowest latency, no transcode</td><td>Client downloads N streams; CPU on client</td></tr>
+<tr><td>Cascading SFUs</td><td>Scales to 10K listeners</td><td>Cross-region forwarding adds ~80ms</td></tr>
+<tr><td>WebRTC over UDP only</td><td>Lowest latency</td><td>~5% of corp networks block UDP &mdash; need WSS fallback</td></tr>
+<tr><td>Async recording via ghost peer</td><td>Doesn't impact live SFU</td><td>If recorder lags, replay quality drops</td></tr>
+<tr><td>Streaming ASR for captions</td><td>Real-time accessibility</td><td>Cost ~$1/hr per language &mdash; expensive at scale</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — Postgres room metadata is leader-follower; Redis presence is leader-only with AOF.</li>
+  <li>Ch. 8 Trouble with Distributed Systems — partial failures in cascading SFUs; need timeouts &amp; failover playbooks.</li>
+  <li>Ch. 9 Consensus — host-handover (e.g., host disconnects) needs a leader-election in the room metadata service; etcd or Raft-backed.</li>
+  <li>Ch. 11 Stream Processing — Kafka pipeline for room-event log feeds analytics, moderation, and replay catalog.</li>
+  <li>Ch. 12 Future of Data Systems — recording is a derived artifact from the live RTP stream.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"This is a real-time media problem at heart, not a CRUD app &mdash; the SFU topology and WebRTC details dominate the design. I'd budget mouth-to-ear latency: 30ms encoder + 100ms network + 50ms jitter buffer + 50ms decode = ~230ms target."</li>
+  <li>"Cascading SFUs are how Clubhouse scaled past Agora's per-room cap; the trade-off is cross-region listeners hear speakers ~80ms later than co-region listeners."</li>
+  <li>"For host disconnect I'd promote the longest-tenured speaker via a Raft-backed coordinator &mdash; abandoning a 10K-listener room is a UX disaster."</li>
+  <li>"Moderation is the existential product risk &mdash; live audio + millions of listeners means hate-speech can go viral in seconds; I'd ship streaming ASR + classifier as Day 1, not Day 90."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>WebRTC</b></td><td>Sub-300ms mouth-to-ear latency for live conversation is impossible over TCP-based protocols; WebRTC's <code>SRTP</code>-over-UDP plus built-in NACK/PLI/jitter-buffer is the only browser-native stack that hits this SLA, and it's already implemented in every major mobile OS.</td><td>HLS — 6-30s latency, fatal for conversation; LL-HLS — still 2s, too slow; raw RTP — no NAT traversal story</td></tr>
+    <tr><td><b>SFU (mediasoup / Pion)</b></td><td>10K listeners per room makes mesh impossible (90M peer connections) and an MCU mixer adds 100ms+ encode/decode latency per hop; SFUs forward raw RTP without re-encoding, so each speaker's CPU is constant regardless of room size, and total latency stays under 300ms.</td><td>MCU mixer — adds latency, encode CPU explosion; full mesh — collapses past ~10 participants</td></tr>
+    <tr><td><b>Opus codec (32 kbps mono)</b></td><td>Speech-only audio sounds excellent at 32 kbps Opus, and its built-in FEC plus packet-loss concealment recover from the typical 1-3% mobile-network loss without retransmits; 32 kbps x 5.5M concurrent = 176 Gbps egress, manageable.</td><td>AAC-LC — no FEC; G.722 — worse quality at same bitrate; MP3 — too much algorithmic latency</td></tr>
+    <tr><td><b>coturn (TURN servers)</b></td><td>~15% of users are behind symmetric NAT or restrictive corporate firewalls that block direct UDP; coturn relays their media via TLS/UDP fallback so they can still join rooms, and the open-source codebase is battle-tested at scale.</td><td>Self-built TURN — multi-year project; commercial Twilio TURN — per-minute cost prohibitive</td></tr>
+    <tr><td><b>Redis</b></td><td>Live presence (who's in room, who's speaking, who raised hand) needs sub-ms reads + pub/sub for real-time UI updates across 10K listeners per room; <code>HSET</code> for presence and PUBLISH for events scale to our 30K signaling QPS.</td><td>In-process state — breaks across signaling-server restarts; etcd — too slow for per-event pub/sub</td></tr>
+    <tr><td><b>PostgreSQL</b></td><td>Room metadata, member roles, recording URLs need durable persistence with relational queries ("recently ended rooms by host"); a small relational table per room with leader-follower replication suffices and aligns with the room-mgr team's existing tooling.</td><td>Cassandra — no transactions for role changes; DynamoDB — vendor lock and weaker SQL</td></tr>
+    <tr><td><b>Cassandra</b></td><td>Hallway feed (live rooms by follow-graph) is high-write, time-bounded reads with 4h TTL auto-expiry; partition by <code>user_id</code> with <code>started_at</code> clustering returns "rooms my followees host now" in one CQL slice without joins.</td><td>Redis ZSET — fits but less durable; Postgres — joins on follow graph too expensive at 50M MAU</td></tr>
+    <tr><td><b>Kafka</b></td><td>Room-event log (joins, leaves, role changes, reports) drives moderation, analytics, replay catalog, and notification fanout independently; durable replay lets us rebuild any derived view after a bug — critical for the moderation pipeline.</td><td>RabbitMQ — no replay; Redis Streams — bounded retention</td></tr>
+    <tr><td><b>etcd (Raft consensus)</b></td><td>When a host disconnects mid-room, we must pick a new host atomically — two services racing to promote different speakers would split the room; etcd's Raft gives strong leader election in &lt;100ms and is operationally lighter than ZooKeeper.</td><td>ZooKeeper — heavier ops; Consul — too feature-rich for our narrow need</td></tr>
+    <tr><td><b>S3</b></td><td>20% of rooms recorded x 14 MB/room = 280 GB/day of replay artifacts plus HLS variants; S3 with CDN delivery serves replay at ~$0.02/GB egress and lifecycle rules age out replays older than 90 days unless explicitly saved.</td><td>Self-hosted object store — capex; long-tail HDFS — no CDN integration</td></tr>
+    <tr><td><b>WebSocket (signaling)</b></td><td>Bidirectional events (presence, role changes, reactions) need low-overhead persistent connections; WS terminates at a stateless gateway that delegates to Redis pub/sub, and sticky sessions by <code>room_id</code> keep all listeners of one room on cohesive nodes.</td><td>HTTP polling — wasteful at 5.5M concurrent; gRPC streams — lacks browser support universally</td></tr>
+    <tr><td><b>Streaming ASR (Whisper-stream / Google STT)</b></td><td>Live captions and real-time hate-speech detection both need streaming speech-to-text with &lt;1.5s lag; managed STT is ~$1/hr/language but eliminates GPU operations and gets continuous quality improvements without our team retraining models.</td><td>Self-hosted Whisper — GPU ops cost; batch ASR — too slow for live moderation</td></tr>
+    <tr><td><b>FCM / APNs</b></td><td>"Followed creator started a room" can fan out 1M push-notifs in 30s when a celebrity goes live; FCM/APNs are the only providers that deliver at this throughput, and provider-rate-limited token-bucket dispatchers keep us within their TOS.</td><td>SMS — wrong channel and cost; in-house push — won't reach OEM-locked iOS</td></tr>
+    <tr><td><b>HLS for replay</b></td><td>Recorded rooms become VOD content delivered to passive listeners; <code>HLS</code> with adaptive bitrate handles mobile network variability, and the same CDN that serves catalog can serve replays without new infrastructure.</td><td>Progressive MP3 — no adaptive bitrate; LL-HLS — overkill for non-live</td></tr>
+    <tr><td><b>AES-NI bare-metal SFU nodes</b></td><td>SFU CPU is dominated by SRTP AES encryption (1 vCPU per ~150 forwarded streams); bare-metal nodes with hardware AES-NI extensions cut SRTP cost ~5x versus virtualized CPUs, key to making 100K concurrent rooms economically viable.</td><td>Generic VMs — 5x more nodes needed; ARM Graviton — partial AES support, less mature WebRTC builds</td></tr>
+  </tbody>
+</table>

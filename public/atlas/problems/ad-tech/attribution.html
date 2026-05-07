@@ -1,0 +1,144 @@
+<h1>Design Multi-touch Attribution System (last-touch → MTA models)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ad-tech</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build an attribution system that, given the full sequence of ad touchpoints (impressions, clicks, video views) a user saw before converting (purchase, signup, install), apportions credit across those touchpoints. Support last-touch as a baseline, plus first-touch, linear, time-decay, position-based, and data-driven multi-touch attribution (MTA) using Markov / Shapley models. Outputs feed advertiser ROAS dashboards and bidding optimization.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Ingest impressions, clicks, conversions from web, mobile, CTV pixels and SDKs.</li>
+  <li>Stitch user journeys across devices (deterministic + probabilistic).</li>
+  <li>Apply attribution windows (e.g., 1-day view, 7-day click, 28-day install).</li>
+  <li>Run multiple attribution models in parallel; expose per-model credit.</li>
+  <li>Recompute when late conversions arrive (e.g., a 14-day delay).</li>
+  <li>Per-advertiser tenant isolation; PII compliance (GDPR / CCPA delete).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> conversions surface in dashboards within 1 hour; full MTA recompute nightly.</li>
+  <li><b>Scale:</b> 200 B touchpoints/day, 500 M conversions/day, 2 B users.</li>
+  <li><b>Accuracy:</b> deterministic attribution for click-based models; calibrated probabilistic for view-through.</li>
+  <li><b>Compliance:</b> 30-day max retention for raw user paths; right-to-be-forgotten in 30 days.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Touch volume: 200 B/day × 0.5 KB = 100 TB/day raw.</li>
+  <li>User journeys: 2 B users × avg 100 touches × 100 B = 20 TB hot state.</li>
+  <li>Compute: nightly MTA on 7-day window ~= 1 PB scan; Spark cluster ~5,000 cores for 4 h job.</li>
+  <li>Conversion ingest: 6k/sec average, 50k/sec peak (Black Friday).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/touch       {userKey, adId, type:imp|clk|view, ts, channel}
+POST /v1/conversion  {userKey, advertiserId, value, eventType, ts}
+GET  /v1/report/attribution?advertiser=...&amp;model=mta_markov&amp;range=...
+POST /v1/gdpr/delete {userKey}    → 30-day SLA cascade</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Pixels/SDK] ──► [Ingest GW] ──► [Kafka: touches]
+                                       │
+                                       ▼
+                          [Flink: Sessionize per userKey]
+                                       │
+                  ┌────────────────────┼────────────────────┐
+                  ▼                    ▼                    ▼
+        [User Journey Store]   [Identity Graph]      [S3 raw]
+        (Cassandra, 30d TTL)   (Spanner)
+                  │
+                  ▼
+      [Conversion Joiner] ─── matches conversion ts back through window
+                  │
+                  ▼
+          [Attribution Engine]
+            ├─ Last-touch (real-time)
+            ├─ Linear / Time-decay (real-time)
+            └─ Markov / Shapley (Spark nightly)
+                  │
+                  ▼
+          [Druid + BigQuery]  → Advertiser dashboards
+</div>
+<p>Real-time path computes rule-based models (last-touch, time-decay) within minutes. Data-driven MTA runs as a Spark batch over the previous 7-day journey log nightly because Markov fitting and Shapley value enumeration need the full graph.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 User journey (Cassandra, wide row)</h3>
+<pre>CREATE TABLE journey (
+  user_key text, day date,
+  ts timestamp, ad_id text, campaign_id text, type text,
+  PRIMARY KEY ((user_key), day, ts)
+) WITH default_time_to_live = 2592000;  -- 30 days</pre>
+<h3>7.2 Identity graph (Spanner)</h3>
+<p>Edges: (deviceId, cookieId, hashedEmail) with confidence weights. Updated by login events and probabilistic graph models.</p>
+<h3>7.3 Conversion log (BigQuery + Kafka)</h3>
+<p>Conversions stored with auctionId references when known, plus user_key for join on attribution.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Sessionization</h3>
+<p>Flink keyed-by user_key, gap-session = 30 min. Emits ordered touch sequence; out-of-order events buffered up to 10 min watermark.</p>
+<h3>8.2 Conversion joiner</h3>
+<p>For each conversion at time T, range-scan journey for user_key in [T - 28d, T]. Rule-based credit applied immediately; result written to Druid for the real-time dashboard.</p>
+<h3>8.3 Markov MTA (nightly)</h3>
+<p>Build a Markov chain over channel transitions including a "conversion" absorbing state. Each channel's removal effect = Δ(P(conversion)) when its transitions are deleted; normalize to credit. O(C²) per advertiser where C = channel count (~50).</p>
+<h3>8.4 Shapley value</h3>
+<p>For an ordered touch sequence, credit channel i = average marginal contribution over all subsets. Approximated by Monte-Carlo sampling — 1k permutations per journey is empirically sufficient.</p>
+<h3>8.5 Identity stitching</h3>
+<p>Deterministic via login (hashedEmail). Probabilistic via (IP × UA × geo) co-occurrence with confidence threshold; respect privacy regulations and per-region opt-out.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot users (bots):</b> cap journey length at 10k touches; spillover sampled.</li>
+  <li><b>Late conversions:</b> 14-day reprocess window; advertisers see "preliminary" vs "final" labels.</li>
+  <li><b>MTA compute:</b> partition by advertiser; co-locate journey + conversion shards in Spark to minimize shuffle.</li>
+  <li><b>GDPR delete:</b> tombstone in Kafka; downstream consumers honor on next read.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Last-touch only</td><td>Simple, deterministic</td><td>Ignores upper-funnel value</td></tr>
+<tr><td>Markov MTA</td><td>Data-driven, principled</td><td>Needs nightly batch, harder to explain</td></tr>
+<tr><td>Probabilistic identity</td><td>Higher coverage</td><td>Privacy + accuracy concerns</td></tr>
+<tr><td>Cassandra TTL = 30d</td><td>Auto-compliance</td><td>Older studies impossible</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 10 Batch Processing — Spark MapReduce-style pipelines for nightly MTA recompute.</li>
+  <li>Ch. 11 Stream Processing — sessionization, watermarks, late-event handling for real-time attribution.</li>
+  <li>Ch. 12 Future of Data Systems — combining stream (real-time last-touch) and batch (Markov) views via the lambda/kappa pattern.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd ship last-touch + linear in v1; advertisers can compare. Data-driven MTA is v2 because the modeling and explainability work is non-trivial."</li>
+  <li>"Privacy is the hard constraint: 30-day TTL is built in, not bolted on, and identity stitching has region-specific gates."</li>
+  <li>"Late conversions are inevitable — the dashboard surfaces 'preliminary vs final' so advertisers don't get confused by restated numbers."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Apache Kafka (touches ingest)</td><td>200 B touchpoints/day = 100 TB/day raw needs a durable replayable log for nightly MTA recompute; Kafka's partition-by-userKey lets Flink sessionize without shuffle, and 30-day retention spans the longest 28-day install attribution window.</td><td>Kinesis (rejected: shard limits at 100 TB/day); Pulsar (smaller ops community for this scale).</td></tr>
+<tr><td>Apache Flink (sessionization)</td><td>Keyed-by user_key with 30-min gap session and 10-min watermark needs exactly-once stateful processing at 200 B events/day; Flink's RocksDB state and watermark mechanics deliver bounded-lateness with idempotent sinks.</td><td>Spark Structured Streaming (rejected: micro-batch lag for sessionization); Kafka Streams (state size limit at TB scale).</td></tr>
+<tr><td>Cassandra (user journey, 30d TTL)</td><td>2 B users × 100 touches × 100 B = 20 TB hot state with strict 30-day TTL for GDPR; Cassandra's TTL-aware tombstones auto-expire rows, wide-row partitioning by user_key keeps per-user touch retrieval to one disk seek.</td><td>HBase (rejected: weaker TTL story); Bigtable (viable on GCP); ScyllaDB (better latency, smaller community).</td></tr>
+<tr><td>Spanner (identity graph)</td><td>(deviceId, cookieId, hashedEmail) edges need ACID merge when login events fire; Spanner's external consistency prevents split-brain identity merges across regions, and stored confidence weights inform probabilistic stitching.</td><td>Postgres (rejected: no global ACID for cross-region writes); Neo4j (graph queries unneeded, edges are flat).</td></tr>
+<tr><td>Apache Spark (nightly MTA)</td><td>Markov fitting and Shapley enumeration over a 7-day journey log = ~1 PB scan; Spark's in-memory shuffles and the 5,000-core 4-hour batch SLA require its broad ecosystem (MLlib, Catalyst) — Flink would work but Spark is the standard for ML on PB tables.</td><td>Flink batch (viable, weaker ML libs); Hive (rejected: no in-memory acceleration).</td></tr>
+<tr><td>Markov chain MTA model</td><td>Channel removal-effect on conversion probability is principled and interpretable; O(C²) over ~50 channels is tractable per advertiser, and the absorbing-state formulation handles non-converted journeys naturally.</td><td>Pure last-touch (rejected: ignores upper funnel); deep-learning attribution (rejected for v1: opacity blocks advertiser trust).</td></tr>
+<tr><td>Shapley value (Monte Carlo)</td><td>For ordered touch sequences, Shapley gives axiomatically-fair credit; full enumeration is 2^N intractable, but 1k-permutation Monte Carlo converges to within 1% credit for typical journey lengths and runs in nightly Spark.</td><td>Exact Shapley (rejected: combinatorial blow-up); LIME-style local approx (less rigorous).</td></tr>
+<tr><td>Apache Druid (real-time dashboard)</td><td>Last-touch and time-decay credits stream to dashboards within minutes; Druid's bitmap-indexed real-time segments deliver sub-second slice/dice on (advertiser × campaign × channel × day) where BigQuery would charge per scan.</td><td>ClickHouse (similar performance, Druid's stream-ingest tighter); BigQuery (cost prohibitive on dashboard QPS).</td></tr>
+<tr><td>BigQuery (conversion log + ad-hoc)</td><td>Conversions joined to journeys for nightly MTA + advertiser-led ad-hoc analysis; BigQuery's serverless model lets advertisers query their own conversion data without operating a cluster, and federated queries cross-check Druid totals.</td><td>Snowflake (more expensive on GCP-native ingest); Redshift (multi-cloud overhead).</td></tr>
+<tr><td>S3 (raw touch archive)</td><td>Raw immutable copy of every touch enables full pipeline replay for late conversions or model changes; S3 lifecycle to Glacier after 30 days satisfies the GDPR cap while preserving aggregate-level history.</td><td>HDFS (operational cost at PB); GCS (similar; choice depends on cloud).</td></tr>
+<tr><td>Lambda architecture (batch + stream)</td><td>Real-time path (Flink) for last-touch within minutes; batch path (Spark) for Markov / Shapley nightly — neither alone meets both 1-h dashboard latency and full-MTA accuracy. Restated "preliminary vs final" labels signal which view advertiser is seeing.</td><td>Pure Kappa (rejected: Markov fitting needs full graph); pure batch (1-h latency unmet).</td></tr>
+<tr><td>UUIDv7 user_key + hashed email</td><td>Deterministic identity stitching uses HMAC-hashed email (one-way, GDPR-safe); UUIDv7 device keys give time-ordered keys for efficient Cassandra range scans by (user_key, day).</td><td>Plaintext email (rejected: PII in storage); SHA-1 (collision risk over 2 B users); hashed-IP-only (low confidence).</td></tr>
+<tr><td>GDPR tombstone-in-Kafka</td><td>Right-to-be-forgotten in 30 days requires cascading deletes across Cassandra, S3, Druid, BigQuery; a tombstone event in Kafka is consumed by all downstream systems on next read, satisfying the SLA without a custom orchestrator.</td><td>Per-system delete API calls (rejected: brittle, hard to audit); central orchestrator (more code to operate).</td></tr>
+</tbody>
+</table>

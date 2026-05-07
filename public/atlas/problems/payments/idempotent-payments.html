@@ -1,0 +1,232 @@
+<h1>Design Idempotent Payment Processing (no double-charge)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">payments</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the request-handling layer of a payment API such that <b>any client retry — at any layer, at any time — is safe</b>. Networks lose packets, clients timeout and retry, load balancers replay requests, mobile apps double-tap. The system must charge the customer at most once per logical intent, regardless of how many physical requests arrive. This is the single most cited "easy to get wrong" problem in payments — and the canonical DDIA Ch.7 problem.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Accept <code>Idempotency-Key</code> header (UUIDv4 or client-defined string ≤ 64 chars).</li>
+  <li>Same key + same request body → return cached prior response (200/201 with original payload).</li>
+  <li>Same key + different request body → 409 Conflict (catches client bugs).</li>
+  <li>Key TTL ≥ 24 hours (industry standard) — Stripe uses 24h; PayPal 5 min; we'll go 24h.</li>
+  <li>Concurrent retries with the same key: only one wins; others wait or get a "in-progress" reply.</li>
+  <li>Crash-safe: a process dying mid-request must not leak partial side effects.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Correctness:</b> zero double-charge. Period.</li>
+  <li><b>Latency overhead:</b> &lt; 5 ms p99 added by the idempotency layer.</li>
+  <li><b>Scale:</b> 50 K RPS peak; 4 B keys/day at peak rate; 24 h retention.</li>
+  <li><b>Availability:</b> the idempotency store must not be a single point of failure for the API.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Keys/day: 50 K RPS × 86400 = 4.3 B; with 24 h TTL → ~4.3 B live rows.</li>
+  <li>Row size: key(64) + req_hash(32) + response(2 KB) + meta(64) ≈ 2.2 KB.</li>
+  <li>Storage: 4.3 B × 2.2 KB ≈ 9.5 TB; sharded Postgres (16 shards × 600 GB) or DynamoDB.</li>
+  <li>Hot-path cache: top 1% (43 M keys) in Redis ≈ 95 GB cluster.</li>
+  <li>Lock contention: at 50 K RPS with avg 200 ms processing, ~10 K concurrent in-flight rows.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/charges
+Headers:
+  Idempotency-Key: 8e0c2b...        (required for unsafe methods)
+  Content-Type: application/json
+Body:
+  {amount, currency, source, customer}
+
+Responses:
+  201 Created      → first time; new charge created
+  200 OK (replay)  → cached response from prior identical request
+  409 Conflict     → same key, different body
+  425 Too Early    → in-progress; client should retry after backoff</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] ─POST─► [API GW] ─► [Idempotency Middleware]
+                                       │
+            ┌──────────────────────────┼──────────────────────────┐
+            ▼                          ▼                          ▼
+      [Redis cache]              [Postgres idempotency]    [Distributed lock]
+      (hot replay path)          (durable, unique idx)     (Redis or row-lock)
+                                       │
+                                       ▼
+                                [Charge handler]
+                                       │
+                            (writes charge + response in
+                             SAME txn as idempotency row)
+                                       ▼
+                                  [Ledger DB]
+</div>
+<p>The middleware is two-stage: cache for fast replay, durable store for correctness. The handler runs <i>inside a database transaction</i> that includes the idempotency row update — this is the load-bearing detail.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Idempotency table (Postgres, sharded by hash(key))</h3>
+<pre>CREATE TABLE idempotency_keys (
+  key            TEXT PRIMARY KEY,
+  request_hash   BYTEA NOT NULL,         -- SHA-256 of canonical body
+  response_code  SMALLINT,
+  response_body  JSONB,
+  state          SMALLINT NOT NULL,      -- 1=IN_FLIGHT, 2=COMPLETED
+  resource_id    TEXT,                   -- e.g., charge_id once created
+  locked_at      TIMESTAMPTZ,
+  expires_at     TIMESTAMPTZ NOT NULL,
+  created_at     TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX ix_expires ON idempotency_keys(expires_at);</pre>
+<h3>7.2 Why Postgres (not just Redis)?</h3>
+<p>Redis loses data on failover under default config; idempotency is one of the few places we cannot afford that. Postgres gives us a <b>UNIQUE constraint that's part of the same transaction</b> as the side-effect write — atomicity for free (DDIA Ch.7: single-object atomic writes are the strongest cheap primitive in databases).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 The five-state protocol</h3>
+<pre>Request arrives with key K, body B, hash H = sha256(canonical(B))
+
+INSERT INTO idempotency_keys(key, request_hash, state, expires_at)
+VALUES (K, H, IN_FLIGHT, now() + interval '24h')
+ON CONFLICT (key) DO NOTHING
+RETURNING xmax = 0 AS inserted;
+
+CASE 1: inserted=true             → we own it; run handler
+CASE 2: existing row, state=COMPLETED, hash matches → replay cached response
+CASE 3: existing row, state=COMPLETED, hash differs → 409
+CASE 4: existing row, state=IN_FLIGHT, &lt; lock_timeout → 425 retry-after
+CASE 5: existing row, state=IN_FLIGHT, &gt; lock_timeout → reclaim (locked_at update via SELECT FOR UPDATE)</pre>
+
+<h3>8.2 The atomicity trick</h3>
+<p>The handler does ALL of the following in one Postgres transaction:</p>
+<pre>BEGIN;
+  -- (idempotency row already inserted as IN_FLIGHT)
+  INSERT INTO charges (id, amount, ...) VALUES (...);
+  INSERT INTO ledger_entries (...) VALUES (...);  -- balanced pair
+  UPDATE idempotency_keys SET state=COMPLETED,
+         response_code=201, response_body=$1,
+         resource_id=charge_id
+   WHERE key=$2;
+COMMIT;</pre>
+<p>If the process dies before COMMIT, Postgres rolls back everything, including the idempotency row's state transition. The next retry sees IN_FLIGHT past timeout and reclaims. <b>No partial side effects, ever.</b></p>
+
+<h3>8.3 External side effects (the hard part)</h3>
+<p>What if we already called the card network? That call is non-transactional. Mitigation: structure the handler so external calls happen <b>after</b> a UUID is allocated and persisted, then dedupe at the connector boundary (network-side idempotency, e.g., Visa's <code>retrievalReferenceNumber</code>). The DB transaction commits the <i>intent + outcome</i> together once the network call returns.</p>
+
+<h3>8.4 Concurrent retries (thundering herd)</h3>
+<p>Two retries arrive in 50 ms — both hit INSERT … ON CONFLICT. Loser sees 425 Too Early. Better: loser does <code>SELECT … FOR UPDATE</code> on the row to <i>wait</i> for the leader; when leader commits, loser sees COMPLETED and replays. Bounded wait via <code>SET LOCAL lock_timeout = '500ms'</code>.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Idempotency table grows fast:</b> partition by day, drop oldest partition daily. 4 B rows/day × 7-day retention = 28 B rows; 7 partitions of ~4 B each.</li>
+  <li><b>Hot key (e.g., a buggy client looping):</b> per-key rate limit at the gateway; circuit-break to 429.</li>
+  <li><b>Postgres write hotspot:</b> shard by hash(key); never use sequential keys.</li>
+  <li><b>Cross-region failover:</b> idempotency must be linearizable across regions for the API contract to hold; Spanner / CockroachDB / Postgres with synchronous replicas in a quorum group (DDIA Ch.9).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Postgres for idempotency</td><td>ACID with side effects in same txn</td><td>Harder to scale than Redis</td></tr>
+<tr><td>24 h TTL</td><td>Tolerates long client retries</td><td>Larger storage footprint</td></tr>
+<tr><td>409 on hash mismatch</td><td>Catches client bugs early</td><td>Clients must canonicalize bodies</td></tr>
+<tr><td>SELECT FOR UPDATE wait</td><td>Smoother UX than 425</td><td>Holds connections; must bound timeout</td></tr>
+<tr><td>Network idempotency at connector</td><td>True end-to-end</td><td>Coupled to acquirer features</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 7 Transactions</b> — this whole problem is the worked example: "exactly-once delivery" reframed as "at-least-once + idempotent operations + transactional commit". Pages on idempotency keys, atomic writes, and the single-object atomic update are exactly the primitives we use.</li>
+  <li><b>Ch. 7 Transactions</b> — read-committed vs SSI: SSI prevents the rare race where two retries both pass the IN_FLIGHT check by sneaking between snapshots; we need it.</li>
+  <li><b>Ch. 7 Transactions</b> — discussion of "what could possibly go wrong" enumerates: process crash, network partition, duplicate retry, replica drift — every failure mode this design defends against.</li>
+  <li><b>Ch. 9 Consensus</b> — for multi-region deployments, the idempotency record must be linearizable; Raft-replicated or Spanner-style synchronous quorum.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The interview trap is to put the idempotency check before the side effect; the correct place is to bind the idempotency record and the side effect into one transaction."</li>
+  <li>"There is no exactly-once; there is only at-least-once with deduping. I'd say that out loud and design accordingly."</li>
+  <li>"The card network is not transactional — so I push idempotency into the connector layer with the network's RRN, and accept reconciliation as the fallback."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Postgres (SSI) — idempotency table</td>
+      <td>4.3 B keys/day with 24h TTL needs durable atomic upserts. SSI (DDIA Ch.7) is the only isolation level that prevents two retries from both sneaking past the IN_FLIGHT check between snapshot reads — read-committed lets phantoms double-charge. UNIQUE constraint binds the key insert to the side-effect commit in one txn.</td>
+      <td>MySQL REPEATABLE READ (still allows write skew here); Redis (loses on failover, can't bind to side effect).</td>
+    </tr>
+    <tr>
+      <td>Spanner / CockroachDB — multi-region</td>
+      <td>For active-active across regions, the idempotency record must be linearizable across regions (DDIA Ch.9) so a retry in EU sees the original commit from US. Spanner-style synchronous quorum is the only correct shape; Postgres synchronous replicas in a quorum group is the cheaper variant.</td>
+      <td>Eventually-consistent multi-master (correctness bug — same key returns different responses by region); single-region only (no DR).</td>
+    </tr>
+    <tr>
+      <td>Cassandra — explicitly rejected</td>
+      <td>Cassandra LWW + tunable consistency cannot bind the idempotency row to a side-effect transaction. Two retries hitting different coordinators could both "win" their CAS — and even if not, there's no mechanism to commit the response payload atomically with the charge insert.</td>
+      <td>n/a — this is the rejection.</td>
+    </tr>
+    <tr>
+      <td>Redis — hot replay cache</td>
+      <td>50 K RPS retry path needs sub-ms response replay; 95 GB cluster holds the top 1% (43 M keys). Tier on top of Postgres — Redis returns cached response, Postgres remains the durable source. We accept Redis loss on failover because Postgres still rejects the duplicate via UNIQUE.</td>
+      <td>Memcached (no replication); in-process LRU (no cross-pod consistency).</td>
+    </tr>
+    <tr>
+      <td>UNIQUE INDEX on key — INSERT … ON CONFLICT</td>
+      <td>The five-state protocol requires atomic "claim or fail" semantics per key. Postgres's INSERT … ON CONFLICT DO NOTHING with a UNIQUE index gives that for free at sub-ms cost (DDIA Ch.7 single-object atomic write). The xmax = 0 trick tells us if we won the insert.</td>
+      <td>SELECT-then-INSERT (TOCTOU race); advisory locks (don't survive across pods).</td>
+    </tr>
+    <tr>
+      <td>Same-txn commit (idempotency + side effect)</td>
+      <td>The load-bearing detail: BEGIN → INSERT charges → INSERT ledger entries → UPDATE idempotency_keys SET state=COMPLETED → COMMIT. Process crash mid-flight rolls back everything including the state transition; next retry sees IN_FLIGHT past timeout and reclaims. <b>Zero partial side effects.</b></td>
+      <td>Two-phase app-managed (race window); compensating cleanup (complex, hard to reason about).</td>
+    </tr>
+    <tr>
+      <td>SHA-256 request hash</td>
+      <td>Stored alongside the key so we can return 409 when the same key arrives with a different body (catches client bugs early). 32 B per row, fast to compute. Must canonicalize JSON (sorted keys, no whitespace) before hashing or false 409s explode.</td>
+      <td>MD5 (broken collisions); full body comparison (storage + comparison cost).</td>
+    </tr>
+    <tr>
+      <td>SELECT … FOR UPDATE — concurrent retry wait</td>
+      <td>Two retries arrive in 50 ms — the loser <code>SELECT FOR UPDATE</code>s the row to wait for the leader's commit, then sees COMPLETED and replays. Smoother UX than 425. <code>SET LOCAL lock_timeout = '500ms'</code> prevents holding pool connections forever.</td>
+      <td>Return 425 immediately (worse client UX, retry storms); spin-wait (wastes CPU + connections).</td>
+    </tr>
+    <tr>
+      <td>Time-partitioned table (drop by day)</td>
+      <td>4.3 B rows/day × 7-day retention = 28 B rows; Postgres native partitioning by (created_at::date) lets us DROP PARTITION daily — orders of magnitude faster than DELETE WHERE expires_at &lt;. Vacuum stays sane.</td>
+      <td>DELETE on TTL (vacuum hell at this row count); TimescaleDB (extra dependency for one feature).</td>
+    </tr>
+    <tr>
+      <td>Saga + idempotent connector calls</td>
+      <td>External card-network calls aren't transactional — we structure the handler so a UUID is allocated and persisted before the network call, and the connector dedupes via the network's own retrievalReferenceNumber. The DB txn commits the intent + outcome together once the network returns.</td>
+      <td>Pre-call commit (no outcome to record); post-call only (no retry safety on network timeout).</td>
+    </tr>
+    <tr>
+      <td>2PC — explicitly rejected</td>
+      <td>The whole point of this design is to avoid distributed atomic commit. 2PC across the API + ledger + connector would create a coordinator bottleneck and tie availability to the slowest participant (DDIA Ch.9). Single-DB ACID + idempotency keys gives the same guarantees at 1/10th the latency.</td>
+      <td>Saga + idempotency (chosen); XA across services (latency + coordinator failure modes).</td>
+    </tr>
+    <tr>
+      <td>Distributed lock (Redis Redlock or PG row lock)</td>
+      <td>For non-transactional side effects (e.g., calling a third-party API once), a short-lived advisory lock per key prevents two pods from making parallel external calls when the IN_FLIGHT marker isn't yet visible across replicas. Bound to 500 ms.</td>
+      <td>No lock (double external call); ZooKeeper (heavier than the use case warrants).</td>
+    </tr>
+    <tr>
+      <td>Etcd (Raft) — for cross-region linearizability of small KV</td>
+      <td>If the architecture goes multi-region without Spanner, etcd-replicated idempotency markers (DDIA Ch.9 Raft) give linearizable claim semantics for the small-but-critical "is this key in flight" check before falling through to the regional Postgres.</td>
+      <td>DynamoDB Global Tables (last-writer-wins is wrong here); Cassandra LWT (CAS too weak across regions).</td>
+    </tr>
+    <tr>
+      <td>Idempotency keys — the contract itself</td>
+      <td>This is the entire problem. Client-generated key + server unique constraint is the canonical "at-least-once + idempotent = exactly-once-effective" pattern (DDIA Ch.7). Without client cooperation there is no correct solution at the API boundary.</td>
+      <td>Server-generated key (defeats retry semantics); body-hash only (false negatives on metadata changes).</td>
+    </tr>
+  </tbody>
+</table>

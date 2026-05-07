@@ -1,0 +1,201 @@
+<h1>Design Multi-armed Bandit Recommender (exploration vs exploitation, Thompson)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">recommendation</span>
+  <span class="tag">ad-tech</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a multi-armed bandit (MAB) layer for a recommender / ad-tech platform that balances exploration and exploitation across thousands of arms (creatives, items, modules). Use Thompson Sampling and contextual bandits (LinUCB / contextual TS) to adapt within minutes to changing reward distributions. Targets: 1B users, 580K decisions/sec, sub-100ms decision latency, posterior updates within 60 seconds of feedback.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Pick an arm per request given context (user features, surface).</li>
+  <li>Update posterior parameters from reward signals (click, conversion).</li>
+  <li>Support both stationary (Beta-Bernoulli) and contextual (LinUCB) bandits.</li>
+  <li>Allow operators to add/remove arms with warm-start priors.</li>
+  <li>Per-user dedupe so the same user isn't served the same exploratory arm too often.</li>
+  <li>Off-policy evaluation (IPS / DR) for new policies before launch.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> arm selection p99 under 10 ms; with retrieval, total under 100 ms.</li>
+  <li><b>Scale:</b> 580K decisions/sec; 10K-100K active arms per surface.</li>
+  <li><b>Update lag:</b> rewards integrated into posterior within 60 seconds.</li>
+  <li><b>Availability:</b> 99.95%; degrade to greedy on the prior mean if posterior store is down.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Posterior state: 100K arms * 200 bytes (Beta(alpha,beta) + LinUCB matrix sketch) = 20 MB per surface; 1000 surfaces = 20 GB total. Fits in Redis.</li>
+  <li>Reward events: 580K decisions/sec * 0.05 reward rate = 29K reward events/sec. 200 bytes each = 6 MB/sec into Kafka.</li>
+  <li>Decision logging (for off-policy eval): 580K * 500 bytes = 290 MB/sec, 25 TB/day.</li>
+  <li>Compute: contextual sample is a 64x64 matrix sample, ~0.1 ms with Cholesky cache.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/bandit/decide   {surface, userCtx, candidateArms[]}
+                          -> {chosenArm, propensity, decisionId}
+POST /v1/bandit/reward   {decisionId, reward, ts}
+GET  /v1/bandit/state/{surface}/{armId}  -> posterior params  (admin)
+POST /v1/bandit/arms     {surface, armId, priorAlpha, priorBeta}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] -> [Decide API]
+                |
+                v
+        [Bandit Engine]
+         |       |
+         v       v
+   Beta-Bernoulli  LinUCB (per-surface)
+         |       |
+         +---+---+
+             v
+        sample arm, log propensity p
+             |
+             v
+       [Decision Log -> Kafka]
+                                \
+                                 v
+                          [Reward Joiner (Flink)]
+                                 | join on decisionId
+                                 v
+                          [Posterior Updater]
+                                 | atomic update
+                                 v
+                          [Posterior Store (Redis)]
+                                 ^
+                                 | reads on every decide
+        [Bandit Engine] ---------/
+</div>
+<p>Walk-through: each request loads posterior for candidate arms, samples one (Thompson) or computes UCB, returns choice with propensity p (probability of selecting that arm). Reward arrives later, joined by decisionId in a streaming pipeline, posterior updated atomically.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Posterior store (Redis)</h3>
+<pre>KEY  bandit:{surface}:{armId}    HASH alpha,beta,n,last_update_ts
+KEY  bandit:ctx:{surface}:{armId} BLOB A_inv (64x64 fp32) + b (64) for LinUCB
+                                       updated via Sherman-Morrison on each reward</pre>
+<h3>7.2 Decision log (Iceberg on S3)</h3>
+<pre>Columns: decisionId, surface, userId, ctx[64], armId, propensity, ts.
+Partitioned by date+surface. Used for off-policy evaluation and counterfactual replays.</pre>
+<h3>7.3 Reward join</h3>
+<pre>Flink keyed-state on decisionId, TTL 7 days. Late rewards beyond TTL discarded with metric.
+Joined record sent to posterior updater and to training data lake.</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Thompson Sampling (Beta-Bernoulli)</h3>
+<p>For each candidate arm draw sample s ~ Beta(alpha, beta), pick argmax. After reward r in {0,1}: alpha += r, beta += (1-r). Naturally regret-optimal. For cold arms use weakly-informative prior Beta(1, 1) or content-derived prior.</p>
+<h3>8.2 Contextual bandit (LinUCB)</h3>
+<p>Reward expected = theta_a^T x. Maintain A_a = sum(x x^T) + lambda*I and b_a = sum(r x). At decide time: theta_hat = A_inv b; UCB = theta_hat^T x + alpha sqrt(x^T A_inv x). Cache A_inv updated via rank-1 Sherman-Morrison on each reward.</p>
+<h3>8.3 Off-policy evaluation</h3>
+<p>Inverse Propensity Scoring (IPS): for new policy pi', estimated reward = mean over logs of (pi'(a|x)/p) * r. Doubly-robust adds a regression baseline. Run nightly on logs to gate launches.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Posterior staleness:</b> 60-sec lag is fine for organic; ad-tech needs &lt;5s -&gt; bypass batch and update via single Flink pipeline.</li>
+  <li><b>Cold arms swamped by warm arms:</b> use forced exploration (epsilon=0.05) or upper-confidence floor for first N pulls.</li>
+  <li><b>Non-stationarity:</b> reward distribution drifts (creatives age out); use sliding-window posteriors or Bayesian forgetting (multiply alpha,beta by 0.99/hour).</li>
+  <li><b>Delayed rewards:</b> conversions arrive hours later; use partial credit at click time, true-up later.</li>
+  <li><b>Hot arms:</b> 80/20 read traffic per surface; replicate hot keys 4x in Redis.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Thompson Sampling</td><td>Simple, regret-optimal</td><td>Hard to debug</td></tr>
+<tr><td>UCB</td><td>Deterministic, explainable</td><td>Tuning alpha is finicky</td></tr>
+<tr><td>Epsilon-greedy</td><td>Trivial to implement</td><td>Wastes pulls forever</td></tr>
+<tr><td>LinUCB / contextual TS</td><td>Uses user features</td><td>Matrix maintenance cost</td></tr>
+<tr><td>Sliding window</td><td>Adapts to drift</td><td>Forgets useful history</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — Flink keyed-state for decision-reward join and posterior updates with exactly-once semantics.</li>
+  <li>Ch. 10 Batch Processing — nightly off-policy evaluation over Iceberg decision logs.</li>
+  <li>Ch. 7 Transactions — atomic CAS-style posterior updates avoid lost updates under concurrent rewards.</li>
+  <li>Ch. 12 Future of Data Systems — feedback loops: bandit decisions become training data; bias must be tracked via propensity logging.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Always log propensities. Without them you cannot do off-policy evaluation, and you'll be stuck doing online A/Bs forever."</li>
+  <li>"Thompson Sampling is my default. It's regret-optimal and trivial to implement. UCB is the answer when stakeholders demand explainability."</li>
+  <li>"Non-stationarity is the silent killer. A bandit without forgetting will lock onto stale arms; I'd add discounting from day one."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Thompson Sampling (Beta-Bernoulli)</td>
+      <td>Default arm-selection: regret-optimal, trivially implementable as alpha+=r, beta+=(1-r), and natively probabilistic so propensity logging is direct. At 580K decisions/sec a single Beta sample is sub-microsecond, fitting the 10ms p99 selection budget with room for retrieval.</td>
+      <td>Epsilon-greedy (wastes pulls forever); UCB (deterministic but tuning constant alpha is finicky in production).</td>
+    </tr>
+    <tr>
+      <td>LinUCB (contextual bandit)</td>
+      <td>Stationary TS ignores user features; LinUCB with a 64-d context vector exploits user signals while keeping per-decision compute at ~0.1ms via cached Cholesky factorization. Sherman-Morrison rank-1 updates avoid recomputing A_inv on each reward.</td>
+      <td>Contextual TS (similar; LinUCB picked for explainability); deep contextual (latency-prohibitive at 580K QPS).</td>
+    </tr>
+    <tr>
+      <td>Redis (posterior store)</td>
+      <td>20 GB total posterior state (1000 surfaces * 100K arms * 200 bytes) sub-1ms reads on every decision; HASH layout for Beta(alpha,beta,n) and BLOB for the 64x64 LinUCB matrix lets one round-trip fetch all candidate-arm state inside the 10ms decision budget.</td>
+      <td>Memcached (no atomic HASH ops); DynamoDB (10ms tail breaks the 10ms p99).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka</td>
+      <td>Decision log at 290 MB/sec (25 TB/day) and reward stream at 6 MB/sec both flow through Kafka; partitioned by decisionId so Flink's keyed-state reward join lands on the same operator that emitted the decision, no shuffle needed.</td>
+      <td>Kinesis (per-shard write cap); Pulsar (less mature Flink connector).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink (reward join + posterior update)</td>
+      <td>Keyed-state on decisionId with 7-day TTL handles delayed conversions; exactly-once via Kafka transactional writes prevents lost or duplicated posterior updates per DDIA Ch.11. Sub-60s end-to-end matches the update-lag NFR.</td>
+      <td>Spark Streaming (micro-batch lag); Kafka Streams (delayed-reward TTL state at this scale).</td>
+    </tr>
+    <tr>
+      <td>Sherman-Morrison update</td>
+      <td>LinUCB matrix A_a accumulates x*x^T per reward; recomputing A_inv from scratch is O(d^3) = 260k ops, blocking the 0.1ms hot path. Sherman-Morrison rank-1 update is O(d^2) = 4k ops, fitting the latency budget while preserving exactness.</td>
+      <td>Periodic refit (drifts between refreshes); Woodbury batch updates (more complex for streaming).</td>
+    </tr>
+    <tr>
+      <td>Apache Iceberg on S3 (decision log)</td>
+      <td>25 TB/day of decision logs partitioned by date+surface enables nightly off-policy evaluation (IPS / DR) per DDIA Ch.10; partition pruning means a typical IPS replay scans one surface-day, not the whole table.</td>
+      <td>Raw Parquet on S3 (no atomic commits); Delta Lake (similar; Iceberg picked for engine neutrality).</td>
+    </tr>
+    <tr>
+      <td>Inverse Propensity Scoring + Doubly-Robust</td>
+      <td>Counterfactually estimate a new policy without an online A/B; combined with a regression baseline (DR) reduces variance vs pure IPS. Mandatory for the launch-gate workflow given that 580K decisions/sec means a real A/B costs millions of impressions.</td>
+      <td>Pure IPS (high variance with small p); pure A/B (slow and expensive launches).</td>
+    </tr>
+    <tr>
+      <td>Apache Spark (nightly OPE)</td>
+      <td>Off-policy evaluation runs on the 25 TB/day decision log; Spark's wide-shuffle joins on (decisionId, reward) and per-policy reweighting parallelize across the cluster, completing the nightly window inside the launch-decision SLA.</td>
+      <td>Beam (vendor lock); custom MapReduce (lacks the SQL-on-Iceberg ergonomics).</td>
+    </tr>
+    <tr>
+      <td>Bayesian forgetting (alpha,beta * 0.99/hr)</td>
+      <td>Reward drifts as creatives age; multiplicative decay on (alpha, beta) every hour gives an effective sliding window of ~100 hours without explicit windowing state, the simplest production-friendly non-stationarity mitigation cited in the design.</td>
+      <td>Hard sliding window (forgets useful early signal); fixed discount (less tunable).</td>
+    </tr>
+    <tr>
+      <td>gRPC + protobuf</td>
+      <td>Per-decision payload includes 64-d context plus N candidate arm IDs; protobuf binary serialization is 4x smaller than JSON and HTTP/2 multiplexing cuts round-trip overhead, key to the 10ms decision p99.</td>
+      <td>REST/JSON (verbose, slower); Thrift (similar; gRPC ecosystem stronger).</td>
+    </tr>
+    <tr>
+      <td>Atomic CAS posterior update</td>
+      <td>Concurrent rewards for the same arm at 29K rewards/sec must not lose updates; CAS-style WATCH/MULTI/EXEC in Redis (or Lua scripts) ensures the (alpha,beta) increment is atomic per DDIA Ch.7, preventing the silent regret regression that lost-update bugs cause.</td>
+      <td>Naive read-modify-write (lost updates); fully-serializable transactions (latency cost).</td>
+    </tr>
+    <tr>
+      <td>Decision/propensity logging</td>
+      <td>Logging propensity p alongside the chosen arm at 580K decisions/sec is non-negotiable; without it IPS/DR are impossible and we'd be locked into online-only A/Bs forever, as the talking-points emphasize. Adds ~8 bytes per decision, trivial cost.</td>
+      <td>No propensity (kills OPE); periodic propensity sampling (biased estimates).</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,148 @@
+<h1>Design Blockchain-style Append-only Ledger (Merkle tree, BFT consensus)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">misc</span>
+  <span class="tag">database-ddia</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a permissioned, append-only ledger of financial transactions across N independently-operated organizations (~20 banks, ~5 regulators) with cryptographic auditability and Byzantine-fault tolerance. Inspired by Hyperledger Fabric, R3 Corda, and Diem — not a public PoW chain. Throughput target: 10 K tx/s, finality &lt; 2 s, no double-spend, immutable history with Merkle proofs for any record.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Submit a transaction (payer, payee, amount, signed); validators agree on inclusion and ordering.</li>
+  <li>Query account balance at any historical block height.</li>
+  <li>Generate a Merkle inclusion proof for a given tx — verifiable offline by a regulator.</li>
+  <li>Smart-contract-style chaincode for conditional logic (escrow, multi-sig).</li>
+  <li>Membership service: enroll/revoke organizations, rotate validator keys.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Throughput:</b> 10 K tx/s sustained, 30 K tx/s burst.</li>
+  <li><b>Finality:</b> deterministic, &lt; 2 s p99 (no probabilistic confirmations).</li>
+  <li><b>Fault model:</b> tolerate f Byzantine validators with N ≥ 3f+1 (PBFT/HotStuff).</li>
+  <li><b>Auditability:</b> every block links its predecessor via SHA-256; tampering with any historical record breaks the chain.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>10 K tx/s × 86400 s = 864 M tx/day; tx ~500 B → 432 GB/day, ~160 TB/yr (per replica).</li>
+  <li>Block size 4 MB at 1 s cadence holds ~8 K tx; pad with empty if low traffic.</li>
+  <li>Validators: 25 (3f+1 with f=8 tolerated). Cross-DC, low-latency mesh between them.</li>
+  <li>State DB (UTXO/account model): 100 M accounts × 1 KB = 100 GB live state.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/tx              {from, to, amount, nonce, sig}      → {txId, status: pending}
+GET  /v1/tx/{id}                                              → {block, index, status, proof?}
+GET  /v1/account/{addr}?at=blockHeight                        → {balance, nonce}
+GET  /v1/block/{h}                                            → {header, txs, merkleRoot, prevHash}
+GET  /v1/proof/{txId}                                         → MerklePath[]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client SDK] --signed tx--&gt; [Org peer (gateway)] --gossip--&gt; [Mempool]
+                                                                |
+                                                                v
+                                                  +--&gt; [Orderer cluster: HotStuff BFT] --&gt; block proposed
+                                                                |
+                                              [25 validators vote: prepare → pre-commit → commit]
+                                                                |
+                                                                v
+                                                       [Block committed]
+                                                                |
+                                  +-----------------------------+-----------------------------+
+                                  v                             v                             v
+                          [Org peer A: ledger DB]      [Org peer B: ledger DB]       [Regulator: read-only]
+                          [State DB (RocksDB)]         [State DB (RocksDB)]
+                          [Merkle index]               [Merkle index]
+</div>
+<p>Walk-through: clients sign txs with their private key. Org peers gossip into a shared mempool. The orderer cluster runs HotStuff (3-phase: prepare, pre-commit, commit) to agree on block <i>n</i>'s contents and order. Once committed, every peer applies the block to its local state DB. The Merkle root of the block's tx set is in the header — anyone can prove inclusion in O(log n).</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Block / chain (immutable log)</h3>
+<pre>Block:
+  header:
+    height, timestamp, prev_hash, merkle_root, validators_sig[]
+  txs[]:
+    tx_id, payload, signatures[]
+
+Chain rule: header.prev_hash = SHA256(prev_block.header)</pre>
+<h3>7.2 Merkle tree of txs</h3>
+<pre>          merkle_root
+         /            \
+       h01            h23
+      /   \          /   \
+     h0   h1        h2   h3        (hN = SHA256(tx_N))
+Proof for tx_2 = [h3, h01]; verifier hashes upward, compares to root.</pre>
+<h3>7.3 State DB (RocksDB)</h3>
+<pre>key = account_addr (20 B), value = {balance, nonce, code_hash}
+Append-only changeset per block; snapshot every 10 K blocks for fast cold-start.</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Consensus: HotStuff</h3>
+<p>Linear-view-change PBFT variant used by Diem/Aptos. Each round: leader proposes block, validators send PREPARE votes, then PRE-COMMIT, then COMMIT — all aggregated via BLS threshold signatures so a single 96 B sig represents 17 votes. Throughput scales to 10 K tx/s on commodity 25-node networks; finality is one round (~500 ms). View-change runs in O(1) message complexity, unlike classic PBFT's O(n²).</p>
+<h3>8.2 BFT vs CFT</h3>
+<p>Raft (CFT) trusts all nodes — fine for one company. Across orgs we assume Byzantine actors (compromised key, malicious admin), so we need ≥ 3f+1 nodes and signed votes. See DDIA Ch. 9: "Byzantine fault tolerance" section.</p>
+<h3>8.3 Smart-contract execution</h3>
+<p>Endorsement-then-order model (Hyperledger Fabric): chaincode runs on a quorum of endorsing peers, produces a read-write set, signed; orderer just orders those — keeps consensus deterministic and side-effect-free. Avoids the Ethereum problem of re-running every contract on every node.</p>
+<h3>8.4 Anti-double-spend</h3>
+<p>State DB holds <code>nonce</code> per account; tx with stale nonce is rejected at endorsement. UTXO alternative (Bitcoin-style) trades simpler concurrency for harder querying.</p>
+<h3>8.5 Privacy</h3>
+<p>Channel-based isolation: per-deal sub-ledger visible only to participants; main chain stores only a salted hash of the off-chain payload. Optional zk-SNARK range proofs hide amounts while letting validators check non-negativity.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Validator count:</b> BFT message complexity grows quickly; HotStuff's linear-view-change keeps 25 nodes feasible — beyond 100, throughput drops sharply.</li>
+  <li><b>State growth:</b> snapshot + prune; archive nodes keep full history, validators keep last 30 days.</li>
+  <li><b>Cross-org WAN latency:</b> co-locate validators in 3 regions max; 100 ms RTT round between regions caps round latency.</li>
+  <li><b>Block-leader hotspot:</b> rotate leader every block (HotStuff pipelined), spreading egress load.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Permissioned BFT</td><td>Deterministic finality, 10 K tx/s</td><td>Fixed validator set; not censorship-resistant</td></tr>
+<tr><td>HotStuff vs PBFT</td><td>Linear msgs, pipelined</td><td>Newer, fewer prod hardenings</td></tr>
+<tr><td>Account model vs UTXO</td><td>Simple smart contracts</td><td>State contention on hot accounts</td></tr>
+<tr><td>On-chain payload vs hash</td><td>Full audit on chain</td><td>Privacy + size; hash is a common compromise</td></tr>
+<tr><td>BLS threshold sigs</td><td>O(1) sig size</td><td>Trusted setup, key-rotation complexity</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 9 Consistency &amp; Consensus — Byzantine generals, FLP impossibility, why we need ≥ 3f+1 and synchrony assumptions for liveness.</li>
+  <li>Ch. 5 Replication — total-order broadcast as the abstraction equivalent to consensus; the chain is exactly that.</li>
+  <li>Ch. 6 Partitioning — channel sub-ledgers as horizontal partitioning by deal/participant set.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start by drawing the line between permissioned and public chains — public PoW will never hit 10 K tx/s with 2-s finality, and naming that up front saves 10 minutes."</li>
+  <li>"The hardest real-world part is key management — losing a validator's BLS key requires a coordinated rotation, and I'd dedicate slide time to HSMs and threshold-sig DKG."</li>
+  <li>"For privacy, I'd default to channel isolation + payload hashing; zk-SNARKs are tempting but the prover cost (seconds per tx) blows the SLO unless we batch."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>HotStuff BFT consensus</td><td>Linear-view-change PBFT variant hits 10 K tx/s on 25 validators with O(1) message complexity per view; classic PBFT's O(n²) would cap us at ~2 K tx/s and miss the &lt; 2 s finality target.</td><td>PBFT (n² messages); Tendermint (n² in worst case); Raft (CFT only, no Byzantine tolerance).</td></tr>
+    <tr><td>BLS threshold signatures</td><td>Aggregating 17 of 25 validator votes into a single 96-byte signature keeps block headers small; without aggregation, header sigs alone would balloon block size past the 4 MB target at 8 K tx/block.</td><td>ECDSA per-validator (25× signature bloat); Schnorr (no production-hardened threshold).</td></tr>
+    <tr><td>SHA-256 (Merkle &amp; chain hash)</td><td>Hardware-accelerated on x86/ARM (~1 GB/s/core) keeps Merkle root computation under 5 ms per 4 MB block; FIPS-approved is mandatory for the regulator audit story.</td><td>BLAKE3 (faster but not FIPS-approved); SHA-3 (slower in HW).</td></tr>
+    <tr><td>Merkle tree (tx inclusion)</td><td>O(log n) proof of any tx in a block — for 8 K tx/block that's 13 hashes (~416 B); regulators verify offline without trusting any single peer, satisfying the audit-anywhere requirement.</td><td>Patricia trie (overkill for ordered set); flat hash list (O(n) proof size).</td></tr>
+    <tr><td>RocksDB (state DB)</td><td>100 GB live state with append-only changesets per block fits LSM-tree's write-amplification budget; Hyperledger and Diem both use RocksDB for the same reason — block-replay performance.</td><td>LMDB (B-tree write amp on hot accounts); LevelDB (RocksDB's older, less-tuned fork).</td></tr>
+    <tr><td>gRPC + Protobuf (peer mesh)</td><td>Cross-org WAN at 100 ms RTT needs HTTP/2 multiplexing to keep the 3-phase HotStuff round under 500 ms; Protobuf's deterministic encoding is critical so all peers hash identical bytes.</td><td>JSON-RPC (non-deterministic field order); custom TCP (years of edge cases).</td></tr>
+    <tr><td>HSMs (validator keys)</td><td>Validator BLS keys are the security root; HSM-stored keys with FIPS 140-2 Level 3 prevent extraction even with root access — losing one key only requires DKG rotation, not a chain fork.</td><td>Software keys (catastrophic on host compromise); KMS (worse latency on per-vote signing).</td></tr>
+    <tr><td>Ed25519 (client tx signing)</td><td>Clients (banks, end-users) need fast, small (64 B) signatures with batch-verifiable semantics; Ed25519's deterministic nonces also avoid the Sony PS3-style randomness leak.</td><td>ECDSA (non-deterministic, larger sig); RSA (256 B sigs blow block size).</td></tr>
+    <tr><td>Endorsement-then-order (Fabric model)</td><td>Chaincode runs on endorsing peers, produces signed read-write set, orderer just orders — keeps consensus deterministic and side-effect-free, avoiding Ethereum's "re-execute everywhere" CPU bottleneck at 10 K tx/s.</td><td>Order-then-execute (every node re-runs every contract); off-chain execution (loses determinism).</td></tr>
+    <tr><td>WASM (chaincode runtime)</td><td>Sandboxed deterministic execution across heterogeneous validators (Linux, BSD, Windows); &lt; 100 µs invocation overhead per tx fits the 10 K tx/s budget, and language-agnostic onboarding for the 20 banks.</td><td>EVM (Solidity-only, slower interpreter); Docker chaincode (non-deterministic resource limits).</td></tr>
+    <tr><td>Channel isolation (per-deal sub-ledger)</td><td>Two banks doing a private deal don't want all 25 validators to see amounts; per-channel sub-ledgers with hash-on-main-chain give privacy without sacrificing the global audit trail.</td><td>Plain-text on chain (privacy violation); zk-SNARKs (multi-second prover cost breaks 2 s finality).</td></tr>
+    <tr><td>Distributed Key Generation (DKG)</td><td>BLS threshold sig requires no single party knows the master key; DKG protocols (Pedersen-VSS) let 25 validators jointly generate shares — necessary for the "no trusted setup" property regulators demand.</td><td>Trusted dealer (single point of compromise); centralized KMS (defeats permissioned model).</td></tr>
+    <tr><td>Apache Kafka (mempool gossip)</td><td>Pending tx pool must survive validator restarts and replay missed proposals; durable mempool on Kafka gives leaders deterministic batching and lets joiners catch up without re-asking peers.</td><td>In-memory gossip (lost on restart); BitTorrent-style (overkill for 25-node mesh).</td></tr>
+  </tbody>
+</table>

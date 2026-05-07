@@ -1,0 +1,152 @@
+<h1>Design YouTube (UGC video platform)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">cdn</span>
+  <span class="tag">recommendation</span>
+  <span class="tag">search</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a user-generated video platform where anyone can upload a clip and anyone can watch it. YouTube has ~2.7 B logged-in MAU, ~500 hours of video uploaded every minute, more than 1 B watch hours per day, and a search/discovery surface that drives ~70% of the watch time via recommendations. Unlike Netflix, the catalog is unbounded, the long-tail is enormous (~50% of views come from videos with &lt; 100k lifetime views), and copyright/abuse moderation is a first-class concern.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Upload a video (chunked, resumable), get a watch URL.</li>
+  <li>Stream playback (ABR) on web, mobile, TV; live streams &amp; shorts as variants.</li>
+  <li>Search by query, channel, hashtag.</li>
+  <li>Personalized home feed and "Up Next" recommendations.</li>
+  <li>Likes, comments, subscriptions, watch later.</li>
+  <li>Content ID matching for copyright.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> search &lt; 200 ms p95; playback start &lt; 1.5 s p95.</li>
+  <li><b>Scale:</b> 2.7 B MAU, peak ~50 M concurrent watchers, 500 hr/min ingest.</li>
+  <li><b>Availability:</b> 99.95% playback.</li>
+  <li><b>Durability:</b> 11 nines on uploaded originals.</li>
+  <li><b>Long tail friendly:</b> the 99th percentile cold video must still play in under 3 s.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Ingest: 500 hr/min × 60 min = 30,000 hr/hr → ~720k h/day. At avg 1 GB/hr mezzanine, that's ~720 TB/day raw, ×10 for transcodes ≈ 7 PB/day.</li>
+  <li>QPS: 50 M concurrent / 5 s manifest refresh = 10 M manifest RPS; search ~1 M RPS at peak.</li>
+  <li>Storage: cumulative catalog &gt; 5 EB across mezzanines + encodes.</li>
+  <li>Bandwidth: avg 3 Mbps × 50 M concurrent = 150 Tbps egress.</li>
+  <li>Telemetry: 50 M × 0.5 events/s = 25 M events/s into Pub/Sub.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/upload/init     {filename,size,mime}     → uploadId, chunkUrls[]
+PUT   /v1/upload/{id}/chunk/{n}  (resumable)        → 200
+POST  /v1/upload/{id}/finalize                       → videoId
+GET   /v1/watch/{videoId}                            → manifestUrl, meta
+GET   /v1/search?q=...&amp;page=...                      → results[]
+GET   /v1/feed?userId=...                            → ranked items
+POST  /v1/engage  {videoId,kind:like|comment,body}   → eventId</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Uploader] → [Resumable Upload Svc] → [GCS raw bucket]
+                                          │
+                                          ▼
+                                 [Transcode workers (k8s)]
+                                          │
+                                  [GCS encoded variants]
+                                          │
+                                          ▼
+[Viewer] → [Edge CDN (Google Global Cache)] → [Origin shield] → GCS
+
+                Control plane:
+[Viewer] → [Frontend] → [Watch Svc] ─► [Video Meta (Spanner)]
+                              ├────► [Search (custom inverted index)]
+                              └────► [Reco Svc] ◄── [Feature store]
+                                          ▲
+                       [Pub/Sub: events] ─┘ → [Dataflow] → [BigQuery + Bigtable]
+</div>
+<p>Hot videos live close to viewers in Google Global Cache (GGC) nodes inside ISPs. Cold long-tail videos fetch from a regional origin shield that absorbs misses before they hit GCS, preventing one viral comeback from causing a storage thundering herd.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Video metadata (Spanner)</h3>
+<pre>CREATE TABLE videos (
+  video_id    STRING(36) PRIMARY KEY,
+  channel_id  STRING(36),
+  title       STRING(MAX),
+  duration_s  INT64,
+  status      STRING(16),   -- processing|ready|blocked
+  visibility  STRING(16),
+  created_at  TIMESTAMP
+);
+CREATE TABLE video_stats (
+  video_id STRING(36),
+  bucket_hour TIMESTAMP,
+  views INT64, likes INT64, watch_ms INT64,
+) PRIMARY KEY (video_id, bucket_hour);</pre>
+<h3>7.2 Why Spanner?</h3>
+<p>Strong global consistency for monetization-critical state (privacy flags, monetization status, takedowns) with horizontal scale. View counts are kept in Bigtable + a stream aggregator because they're append-heavy and tolerate eventual consistency.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Upload pipeline</h3>
+<p>Resumable HTTP uploads (RFC-style, chunked, with byte-range resume). Once finalized, a Pub/Sub message triggers transcoding into ~12 variants (codec ∈ {H.264, VP9, AV1} × bitrate × resolution). Thumbnails are extracted at scene-change points.</p>
+<h3>8.2 Search</h3>
+<p>Inverted index sharded by term-hash; within a shard, postings are stored in time-decay buckets so newer videos rank without rewriting the whole index. Query fan-out + scatter-gather aggregator merges shard results.</p>
+<h3>8.3 Recommendations</h3>
+<p>Two towers: candidate generator (deep retrieval over a billion items using ANN on learned embeddings) → ranker (multi-task DNN scoring CTR, watch-time, satisfaction). Trained daily on Dataflow over a year of engagement events. The ranker re-scores online with fresh features (last-N watched, time-of-day).</p>
+<h3>8.4 Content ID</h3>
+<p>Every uploaded video is fingerprinted (audio + perceptual video hashes) and matched against a reference DB; matches trigger monetization-share or takedown rules before the video goes public.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Viral spike:</b> tier-1 GGC absorbs 90%+; tier-2 regional shield protects origin.</li>
+  <li><b>Long tail:</b> origin must serve the 0.001%-popularity videos; we keep them on object storage + small SSD warm cache, accept 2.5 s startup.</li>
+  <li><b>Comments hot partitions:</b> shard by (video_id, bucket) where bucket = floor(comment_id / 10k); aggregator merges across buckets at read time.</li>
+  <li><b>Search index churn:</b> incremental segment merge during off-peak; LSM-style.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Spanner for metadata</td><td>Strong global consistency</td><td>Higher write latency than Bigtable</td></tr>
+<tr><td>Bigtable for view counts</td><td>Cheap append-heavy writes</td><td>Eventual consistency</td></tr>
+<tr><td>Edge CDN inside ISPs</td><td>Massive last-mile savings</td><td>Ops cost; cold long-tail still hits origin</td></tr>
+<tr><td>Online re-ranking</td><td>Fresh recommendations</td><td>Inference budget per request</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — sharding the inverted index by term-hash and the video metadata by video_id.</li>
+  <li>Ch. 10 Batch Processing — daily Dataflow jobs to retrain candidate-gen embeddings.</li>
+  <li>Ch. 11 Stream Processing — Pub/Sub + Dataflow for view-count aggregation and online features.</li>
+  <li>Ch. 12 Future of Data Systems — search and recommendations as derived data from a write-ahead event log.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd treat the event log (uploads, plays, likes) as the source of truth and derive search, recommendations, and analytics from it — that's the only way the read paths stay decoupled."</li>
+  <li>"The hardest part is the long tail — popularity follows a Zipf curve so the top 1% of videos drive 80% of bytes; my system has to be cheap enough to also serve the bottom 99%."</li>
+  <li>"For Content ID I'd lean on perceptual hashes pre-publish, then a slower forensic match async; otherwise upload latency tanks."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Spanner</b></td><td>Privacy flags, monetization status, and takedowns must be globally consistent — a video marked private must vanish everywhere within seconds. Spanner's TrueTime gives external consistency at horizontal scale across a 5 EB catalog.</td><td>Bigtable — no transactions for monetization edits; CockroachDB — Google internal won't switch; sharded MySQL — manual resharding pain</td></tr>
+    <tr><td><b>Bigtable</b></td><td>View counts and watch_ms are append-heavy at 25 M events/s; row-key (video_id, bucket_hour) gives append-only writes without compaction storms, and reads scale linearly with tablets.</td><td>Spanner — 10× cost on append-heavy load; Cassandra — operational footprint at Google is a non-starter</td></tr>
+    <tr><td><b>Google Pub/Sub</b></td><td>25 M events/s ingest into a managed log with global delivery; pull subscribers like Dataflow get exactly-once for billing-critical view counts without operating Kafka clusters.</td><td>Kafka — Google internally prefers Pub/Sub; Kinesis — non-GCP</td></tr>
+    <tr><td><b>Dataflow (Beam)</b></td><td>Daily retraining of candidate-gen embeddings over a year of engagement events plus realtime view-count aggregation; one Beam pipeline targets both batch and streaming so feature definitions don't drift.</td><td>Spark — separate batch/stream APIs; Flink — operational overhead vs managed Beam</td></tr>
+    <tr><td><b>BigQuery</b></td><td>Watch-time analytics over 10 TB/day of impression logs for ad-hoc analysis by PMs and reco engineers; serverless scan beats running a Trino cluster across 5 EB of derived data.</td><td>Snowflake — multi-cloud not needed at Google; Hive — too slow for interactive analysis</td></tr>
+    <tr><td><b>GCS</b></td><td>11 nines durability for 7 PB/day of encoded variants; multi-region buckets with object lifecycle let cold long-tail videos drop to Coldline without code changes.</td><td>S3 — cross-cloud egress cost; HDFS — durability requires triple replication</td></tr>
+    <tr><td><b>Google Global Cache (GGC)</b></td><td>150 Tbps egress is impossible on commercial CDN economics; GGC nodes inside ISPs absorb 90%+ of bytes and the cold long-tail (50% of views, 0.001%-popularity videos) routes to origin shield.</td><td>Akamai — transit costs unsustainable; Cloudflare — no ISP-embedded footprint at this scale</td></tr>
+    <tr><td><b>Custom inverted index</b></td><td>Search at 1 M RPS over a billion videos with time-decay buckets so newer content ranks without rewriting whole index segments; LSM-style merges happen off-peak.</td><td>Elasticsearch — JVM GC at this QPS painful; Vespa — closer fit but Google chose in-house</td></tr>
+    <tr><td><b>HTTP resumable upload</b></td><td>500 hr/min of uploads come from flaky mobile networks; byte-range resume lets a 20 GB upload survive 100 disconnects without re-sending committed bytes.</td><td>WebDAV — no resume semantics; raw POST — no resume on disconnect</td></tr>
+    <tr><td><b>AV1 / VP9 / H.264 ladder</b></td><td>VP9 cuts 30% bandwidth on Chrome/Android; AV1 another 30% on supported clients; H.264 covers the universal fallback. At 150 Tbps the bandwidth saving pays for the encoder fleet many times over.</td><td>H.264 only — wastes bandwidth; HEVC — patent licensing fight</td></tr>
+    <tr><td><b>Two-tower DNN reco</b></td><td>1 B candidates × 50 M watchers needs ANN retrieval to fit in 50 ms inference budget; a heavy ranker on 500 candidates produces 70% of watch time.</td><td>Single-stage ranker — won't scale to 1B items; pure CF — no cold-start solution</td></tr>
+    <tr><td><b>Perceptual hashing (Content ID)</b></td><td>Audio + video fingerprints match against rights DB before publish; legal risk of letting unflagged copyrighted content monetize for hours dwarfs the compute cost of upload-time hashing.</td><td>Manual review — doesn't scale to 500 hr/min; full ML classification — too slow pre-publish</td></tr>
+    <tr><td><b>Kubernetes (Borg internally)</b></td><td>Transcode workers are stateless and bursty; 7 PB/day of encoded output needs autoscaling pools with mixed CPU/GPU nodes, scheduled by codec workload type.</td><td>Static VMs — wasted capacity; bare-metal — no fast bursting</td></tr>
+  </tbody>
+</table>

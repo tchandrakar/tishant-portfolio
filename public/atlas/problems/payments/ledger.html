@@ -1,0 +1,257 @@
+<h1>Design Double-Entry Ledger System (immutable, balanced, auditable)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">payments</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the system of record for money: every value movement is recorded as a balanced double-entry posting (debits = credits per currency), entries are immutable, balances are derivable from entries, and the whole structure is auditable to any point in history. Used by banks, fintechs (Stripe, Square, Wise, Revolut), exchanges, and any system that cannot afford "the database lost a transaction".</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Post a transaction = atomic group of ≥ 2 entries summing to zero per (currency, partition).</li>
+  <li>Read account balance at <b>now</b> or at <b>any past timestamp</b> (point-in-time).</li>
+  <li>Append-only entries; corrections via reversing entries, never updates.</li>
+  <li>Multi-currency, multi-account-type (asset, liability, equity, revenue, expense).</li>
+  <li>Pending → posted lifecycle (e.g., card auth → capture).</li>
+  <li>Reports: trial balance, P&amp;L, account statement.</li>
+  <li>Audit trail with cryptographic hash chain (optional but increasingly standard).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Correctness invariant:</b> for every txn, sum(entries) == 0 per currency. Always. Enforced in DB, not just app.</li>
+  <li><b>Immutability:</b> no UPDATE or DELETE on the entries table — period.</li>
+  <li><b>Throughput:</b> 10 K postings/s sustained, 100 K bursts; each posting writes ~3 entries.</li>
+  <li><b>Latency:</b> commit p99 &lt; 30 ms.</li>
+  <li><b>Auditability:</b> entries reproducible byte-for-byte from the WAL; 7+ year retention.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Entries/year: 10 K × 3 × 86400 × 365 ≈ 95 B entries; ×7 yr retention ≈ 670 B rows.</li>
+  <li>Row size 200 B → ~135 TB raw, ~400 TB replicated (3×).</li>
+  <li>Active accounts: 100 M; balance cache size 100 M × 64 B × 25 currencies = ~160 GB Redis.</li>
+  <li>Hot account write rate: top 0.1% of accounts handle 50% of postings → contention design needed.</li>
+  <li>WAL throughput: 10 K postings × 3 entries × 200 B = 6 MB/s sustained.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/transactions
+  Body: {
+    txn_id: "uuid",            // idempotency
+    description: "Charge cust_42 for invoice inv_99",
+    entries: [
+      {account: "user:42:wallet", amount: -2500, currency: "USD"},
+      {account: "stripe:fees",    amount:    75, currency: "USD"},
+      {account: "merchant:7:rev", amount:  2425, currency: "USD"}
+    ],
+    posted_at: "2026-05-06T10:00:00Z"
+  }
+  → {txn_id, status: POSTED}
+
+GET /v1/accounts/{id}/balance?as_of=2026-05-01T00:00:00Z
+  → {currency, available, pending}
+
+GET /v1/accounts/{id}/entries?from=...&amp;to=...
+  → [{entry_id, txn_id, amount, currency, posted_at}]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client/Service] ──POST txn──► [Posting API]
+                                     │
+                                     ▼
+                          [Validation + Idempotency]
+                                     │
+                                     ▼
+                  ┌─────[Single Postgres Transaction]─────┐
+                  │                                       │
+                  │  INSERT entries × N (immutable)       │
+                  │  UPDATE account_balances (running)    │
+                  │  INSERT txn header                    │
+                  │  Constraint: sum=0 per currency       │
+                  │                                       │
+                  └────────────────┬──────────────────────┘
+                                   │
+                          ┌────────┴─────────┐
+                          ▼                  ▼
+                    [Outbox → Kafka]   [Balance cache (Redis)]
+                          │
+                ┌─────────┼──────────┐
+                ▼         ▼          ▼
+         [Reporting]  [Audit S3]  [Downstream svcs]
+</div>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Schema (Postgres, sharded by account_id hash)</h3>
+<pre>CREATE TABLE txn_headers (
+  txn_id        UUID PRIMARY KEY,
+  posted_at     TIMESTAMPTZ NOT NULL,
+  description   TEXT,
+  prev_hash     BYTEA,                 -- hash chain
+  hash          BYTEA NOT NULL,
+  CONSTRAINT immutable CHECK (false) NO INHERIT  -- enforced via revoke
+);
+
+CREATE TABLE entries (
+  entry_id      BIGSERIAL,
+  txn_id        UUID NOT NULL REFERENCES txn_headers,
+  account_id    BIGINT NOT NULL,
+  amount        NUMERIC(20,4) NOT NULL,    -- signed; integer minor units recommended
+  currency      CHAR(3) NOT NULL,
+  posted_at     TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (account_id, entry_id)
+) PARTITION BY HASH(account_id);
+
+-- Materialized running balance, updated in same txn
+CREATE TABLE account_balances (
+  account_id    BIGINT,
+  currency      CHAR(3),
+  available     NUMERIC(20,4),
+  version       BIGINT,                    -- monotonic per account
+  PRIMARY KEY (account_id, currency)
+);</pre>
+<h3>7.2 The zero-sum constraint</h3>
+<p>Enforced two ways: (a) deferred SQL constraint at commit time checking <code>sum(amount) GROUP BY currency = 0</code>; (b) application-level pre-check. Both, because defense in depth.</p>
+<h3>7.3 Why integer minor units?</h3>
+<p>Floats are forbidden — IEEE-754 cannot represent $0.10 exactly. Use NUMERIC(20,4) or store as integer cents (USD), paise (INR), satoshi (BTC).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Concurrent postings on the same account</h3>
+<p>Two payments to <code>merchant:7</code> race. Both want to UPDATE balance. Without isolation, lost-update is possible. Use SSI (Serializable Snapshot Isolation) — DDIA Ch.7 explains exactly this case as <i>write skew</i>: each txn reads a balance, decides it's enough, both commit, balance goes negative. SSI aborts one. Application retries.</p>
+
+<h3>8.2 Hot account contention</h3>
+<p>Stripe fees account, exchange omnibus account: receives a fraction of every txn. Sub-ledger pattern: split into N shards (e.g., <code>stripe:fees:[0..63]</code>), pick at random, aggregate on read. Trade-off: balance reads scan N rows.</p>
+
+<h3>8.3 Point-in-time balance</h3>
+<p>Two strategies:
+<br>(a) <b>Replay from entries</b>: <code>SELECT SUM(amount) FROM entries WHERE account_id=X AND posted_at &lt;= T</code>. Correct, slow on hot accounts.
+<br>(b) <b>Snapshot table</b>: hourly snapshots; read = nearest snapshot + delta. 99% queries hit fast path.</p>
+
+<h3>8.4 Hash chain &amp; tamper-evidence</h3>
+<p><code>hash = SHA-256(prev_hash || canonical(txn))</code>. Daily, root hash is published (S3, blockchain, or a notary). Any tampering with old entries invalidates the chain — auditors love it. (DDIA Ch.5: hash-pointer-style log.)</p>
+
+<h3>8.5 Pending vs posted</h3>
+<p>Card authorizations create <b>pending</b> entries on a separate "in-flight" account; capture moves them to "available". Reservations expire via a sweeper that posts compensating entries. Never mutate.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Sharding:</b> hash by account_id; cross-account postings (most txns) span shards → use a 2-phase mini-protocol or a single coordinator shard per txn.</li>
+  <li><b>Multi-shard txns:</b> for cross-shard postings, write to a global txn coordinator with a <i>pending</i> marker, then fan out per-shard inserts; finalize via 2PC (Postgres prepared txn) or move to CockroachDB / TiDB which give Spanner-style txns natively.</li>
+  <li><b>Read replicas for reports:</b> CDC into a columnar store (Clickhouse / Snowflake) for analytics; never run reports on the OLTP primary.</li>
+  <li><b>Cold storage:</b> entries older than 90 days move to compressed Parquet on S3, queryable via Athena; balance cache stays current via running totals.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>SSI on Postgres</td><td>Catches write skew automatically</td><td>Aborts under contention; needs retry loop</td></tr>
+<tr><td>Materialized balance + entries</td><td>O(1) reads; verifiable from log</td><td>Two writes per posting</td></tr>
+<tr><td>Sub-ledgers for hot accounts</td><td>Removes contention</td><td>Aggregation cost on reads</td></tr>
+<tr><td>Hash chain</td><td>Tamper-evident; cheap to verify</td><td>Sequential within a chain — needs per-shard chains</td></tr>
+<tr><td>2PC for cross-shard</td><td>Strong consistency</td><td>Coordinator failure modes; latency</td></tr>
+<tr><td>Spanner-style DB</td><td>Cleaner cross-shard</td><td>Vendor lock; cost</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 7 Transactions</b> — this is the <i>archetypal</i> chapter for ledgers. Write skew on balance checks (Ch.7's "doctors on call" example translated to "two withdrawals on one account") motivates SSI. Single-object atomic writes underpin idempotency. Deferred constraints are exactly the zero-sum check. The chapter's discussion of "what isolation level you actually need" maps 1:1 to ledger requirements.</li>
+  <li><b>Ch. 7 Transactions</b> — 2PC + its failure modes are the design constraint that pushes us toward single-shard txns where possible, and toward CockroachDB/Spanner when not.</li>
+  <li><b>Ch. 9 Consensus</b> — total order broadcast is what gives us a globally consistent entry sequence; Raft for the txn coordinator's leader election; linearizable reads for "what's my balance right now".</li>
+  <li><b>Ch. 9 Consensus</b> — quorum reads/writes for cross-region replication of the ledger; FLP impossibility reminding us that "no false positives, no false negatives, fast" can't all hold under partition.</li>
+  <li><b>Ch. 11 Stream Processing</b> — entries are an event log; downstream reports, balance projections, and analytics are derived state — classic event sourcing.</li>
+  <li><b>Ch. 5 Replication</b> — synchronous replicas in the same region for durability; async cross-region with documented RPO.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Double-entry isn't accounting cosplay; it's an integrity invariant the database can enforce. Sum-to-zero is a constraint, not a guideline."</li>
+  <li>"Immutability is the point. If you ever feel the urge to UPDATE an entry, you write a reversing entry instead. This is what makes audits possible without time travel."</li>
+  <li>"The hardest real-world problem is hot accounts (the omnibus); sub-ledgers solve it but trade write contention for read aggregation."</li>
+  <li>"I'd reach for Postgres + SSI for a single-region 10 K TPS system; for multi-region active-active, CockroachDB or Spanner — the cost of building Spanner yourself is not worth it."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Postgres (SSI) — entries &amp; balances</td>
+      <td>10 K postings/s with a 30 ms p99 commit fits a sharded primary; SSI (DDIA Ch.7) is essential because two concurrent withdrawals on one account both passing a "balance &gt;= amount" predicate is the textbook write-skew bug that costs banks millions. Single-shard txns commit entries + balance update + outbox atomically.</td>
+      <td>MySQL (no real SSI); Aurora (close, but autovacuum behavior at 95 B entries is unproven for us).</td>
+    </tr>
+    <tr>
+      <td>CockroachDB / Spanner — multi-region option</td>
+      <td>For active-active across regions or cross-shard txns spanning 100+ shards, Spanner-style external consistency via TrueTime/HLC (DDIA Ch.9) gives single-system-image txns without app-level 2PC. The 10 K TPS sustained, 100 K bursts envelope is well within both products.</td>
+      <td>Postgres + 2PC across shards (coordinator failure modes); TiDB (kept as Spanner alternative).</td>
+    </tr>
+    <tr>
+      <td>Cassandra — explicitly rejected for entries</td>
+      <td>The zero-sum invariant cannot be enforced under LWW eventual consistency: a delayed replica could surface a phantom credit. Cassandra LWTs are too weak (no group atomicity across multi-row entries). It does not touch this system.</td>
+      <td>n/a — this is the rejection.</td>
+    </tr>
+    <tr>
+      <td>Kafka — outbox / event sourcing bus</td>
+      <td>Every posting fans out to reporting, downstream services, and audit. 10 K postings/s × 3 entries × multiple consumers needs durable replayable log with per-account ordering (partition key = account_id) so derived projections (DDIA Ch.11 stream-table duality) stay consistent.</td>
+      <td>RabbitMQ (no replay window for retro-projections); SQS (no per-key ordering).</td>
+    </tr>
+    <tr>
+      <td>Debezium — CDC outbox publisher</td>
+      <td>Outbox table written inside the same Postgres txn as the entries; Debezium tails WAL and republishes to Kafka (DDIA Ch.11 transactional outbox). Guarantees no posting goes unannounced even if Kafka is down at commit, and never publishes a rolled-back posting.</td>
+      <td>Dual-write from app (lost-event bug); Postgres LISTEN/NOTIFY (not durable, no replay).</td>
+    </tr>
+    <tr>
+      <td>Redis — balance read cache</td>
+      <td>100 M accounts × 25 currencies × 64 B = ~160 GB; sub-ms balance reads for "what's available now?" without hitting the OLTP primary on every check. Cache invalidated by outbox events; eventual consistency is fine because the source of truth (entries) remains the durable arbiter.</td>
+      <td>Memcached (no Hash type for multi-currency per account); in-process (no cross-pod consistency).</td>
+    </tr>
+    <tr>
+      <td>Clickhouse / Snowflake — reporting</td>
+      <td>Trial balance, P&amp;L, statement queries scan billions of entry rows; columnar OLAP is 100×+ faster than running on the OLTP primary. CDC into the warehouse keeps it live within minutes; never run analytics on the ledger primary or you'll starve postings.</td>
+      <td>Postgres read replica (row-store too slow for full-scan reports); Druid (more ops complexity for our query mix).</td>
+    </tr>
+    <tr>
+      <td>S3 + Parquet — cold storage</td>
+      <td>Entries older than 90 days move to compressed Parquet; 7-year retention × 670 B rows would cost a fortune in OLTP storage. S3 + Athena gives queryable archives at 1/20th the cost while running balance recomputation jobs nightly.</td>
+      <td>Glacier (recall latency too high for occasional audit query); keep all in OLTP (cost-prohibitive at PB scale).</td>
+    </tr>
+    <tr>
+      <td>Double-entry (sum=0 per currency)</td>
+      <td>The defining invariant. Every txn writes ≥2 balanced entries; deferred SQL constraint <code>sum(amount) GROUP BY currency = 0</code> enforces it at commit time so no application bug can create money. This is what makes reconciliation possible at all.</td>
+      <td>Single-entry (no proof of conservation); app-only check (defense-in-depth missing).</td>
+    </tr>
+    <tr>
+      <td>Hash chain (SHA-256) — tamper evidence</td>
+      <td><code>hash = SHA-256(prev_hash || canonical(txn))</code>; daily root hash published externally. Tampering with any old entry breaks the chain. Cheap (32 B per row), expensive to forge — auditors love it. Per-shard chains avoid global serialization.</td>
+      <td>Merkle tree (overkill for sequential audit); HMAC only (no proof of order).</td>
+    </tr>
+    <tr>
+      <td>2PC (Postgres prepared txn) — cross-shard</td>
+      <td>For postings that span shards (most txns!), Postgres's PREPARE TRANSACTION + COMMIT PREPARED gives true atomic commit across shards. Used reluctantly (DDIA Ch.9: coordinator failure modes are real) — wrapped in a coordinator with timeout-based recovery.</td>
+      <td>Saga (compensating reversals are messy when zero-sum must hold instant-by-instant); single-shard fanout (impossible for inter-account txns).</td>
+    </tr>
+    <tr>
+      <td>Saga — alternative for autonomous-shard mode</td>
+      <td>If we drop 2PC for higher availability, a saga writes a pending-marker txn header, fans out per-shard inserts, then finalizes. Compensating reversals on partial failure restore the sum-to-zero invariant by writing reversing entries — never UPDATE.</td>
+      <td>2PC (chosen for strict consistency); raw async (loses zero-sum guarantee).</td>
+    </tr>
+    <tr>
+      <td>Idempotency keys — txn_id UNIQUE</td>
+      <td>The txn_id is the idempotency key; UNIQUE on txn_headers means a retry never double-posts (DDIA Ch.7 single-object atomic write). Combined with same-txn entry inserts, the entire posting is idempotent end-to-end.</td>
+      <td>Server-generated id (defeats client retry semantics); request hash (false negatives on metadata diff).</td>
+    </tr>
+    <tr>
+      <td>Sub-ledger pattern — hot accounts</td>
+      <td>Stripe-fees and exchange-omnibus accounts receive ~50% of postings; SSI on a single row aborts everything. Split <code>stripe:fees:[0..63]</code> randomly; aggregate on read. Trade-off: balance reads scan 64 rows — acceptable because reads are rare relative to writes here.</td>
+      <td>Optimistic concurrency on single row (abort rate too high); Redis counter (no durability, no audit).</td>
+    </tr>
+    <tr>
+      <td>Raft (etcd) — txn coordinator leader</td>
+      <td>Cross-shard postings need a single coordinator per txn to prevent double-fanout; Raft-elected leader (DDIA Ch.9) gives clean failover. Lease-based so a partitioned old leader can't double-finalize after a new one takes over.</td>
+      <td>ZooKeeper (older, heavier ops); DB-row-based election (slower failover, weaker semantics).</td>
+    </tr>
+  </tbody>
+</table>

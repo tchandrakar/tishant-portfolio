@@ -1,0 +1,140 @@
+<h1>Design Uber (rider/driver matching at city scale)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a global ride-hailing platform that connects riders with nearby drivers, dispatches the closest viable driver in under a second, tracks the trip in real time, computes fare on completion, and settles payment to the driver. Must work across thousands of cities with very different supply/demand profiles, comply with local regulations, and remain available during city-wide demand spikes (NYE, sports events, airport surges).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Rider requests a ride from origin to destination; system returns ETA and fare estimate.</li>
+  <li>Driver matching: assign closest available driver within ~5 km; rider sees driver location updating every 4s.</li>
+  <li>Live trip tracking, route updates, on-trip ETA refresh.</li>
+  <li>Fare computation, surge multiplier application, split fare, tipping.</li>
+  <li>Payments: charge rider, payout to driver, refunds, receipts.</li>
+  <li>Ratings, support tickets, driver onboarding, KYC.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> dispatch decision p99 &lt; 1s; driver location ingestion p99 &lt; 200 ms.</li>
+  <li><b>Scale:</b> 25 M trips/day (~290 trips/sec average, ~3 K trips/sec peak); 5 M concurrent online drivers globally.</li>
+  <li><b>Availability:</b> 99.99% for matching, 99.999% for payments ledger.</li>
+  <li><b>Consistency:</b> strong on the trip lifecycle (one driver per request); eventual on analytics.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Driver location pings every 4s: 5 M drivers / 4s = 1.25 M writes/sec at peak.</li>
+  <li>Each ping ~100 B → 125 MB/sec ingest, 10 TB/day raw, 90-day retention &gt; 900 TB compressed.</li>
+  <li>Match QPS: 3 K dispatches/sec peak × 50 candidate evaluations = 150 K geo-queries/sec.</li>
+  <li>Trip metadata: 25 M/day × 2 KB = 50 GB/day; 18 TB/year per region.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/rides/estimate    {origin, destination, productType}      → fare, eta
+POST /v1/rides/request     {riderId, origin, destination, fareId}  → rideId, status
+GET  /v1/rides/{id}                                                 → rideState, driverLoc
+POST /v1/rides/{id}/cancel {reason}                                 → 200
+POST /v1/drivers/location  {driverId, lat, lng, ts, heading}        → 200  (high-volume)
+POST /v1/rides/{id}/finish {endLoc, distanceKm, durationS}          → fare, receiptId</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Rider App]                                  [Driver App]
+     |                                              |
+     |  HTTPS/gRPC                       MQTT/QUIC  |  (location pings 4s)
+     v                                              v
+[Edge / API GW + WAF]                       [Location Ingest Svc]
+     |                                              |
+     v                                              v
+[Ride Svc]----+---->[Match/Dispatch Engine]<---[Geo Index (S2/H3)] <--+
+     |        |              |                                         |
+     v        v              v                                         |
+[Pricing][Trip State FSM][Notification Svc]                            |
+     |        |              |                                         |
+     v        v              v                                         |
+[MySQL]  [Kafka: trip_events] -----> [Payments] -> [Ledger (Postgres)] |
+                |                                                      |
+                +---> [Stream Proc / Flink] -> [Analytics, Surge]------+
+</div>
+<p>Rider hits the API GW, which routes to the Ride Service. Ride Service writes a pending trip record (FSM: REQUESTED), pushes a match request to the Dispatch Engine. Dispatch queries the Geo Index for nearby drivers (S2 cell scan + filter by status), scores them, and offers to the top driver via MQTT push. On accept, the FSM transitions and Kafka emits trip_events that downstream payments, surge, and analytics consume.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Trip (MySQL, sharded by city_id)</h3>
+<pre>CREATE TABLE trips (
+  trip_id BINARY(16) PRIMARY KEY,
+  city_id INT, rider_id BIGINT, driver_id BIGINT,
+  state ENUM('REQ','MATCHED','ARRIVED','ONTRIP','DONE','CANCELED'),
+  origin POINT, dest POINT,
+  fare_cents INT, surge_x DECIMAL(3,2),
+  created_at DATETIME(3), ended_at DATETIME(3)
+) PARTITION BY HASH(city_id);</pre>
+<h3>7.2 Driver location (Redis + Cassandra)</h3>
+<p>Hot path: Redis sorted set per S2 cell, TTL 30s, used by Dispatch. Cold path: Cassandra time-series keyed by <code>(driver_id, day)</code> for forensics and ML training. Cassandra is chosen for high write throughput and TTL support (DDIA Ch. 3).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Dispatch engine</h3>
+<p>Per-city service. On a match request, it computes the rider's S2 cell at level 12 (~1.2 km), expands neighbors, queries the geo index for ~50 candidates, scores them by ETA (road-network not haversine), driver acceptance rate, and surge balancing. Sends offer with 10s TTL; on timeout, falls to next candidate. Uses optimistic locking on driver state in Redis to prevent double-dispatch.</p>
+<h3>8.2 Trip state FSM</h3>
+<p>Implemented as a Saga over Kafka. Each transition is an event with idempotency key = trip_id+to_state. Compensating events handle driver no-show or payment failures.</p>
+<h3>8.3 Payments</h3>
+<p>Double-entry ledger in Postgres. Authorization at trip start (hold), capture at trip end. Driver payout aggregated daily and pushed to bank rails. Strong consistency (read-after-write) is non-negotiable here.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Location ingest hot spots:</b> partition Kafka by driver_id hash, not by city, to avoid mega-city skew; back-pressure via QUIC.</li>
+  <li><b>Geo-index hot cells:</b> Manhattan at rush hour packs 10 K drivers in a few S2 cells; subdivide cells dynamically using H3 resolution 9–10 in dense zones.</li>
+  <li><b>Match thundering herd:</b> use exponential back-off and per-rider single-flight to prevent retries from doubling load.</li>
+  <li><b>MySQL hot shard:</b> NYC alone is ~8% of trips; split city_id 1 into multiple logical shards.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Per-city dispatch service</td><td>Local latency, blast-radius isolation</td><td>Cross-city trips need federation</td></tr>
+<tr><td>S2 vs H3 indexing</td><td>S2 cheaper, hierarchical</td><td>H3 hex distances are more uniform</td></tr>
+<tr><td>Push (MQTT) over poll</td><td>p99 sub-second offers</td><td>Mobile battery + connection mgmt</td></tr>
+<tr><td>Strong consistency on trip state</td><td>No double-booked drivers</td><td>Higher write latency, leader bottleneck</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — single-leader for trip FSM; multi-leader for location pings.</li>
+  <li>Ch. 6 Partitioning — hash by driver_id for pings, by city for trips, with rebalancing.</li>
+  <li>Ch. 9 Consistency — linearizable dispatch decision (CAS on driver=available).</li>
+  <li>Ch. 11 Stream Processing — Kafka + Flink for surge and analytics.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I would start with one region and scale by sharding on city_id, because dispatch is inherently local — a driver in Mumbai never matches a rider in NYC."</li>
+  <li>"The hardest part is the geo-index hot-cell problem; my mitigation is dynamic cell subdivision plus a top-k heap maintained in Redis."</li>
+  <li>"For payments I'd use a separate, smaller, strongly-consistent service — the rest of the system can be eventually consistent."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>S2 (level 12)</td><td>Hilbert-curve 1D keys make 1.2 km cell scans a single Redis range read; the 50 candidates per dispatch (3 K dispatches/sec × 50 = 150 K geo-queries/sec) come back in &lt;2 ms. Hierarchical levels let Manhattan subdivide on demand.</td><td>Geohash → uneven cells at high latitudes; H3 → no native 1D ordering, harder to range-scan.</td></tr>
+    <tr><td>H3 (resolution 9–10)</td><td>Reserved for dense urban subdivision when an S2 cell exceeds ~1 K drivers; uniform hex neighbor distance matters when scoring a 5 km radius around a rider in midtown.</td><td>S2 only → uneven hot-cell shapes; quadtrees → no edge-uniform neighbor ring.</td></tr>
+    <tr><td>Redis (sorted sets, TTL 30s)</td><td>1.25 M location writes/sec land in a sharded cluster keyed by S2 cell with sub-ms latency; TTL auto-expires offline drivers; CAS via SET NX gives the linearizable single-offer guarantee on driver state.</td><td>Memcached → no sorted set or TTL-on-element; Hazelcast → heavier ops footprint for the same access pattern.</td></tr>
+    <tr><td>Cassandra (ping cold path)</td><td>Time-series of 1.25 M wps × 100 B = 10 TB/day with 90-day retention requires a write-optimized LSM store; partition (driver_id, day) + native TTL fits forensics and ML training without compaction pain.</td><td>HBase → harder ops; Postgres → would need aggressive partitioning, no native TTL.</td></tr>
+    <tr><td>Kafka (trip_events)</td><td>Replayable log decouples Ride Service from Payments, Surge, and Analytics. Partitioning pings by driver_id avoids the NYC-as-8%-of-trips skew and lets Flink consume at 1.25 M msg/sec.</td><td>RabbitMQ → no replay, weaker throughput; Pulsar → fine but smaller ecosystem for Flink connectors.</td></tr>
+    <tr><td>Flink (surge + analytics)</td><td>Exactly-once windowed aggregation over the ping stream materializes per-cell supply/demand counters every 60s; checkpoints survive AZ failure without double-counting fares.</td><td>Spark Streaming → micro-batch latency too high for 60s surge cadence; Kafka Streams → harder to express complex windowed joins.</td></tr>
+    <tr><td>gRPC (rider/server)</td><td>Sub-1s p99 dispatch budget cannot afford JSON parsing on every fan-out; protobuf + HTTP/2 multiplexing keeps internal RPCs (Ride → Dispatch → Geo Index) under 5 ms each.</td><td>REST/JSON → 3–5× more bytes, slower marshalling; Thrift → smaller community, less polyglot tooling.</td></tr>
+    <tr><td>MQTT (driver downlink)</td><td>Persistent sessions over QUIC keep 5 M concurrent driver phones connected with low battery cost; offers reach the driver in &lt;200 ms so the 10s TTL window stays useful.</td><td>WebSocket → heavier per-connection state at 5 M scale; APNs/FCM only → 2–10s tail, unusable for dispatch.</td></tr>
+    <tr><td>QUIC (location ingest)</td><td>0-RTT resume and head-of-line-blocking-free streams matter when a driver phone hops cell towers mid-trip; keeps p99 ping ingest &lt; 200 ms even under packet loss.</td><td>TCP+TLS → reconnect cost on tower handoff; raw UDP → no congestion control, would melt under 1.25 M wps.</td></tr>
+    <tr><td>MySQL (sharded by city_id)</td><td>Trip FSM needs single-leader writes for the "one driver per request" invariant; 25 M trips/day × 2 KB = 50 GB/day per region fits comfortably with hash partitioning by city.</td><td>Postgres → equally fine, but Vitess/MySQL gives more proven sharding tooling at city scale.</td></tr>
+    <tr><td>Postgres (payments ledger)</td><td>Double-entry ledger needs serializable isolation and read-after-write; 99.999% availability target on payments justifies a smaller, stronger store separate from the trip DB.</td><td>MySQL → fine, but Postgres' SERIALIZABLE and rich constraint support reduce ledger bugs.</td></tr>
+    <tr><td>API Gateway + WAF</td><td>Single ingress for both rider HTTPS/gRPC and TLS termination; WAF blocks credential-stuffing on the auth path before it reaches the Ride Service.</td><td>Service-mesh-only ingress → no L7 WAF; raw NLB → no auth offload.</td></tr>
+  </tbody>
+</table>
+

@@ -1,0 +1,137 @@
+<h1>Design Google Docs (Operational Transformation, OT)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">collaboration</span>
+  <span class="tag">file-storage</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a real-time collaborative rich-text editor where dozens of users can simultaneously edit the same document, see each other's cursors, and never lose a keystroke — even across flaky networks. The canonical algorithm here is <b>Operational Transformation (OT)</b>, the same family used by Google Docs / Wave. We must converge all replicas, preserve user intent, and survive disconnects of minutes to hours.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Rich text: bold/italic/lists/tables/comments, ~30 op types.</li>
+  <li>Real-time concurrent editing for up to 100 active editors per doc.</li>
+  <li>Offline editing with automatic merge on reconnect.</li>
+  <li>Cursors, selections, presence indicators.</li>
+  <li>Revision history, undo/redo per-user, suggestions / track-changes.</li>
+  <li>Comments anchored to character ranges that survive edits.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 keystroke echo &lt; 50 ms same-region, p99 &lt; 200 ms.</li>
+  <li><b>Scale:</b> 1 B docs, 500 M MAU, 50 M concurrent editing sessions.</li>
+  <li><b>Convergence:</b> all replicas reach identical state within 1 s of the last op.</li>
+  <li><b>Durability:</b> no acked op ever lost (RPO = 0).</li>
+  <li><b>Availability:</b> 99.99% on the editing path.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Avg op size: ~120 B (insert/delete + attribution + range).</li>
+  <li>Per-user typing rate: ~3 ops/s while active → 50 M sessions × 0.3 active = 15 M ops/s peak.</li>
+  <li>Op-log storage: 15 M ops/s × 120 B × 86400 = ~155 TB/day raw, ~50 TB after compaction.</li>
+  <li>Snapshot store (every 1000 ops or 5 min): 1 B docs × avg 40 KB = 40 PB.</li>
+  <li>Edge fan-out bandwidth: 15 M ops/s × 120 B × avg 4 peers = ~7.2 GB/s.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>WS    /v1/doc/{docId}/session         → { sessionId, baseRev, snapshot }
+WS    → C2S { type:"op", clientId, parentRev, ops:[...] }
+WS    ← S2C { type:"ack", rev }
+WS    ← S2C { type:"op",  rev, ops:[...], origin:clientId }
+WS    ← S2C { type:"presence", users:[{id,cursor,sel,color}] }
+GET   /v1/doc/{docId}/history?from=&amp;to=  → revisions[]
+POST  /v1/doc/{docId}/snapshot           → snapshotId  (admin/cron)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Browser]──WS──&gt;[Edge GW]──&gt;[Session Router]──&gt;[Doc Server (sticky shard)]
+                                                  │       │
+                                                  │       ├─&gt;[OT Engine] (in-mem)
+                                                  │       │
+                                                  │       ├─&gt;[Op Log: Bigtable/Spanner]
+                                                  │       │
+                                                  │       └─&gt;[Snapshot Store: GCS/S3]
+                                                  ▼
+                                          [Pub/Sub fan-out]──&gt;peer Doc Servers
+</div>
+<p>A document is owned by exactly one Doc Server at a time (single-writer per doc). The Session Router uses consistent hashing on docId. The OT Engine maintains the canonical revision log; every incoming client op is transformed against concurrent ops it hasn't seen, assigned a revision, persisted to the op log, and broadcast.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Op log (Spanner)</h3>
+<pre>CREATE TABLE doc_ops (
+  doc_id   STRING(36),
+  rev      INT64,
+  client_id STRING(36),
+  parent_rev INT64,
+  op_blob  BYTES,        -- protobuf of ops[]
+  ts       TIMESTAMP,
+) PRIMARY KEY (doc_id, rev);</pre>
+<h3>7.2 Snapshots</h3>
+<p>Every 1,000 ops or 5 min we materialize the doc and write to GCS. Recovery = latest snapshot + tail of op log. Truncate ops older than newest snapshot after a 7-day grace window for history.</p>
+<h3>7.3 Why Spanner?</h3>
+<p>Strict single-document linearizability via row-level locks on (doc_id, rev), multi-region sync replication, and TrueTime gives a globally ordered revision number — exactly what OT needs. DDIA Ch.9 (Linearizability) discusses why this matters for total order.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 OT engine</h3>
+<p>Each op carries (clientId, parentRev). The server holds the canonical sequence S. When op O arrives with parentRev=r and current server rev is R, the server transforms O against S[r+1..R] using transform functions T(a,b) → (a',b') satisfying TP1: apply(apply(s,a),T(b,a)) = apply(apply(s,b),T(a,b)). It then appends O' as rev R+1 and broadcasts.</p>
+<h3>8.2 Client</h3>
+<p>Maintains three buffers: <i>acknowledged</i>, <i>in-flight</i> (sent, awaiting ack), <i>pending</i> (queued). On receiving a remote op it transforms against in-flight+pending. This is the Jupiter model — server is the single source of truth, no client-to-client transforms.</p>
+<h3>8.3 Presence &amp; cursors</h3>
+<p>Ephemeral, never persisted. Pushed on a separate Pub/Sub topic at 10 Hz, attached to revision so cursors don't jump after a remote insert.</p>
+<h3>8.4 Comments anchoring</h3>
+<p>Comments store (startMarkerId, endMarkerId). Markers are sticky positions in the op log; they survive transforms because each insert/delete updates marker offsets atomically.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot doc (10k editors on a launch doc):</b> shard read fan-out via a tree of relay servers; writes still serialize on the owner.</li>
+  <li><b>Owner failover:</b> lease in Chubby/etcd, 10 s TTL; new owner replays op log tail from last snapshot.</li>
+  <li><b>Long offline (days):</b> client may need a full snapshot rebase; we cap offline-merge to 30 days.</li>
+  <li><b>Op log compaction:</b> background compactor merges adjacent inserts from same author within 2 s.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>OT vs CRDT</td><td>Smaller payloads (~120 B vs 250–400 B), simpler rich-text intent preservation</td><td>Requires central server; transform functions are notoriously hard (Wave shipped with bugs for years)</td></tr>
+<tr><td>Single-writer per doc</td><td>Total order trivial; no merge ambiguity</td><td>Owner is a SPOF until failover; cap on per-doc throughput (~5k ops/s)</td></tr>
+<tr><td>Snapshots every 1k ops</td><td>Bounded recovery time</td><td>Storage amplification (~3×)</td></tr>
+<tr><td>Spanner for op log</td><td>Strong order, multi-region</td><td>Cost; ~$0.30/GB/mo + commit latency 50–100 ms</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — single-leader with synchronous followers per region.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — linearizable revision counter, why total order is required for OT correctness.</li>
+  <li>Ch. 11 Stream Processing — Pub/Sub fan-out of ops as an event log.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"OT is correct only if every transform pair satisfies TP1; I would lean on a verified library (ot.js / ShareDB) rather than write transforms from scratch."</li>
+  <li>"The hardest part is offline merge over days — I'd cap it and fall back to a 3-way diff if the op log is gone."</li>
+  <li>"For a greenfield design today I'd seriously consider Yjs CRDTs to drop the central writer; the ~2× payload cost is worth the operational simplicity."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>OT (Jupiter model)</td><td>Rich-text intent preservation is well-studied for OT; payloads stay at ~120 B vs ~250–400 B for CRDT, halving our 7.2 GB/s edge fan-out. Jupiter's "server is single source of truth" eliminates client-to-client transforms, the bug-prone part of OT.</td><td>Yjs CRDT (rejected: 2× payload at our scale costs ~$3 M/yr extra egress); ShareJS classic OT (rejected: client-to-client transforms add TP2 correctness burden).</td></tr>
+    <tr><td>Google Spanner (op log)</td><td>OT correctness requires a totally ordered revision counter per doc. Spanner's TrueTime + row-level locks on (doc_id, rev) deliver linearizable inserts at 50–100 ms commit latency across regions, which is acceptable because we ack to client only after persistence.</td><td>FoundationDB (rejected: weaker cross-region story for synchronous replication); Postgres + Patroni (rejected: no native multi-region linearizable writes at 1 B docs).</td></tr>
+    <tr><td>WebSocket transport</td><td>Bidirectional, sticky to the Doc Server shard, and works on every corporate firewall. We need ordered delivery for ops and 50 ms p50 echo; raw TCP framing through WS keeps headers under 10 B per op after permessage-deflate.</td><td>WebTransport/QUIC (rejected: still maturing in 2024 enterprise browsers); SSE+POST (rejected: half-duplex doubles RTT for keystrokes).</td></tr>
+    <tr><td>GCS / S3 (snapshots)</td><td>Every 1,000 ops we materialize a 40 KB doc — 40 PB total. Object storage at $0.02/GB/mo is 15× cheaper than keeping that in Spanner. Recovery is "latest snapshot + tail" so cold-read latency of 50–80 ms is fine.</td><td>Spanner blobs (rejected: $0.30/GB/mo × 40 PB = unviable); HDFS (rejected: ops burden and worse durability than S3's 11 9s).</td></tr>
+    <tr><td>Pub/Sub (op fan-out)</td><td>After the Doc Server commits rev R+1 it must push to ~4 peer servers and N edge connections. Pub/Sub gives at-least-once delivery with 10 ms intra-region latency; idempotency comes for free because rev numbers are monotonic.</td><td>Kafka (rejected: per-doc topic explosion at 1 B docs); raw gRPC fanout (rejected: no buffering during peer hiccups).</td></tr>
+    <tr><td>etcd / Chubby (owner lease)</td><td>Single-writer-per-doc requires a fencing lease so a stale owner can't append after partition. etcd's 10 s TTL leases with mod-revision fencing match our &lt; 5 s failover SLO without paying for full Paxos in the data path.</td><td>ZooKeeper (rejected: heavier ops, comparable semantics); Redis Redlock (rejected: not a true consensus system, known correctness gaps).</td></tr>
+    <tr><td>Consistent-hash session router</td><td>50 M concurrent sessions must land on the right Doc Server shard. Hashing on doc_id with a virtual-node ring keeps re-shuffling at &lt; 1/N of keys when a node dies, preserving the in-RAM OT state for unaffected docs.</td><td>Random LB + global lookup (rejected: every op pays a Redis hop); Maglev (viable but added complexity for marginal balance gain).</td></tr>
+    <tr><td>Protobuf op encoding</td><td>~120 B per op needs a tight schema. Protobuf gives 30% smaller wire size than JSON, schema evolution for our 30 op types, and zero-copy decode in the C++ Doc Server's hot path.</td><td>JSON (rejected: 1.5–2× size, parse cost dominates at 15 M ops/s); FlatBuffers (rejected: poorer language support for the JS client).</td></tr>
+    <tr><td>Sticky markers (comments)</td><td>Comments anchored to character ranges must survive arbitrary inserts/deletes. Sticky markers updated atomically in the OT engine cost O(1) per op vs recomputing offsets, keeping comment-anchor latency invisible at 15 M ops/s.</td><td>Recompute on read (rejected: O(log n) per comment per render); CRDT range markers (rejected: incompatible with OT's mutable rev numbering).</td></tr>
+    <tr><td>Region-local sync replicas</td><td>p99 keystroke echo budget is 200 ms; cross-region commit alone is 80–120 ms. Spanner sync within region + async cross-region keeps the hot path local while still hitting RPO=0 on majority loss.</td><td>Global sync replication (rejected: blows past 200 ms p99 budget); Async-only (rejected: violates RPO=0 durability requirement).</td></tr>
+    <tr><td>Background op-log compactor</td><td>15 M ops/s × 86400 s = 1.3 T ops/day raw. Merging adjacent inserts from the same author within 2 s shrinks log to ~50 TB/day. Saves ~$50 K/day in Spanner storage without altering the doc state — we replay merged ops identically.</td><td>No compaction (rejected: 3× storage in 30 days); log-truncate at every snapshot (rejected: kills history granularity).</td></tr>
+    <tr><td>Per-user undo (client-side)</td><td>Undo must invert only the local user's ops, not the document's, while remote ops keep flowing. Client tracks its in-flight + acknowledged stack and emits inverse ops; the server treats them as ordinary ops, no undo opcode needed.</td><td>Server-side undo opcode (rejected: needs per-user state in the OT engine, breaks single-writer simplicity); CRDT-style "undo as new op" (already what we do, just framed differently).</td></tr>
+  </tbody>
+</table>

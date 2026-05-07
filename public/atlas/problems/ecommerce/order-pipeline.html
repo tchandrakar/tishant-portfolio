@@ -1,0 +1,142 @@
+<h1>Design Order Pipeline / Order Lifecycle (state machine, saga, returns)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ecommerce</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the end-to-end order pipeline: from "Place Order" through payment, inventory commit, fulfilment, shipping, delivery, and return/refund. The system must coordinate 6+ downstream services (payments, inventory, fraud, fulfilment, carrier, notifications, accounting) without distributed transactions, recover cleanly from any step's failure, and provide a queryable, auditable order history.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Create order, validate items + price + address, reserve inventory, charge payment.</li>
+  <li>Allocate to warehouse, generate picklist, ship, track, deliver.</li>
+  <li>Cancel before ship; return + refund after delivery.</li>
+  <li>Customer self-service: "Where's my order?", invoice download.</li>
+  <li>Accurate order state visible to customer, support, and analytics within seconds.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Correctness:</b> no orphaned charges, no orphaned shipments, no double refunds.</li>
+  <li><b>Throughput:</b> 30k orders/s peak; 200k events/s on the bus.</li>
+  <li><b>Latency:</b> place-order p99 &lt; 800 ms (synchronous portion).</li>
+  <li><b>Durability:</b> every state transition durable; recoverable from any single component failure.</li>
+  <li><b>Auditability:</b> append-only history; replayable.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 30k order creates/s, 200k state-change events/s.</li>
+  <li>Storage: 1B orders/yr * 4 KB = 4 TB/yr hot; 40 TB with items + events.</li>
+  <li>Kafka: 200k * 1 KB = 200 MB/s ingress; retain 7 days = 120 TB.</li>
+  <li>Search index (orders): 1B docs, ~500 GB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/orders               {cart, addr, payMethod, idemKey} → orderId, status
+GET  /v1/orders/{id}                                          → order JSON
+POST /v1/orders/{id}/cancel    {reason, idemKey}              → status
+POST /v1/orders/{id}/return    {items, reason}                → returnId
+POST /v1/internal/orders/{id}/transition  {event, payload}    -- saga internal</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Checkout] --POST /orders--&gt; [Order Svc] --insert--&gt; [Postgres orders]
+                                  |                       |
+                                  v                       v
+                            [Outbox table] -----&gt; [Kafka order-events]
+                                                          |
+       +--------+---------+---------+----------+----------+----------+
+       v        v         v         v          v          v          v
+   [Payment] [Inv]   [Fraud]   [Fulfil]   [Notif]    [Accounting]  [Search]
+       |        |         |         |
+       v        v         v         v
+    publishes  publishes  publishes publishes  -&gt; [Saga Orchestrator] -&gt; updates [Order Svc]
+</div>
+<p>Hybrid: a saga orchestrator listens to all service events and drives the order's state machine; services remain decoupled but the orchestrator owns the lifecycle invariants.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Orders (sharded Postgres by user_id hash)</h3>
+<pre>orders(order_id PK, user_id, status, total_cents, currency,
+       created_at, updated_at, version);
+order_items(order_id, sku, qty, unit_price, seller_id);
+order_events(event_id PK, order_id, type, payload jsonb, ts);  -- append only
+outbox(id PK, agg_id, type, payload, published_at);</pre>
+<h3>7.3 State machine</h3>
+<pre>CREATED -&gt; PAYMENT_PENDING -&gt; PAID -&gt; ALLOCATED -&gt; PICKED -&gt; SHIPPED -&gt; DELIVERED
+                          \                                              \
+                           -&gt; PAYMENT_FAILED -&gt; CANCELLED                 -&gt; RETURN_REQUESTED -&gt; RETURNED -&gt; REFUNDED
+   any -&gt; CANCELLED (with compensating actions)</pre>
+<p>Every transition is recorded in <code>order_events</code>; current <code>status</code> is a derived materialization for fast reads. DDIA Ch.11's "log as system of record" applies.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Place-order synchronous path</h3>
+<p>Order Svc validates, inserts the order row + outbox row in one local transaction. The outbox publisher tails the table and writes to Kafka with the order_id as the partition key. Total sync latency: ~150 ms.</p>
+<h3>8.2 Saga orchestrator</h3>
+<p>Reads order-events, looks up the order's current state, decides next command, and publishes to the responsible service. Implements timeouts: e.g., if PAYMENT_PENDING &gt; 60 s, fire payment-status-poll; if SHIPPED &gt; 14 days, mark stuck. Idempotency: every command carries a deterministic key derived from (order_id, transition).</p>
+<h3>8.3 Compensations</h3>
+<p>Failures emit compensating commands: cancel reservation, refund payment, regenerate invoice. Compensations are themselves idempotent — re-running them is safe.</p>
+<h3>8.4 Returns</h3>
+<p>Return is a sub-saga: <i>RETURN_REQUESTED → RMA_ISSUED → ITEM_RECEIVED → INSPECTED → REFUND_INITIATED → REFUNDED</i>. Refund uses the original payment idempotency key + a sub-key so the PSP doesn't double-credit.</p>
+<h3>8.5 Read paths</h3>
+<p>Customer order list reads from a denormalized "order summary" view in DynamoDB or Elasticsearch, populated from order-events via Kafka. The OLTP DB is shielded from query traffic.</p>
+<h3>8.6 Idempotency &amp; exactly-once-effect</h3>
+<p>End-to-end idempotency key originates at /orders POST. The orchestrator stores (idemKey → orderId) so a retry returns the same order. Each downstream call carries a derived key. We get effective exactly-once via dedup at every boundary, not via 2PC.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Saga state hot rows:</b> shard orchestrator state by order_id; multiple orchestrator instances with consistent-hash leases.</li>
+  <li><b>Kafka partition skew:</b> order_id partition key gives even spread.</li>
+  <li><b>Stuck orders:</b> a watchdog scans for orders without a transition in N hours and re-drives.</li>
+  <li><b>Reporting load:</b> CDC into a column store (BigQuery/Snowflake); never query OLTP for analytics.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Saga (vs 2PC)</td><td>Loose coupling, scalable</td><td>Compensations are application logic</td></tr>
+<tr><td>Orchestrated (vs choreographed)</td><td>Clear lifecycle ownership</td><td>Orchestrator can be a bottleneck</td></tr>
+<tr><td>Outbox + CDC</td><td>Atomic with DB write</td><td>Outbox table grows; needs cleanup</td></tr>
+<tr><td>Append-only event log</td><td>Audit, replay, debugging</td><td>Storage cost; read fan-out</td></tr>
+<tr><td>Denormalized read views</td><td>Cheap fast reads</td><td>Eventual; must handle staleness in UI</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 7 Transactions — local ACID for order + outbox; why distributed transactions are avoided.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — orchestrator leader election; fencing tokens to avoid split-brain.</li>
+  <li>Ch. 11 Stream Processing — log-as-source-of-truth, exactly-once-effect via dedup, materialized views.</li>
+  <li>Ch. 12 The Future of Data Systems — derived data systems for search/analytics.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I never use 2PC across service boundaries; sagas with idempotent compensations are the industry standard for a reason."</li>
+  <li>"The transactional outbox is non-negotiable — it's how you avoid the dual-write problem between DB and Kafka."</li>
+  <li>"Returns are deceptively hard; the refund key has to be idempotent against the original charge so PSPs don't double-credit on retries."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Sharded Postgres (orders)</td><td>30k orders/s with multi-row writes (orders + order_items + outbox) needs ACID. Sharding by user_id hash co-locates a customer's orders for fast list reads and confines a checkout transaction to one shard. Each shard handles ~3k orders/s with headroom.</td><td>DynamoDB (no multi-row tx, joins painful for order_items); CockroachDB (cross-shard latency hurts the 800 ms place-order budget).</td></tr>
+<tr><td>Transactional outbox</td><td>The dual-write problem (write DB then publish Kafka) loses events on crash. Outbox row in the same local Postgres tx + tail-publisher gives atomic-with-DB publish. Without it, at 200k events/s some orders silently never reach Inventory or Payments.</td><td>Two-phase commit (no Kafka support, blocking); fire-and-forget publish (drops events on crash); CDC-only without outbox (publishes uncommitted writes).</td></tr>
+<tr><td>Kafka (order-events)</td><td>200k state-change events/s with 7-day retention (120 TB) feeds 6+ downstream services. Partition by order_id gives even spread and per-order ordering. 7-day retention enables saga replay after orchestrator failure without losing in-flight orders.</td><td>RabbitMQ (no replay; can't rebuild materialized views); SQS (no per-key ordering); Pulsar (less mature ecosystem).</td></tr>
+<tr><td>Saga orchestrator (vs choreography)</td><td>Lifecycle invariants — "PAID requires inventory reserved AND payment captured" — need a single owner. Orchestration centralizes timeout policy (60 s payment timeout, 14 d shipped-stuck) and compensations. With 6+ services, choreographed sagas become an undebuggable mesh of "who reacts to what".</td><td>Choreography (no central audit, hard to evolve); 2PC (PSPs and carriers don't support it).</td></tr>
+<tr><td>Append-only event log (order_events)</td><td>Auditability and replay are explicit non-functional requirements. Every transition stored as an immutable event; current status is a derived materialization. Replays reproduce any historical state, critical for support, fraud, and regulatory audit. DDIA Ch.11 "log as system of record".</td><td>Mutable status column only (loses history); event sourcing without snapshot (slow current-state reads).</td></tr>
+<tr><td>Idempotency-key store</td><td>End-to-end exactly-once-effect is the single most important correctness property — no double charges, no double shipments. Client-supplied idemKey at /orders POST stored as (idemKey → orderId); duplicate POSTs return the same orderId without side-effects. Each downstream call carries a derived deterministic key.</td><td>Database unique constraints alone (works for inserts, harder for cross-step retries); best-effort retry (orphaned charges in production).</td></tr>
+<tr><td>Consistent-hash leases (orchestrator)</td><td>Hot saga state rows would serialize transitions if multiple orchestrator instances raced. Consistent-hash leases pin order_id ranges to one orchestrator instance with fencing tokens — no split-brain, no double transitions. Fencing tokens (DDIA Ch.9) protect against zombie instances after GC pauses.</td><td>Single-instance orchestrator (SPOF, won't survive 30k orders/s); multi-master with locks (deadlock risk).</td></tr>
+<tr><td>DynamoDB / ES (read views)</td><td>Customer "where's my order" reads at scale would crush the OLTP shard. Denormalized order summary view in DDB (by user_id) or ES (text search) is populated from order-events via Kafka. OLTP is shielded; reads are sub-100 ms.</td><td>OLTP read replicas only (still amplify load); query OLTP directly (kills checkout p99 during traffic spikes).</td></tr>
+<tr><td>Watchdog (stuck orders)</td><td>Sagas occasionally lose events (PSP timeout with unknown outcome, carrier silence). A watchdog scans for orders without a transition in N hours and re-drives. Idempotent compensations make re-driving safe; without this, &lt; 0.01% of orders silently get stuck — at 1B orders/yr that's 100k stuck orders.</td><td>Manual ops triage (doesn't scale); per-step retries only (won't catch silent gaps between steps).</td></tr>
+<tr><td>BigQuery / Snowflake (analytics)</td><td>1B orders/yr × 4 KB = 4 TB/yr; reporting queries (cohorts, fraud rings, finance close) are columnar workloads. CDC into a column store decouples analytics from OLTP completely. Querying OLTP for analytics has caused at least one outage at every e-commerce company.</td><td>Read replica querying (locks, latency); per-shard rollups (fragile, slow joins).</td></tr>
+<tr><td>State machine (explicit transitions)</td><td>CREATED → PAYMENT_PENDING → PAID → ALLOCATED → PICKED → SHIPPED → DELIVERED is enforced in code; illegal transitions throw. Without an explicit FSM, services would bypass states (e.g., SHIPPED before PAID) under retry storms. The FSM is the contract every service signs.</td><td>Implicit status flags (drift; spaghetti); workflow engine like Cadence/Temporal (great alternative, considered for v2 — adds runtime dep).</td></tr>
+<tr><td>Refund sub-saga w/ derived idem-key</td><td>Refunds re-use the original payment's idempotency key plus a sub-key (paymentId|refundId) so PSPs don't double-credit on retry. Returns are a sub-saga RETURN_REQUESTED → RMA_ISSUED → ITEM_RECEIVED → INSPECTED → REFUND_INITIATED → REFUNDED, each step idempotent and resumable.</td><td>Generate fresh refund key (PSP can't dedup against original charge); manual refund (doesn't scale to 1B orders/yr).</td></tr>
+<tr><td>CDC (Debezium)</td><td>Outbox tail-publisher uses Debezium-style CDC to stream Postgres WAL into Kafka. Catches every committed write, never reads uncommitted. At 200k events/s the alternative (polling outbox table) is too slow and creates write amplification on the OLTP shard.</td><td>Polling publisher (lag and table bloat); application-level publish (loses atomicity guarantee).</td></tr>
+</tbody>
+</table>
+

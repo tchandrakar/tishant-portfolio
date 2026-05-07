@@ -1,0 +1,147 @@
+<h1>Design Real-time File Sync (multi-device, conflict resolution)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">file-storage</span>
+  <span class="tag">collaboration</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the real-time sync engine behind products like Notion, Obsidian Sync, Apple Notes, or the file-tier of Google Workspace. Unlike a backup tool (which can tolerate minutes of lag) and unlike an object store (which has no notion of identity-per-device), this system must keep N devices for the same user — and M users sharing a folder — converged within a couple of seconds while users are actively editing, possibly offline, on flaky networks.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Continuous sync of file create/modify/rename/delete across all devices and users with access.</li>
+  <li>Offline edits queue locally and replay on reconnect.</li>
+  <li>Deterministic, automatic conflict resolution for concurrent edits to the same file.</li>
+  <li>Per-folder ACLs; revocation must drop a device's access within seconds.</li>
+  <li>Bandwidth-efficient updates (delta sync) and battery-friendly mobile clients.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> change-event propagation p95 &lt; 2 s within a region; p99 &lt; 5 s globally.</li>
+  <li><b>Scale:</b> 200 M users, 1 B linked devices, 10 B files, 50 B sync events/day.</li>
+  <li><b>Availability:</b> 99.95% on metadata; degraded read-only mode below that.</li>
+  <li><b>Consistency:</b> causal consistency per file; eventual convergence across all devices.</li>
+  <li><b>Battery:</b> idle mobile client drains &lt; 1% / hour while connected.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>50 B events/day = ~580 K events/s avg, 2.5 M/s peak.</li>
+  <li>WebSocket fan-out: 200 M users x 5 devices x 60% online = 600 M live connections.</li>
+  <li>Event payload ~500 B → 290 GB/s at peak fan-out (read-amplified).</li>
+  <li>Metadata DB: 10 B files x ~600 B/row = 6 TB hot, ~60 TB with versions.</li>
+  <li>Delta blocks: assume 30% of changes are partial → 8 PB/day delta upload.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>WS   /v1/sync/connect         (auth)                      ← server-push events
+POST /v1/ops/commit           {file_id, parent_vector, ops[], blocklist} → new_vector
+GET  /v1/ops/since            {file_id, vector}            → ops[]
+POST /v1/blocks/upload        {hash, size, data}           → block_id
+POST /v1/folder/share         {folder_id, user, role}      → membership_id
+POST /v1/folder/revoke        {folder_id, device_id}       → 204</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">           [Device A]                 [Device B]                [Device C]
+                │                         │                          │
+                └─────── WebSocket ───────┼──── WebSocket ───────────┘
+                                          ▼
+                                [Sync Gateway tier]
+                                          │
+                                          ▼
+                              [Op Log per file_id (Kafka)]
+                                          │
+                       ┌──────────────────┼──────────────────┐
+                       ▼                  ▼                  ▼
+                [Metadata KV]      [Delta Block Store]  [Notification fanout]
+                       │
+                       ▼
+                  [ACL service] ◄── [Audit log]
+</div>
+<p>Walk-through: every device holds an open WebSocket to a sync gateway. Each <i>file</i> has a per-file op log (a Kafka partition keyed by <code>file_id</code>) that totally orders all commits. A device commits ops with the parent vector clock it last observed; the server appends, rebroadcasts the new vector + ops to every other connected device with access, and updates the metadata snapshot for late joiners.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 File metadata (sharded KV)</h3>
+<pre>key: namespace_id || file_id
+value: {
+  name, parent_id, size, mtime,
+  vector_clock: {device_id -> seq},
+  current_blocklist: [hash...],
+  acl_id, version_head_op_id
+}</pre>
+<h3>7.2 Per-file op log</h3>
+<p>Append-only sequence of <code>{op_id, device_id, parent_vector, op_payload, ts}</code>. Retain the last N ops in hot storage; older ops are compacted into snapshots. The op log <i>is</i> the source of truth — metadata KV is a materialized view.</p>
+<h3>7.3 Delta blocks</h3>
+<p>Same content-addressed block store as the Dropbox design — variable-chunked via FastCDC, EC 10+4, dedup'd globally per namespace.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Conflict resolution model</h3>
+<p>We distinguish three classes:
+1) <b>Whole-file binary</b> (PDF, DOCX): last-writer-wins on the op log; the loser's edit becomes a "Conflict copy" sibling. Same as Dropbox.
+2) <b>Plain text / Markdown</b>: 3-way merge using the common ancestor recorded in the parent vector. Falls back to conflict copy on textual conflicts.
+3) <b>Structured doc (CRDT-aware product)</b>: ops are CRDT operations (Yjs-style), commute by construction, no conflicts possible.
+Per-file metadata declares which model applies.</p>
+<h3>8.2 Vector clocks &amp; causality</h3>
+<p>Each device maintains <code>{device_id → seq}</code> per file. A commit carries its parent vector; the server rejects commits whose parent is &gt; 16 ops behind the head (forces resync). This keeps memory usage bounded.</p>
+<h3>8.3 Notification &amp; mobile</h3>
+<p>Foreground devices use WebSockets. Backgrounded mobile devices fall back to APNs/FCM "silent" pushes that wake the app for at most 30 s every 15 min — tuned to OS budgets.</p>
+<h3>8.4 Revocation latency</h3>
+<p>ACL changes write to a per-namespace revocation epoch. Every WebSocket frame carries the device's known epoch; sync gateway drops the connection when epochs diverge, forcing the client to re-auth and re-fetch the (possibly empty) tree.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot files (everyone editing one shared doc):</b> the per-file Kafka partition is the bottleneck. Mitigate by batching ops every 50 ms and folding redundant ops on the gateway before append.</li>
+  <li><b>Reconnect storms after a regional blip:</b> exponential backoff + jittered reconnect; gateway tier autoscales on connection rate.</li>
+  <li><b>Cold devices catching up:</b> a laptop that's been off for a month may have 100 K ops to replay — server returns a snapshot + tail of recent ops instead.</li>
+  <li><b>Multi-region:</b> Kafka MirrorMaker between regions; a single file is "homed" in one region, others read replicas with ~150 ms lag.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Per-file op log (Kafka)</td><td>Total order per file, easy replay</td><td>Hot files = hot partitions</td></tr>
+<tr><td>Vector clocks</td><td>Causality without global timestamps</td><td>Grows with device count</td></tr>
+<tr><td>WebSocket + silent push hybrid</td><td>Battery-friendly on mobile</td><td>Two code paths to test</td></tr>
+<tr><td>Last-writer-wins for binary</td><td>Simple, predictable</td><td>Can lose work without conflict copy</td></tr>
+<tr><td>CRDTs where possible</td><td>True conflict-free merges</td><td>Only works for structured formats</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-leader (each device is a leader for its own ops).</li>
+  <li>Ch. 9 Consistency &amp; Consensus — causal consistency via vector clocks.</li>
+  <li>Ch. 11 Stream Processing — Kafka per-file log; gateways are stream consumers.</li>
+  <li>Ch. 12 The Future of Data Systems — CRDTs as conflict-free merge.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd model this as a per-file op log first; everything else (snapshots, conflict policy, mobile push) is layered on top."</li>
+  <li>"The interesting choice is conflict resolution: I'd ship LWW + conflict-copy on day one, then add CRDTs format-by-format because they're not free."</li>
+  <li>"Revocation latency is the security SLO most teams forget — I'd put a hard 5-second budget on it and design the epoch protocol around that number."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Kafka per-file partitioned op log</td><td>Each file_id maps to a Kafka partition giving total order per file — exactly what causal consistency NFR requires. At 50 B events/day (~580 K/s avg, 2.5 M/s peak), Kafka's per-partition throughput plus auto-balancing is the only mature stream system that fits.</td><td>Pulsar (equivalent semantics; team already standardized on Kafka); per-file Raft groups (10 B Raft groups is operationally insane).</td></tr>
+    <tr><td>WebSocket gateway tier (Go)</td><td>600 M live connections at peak demand a runtime where each connection costs &lt;100 KB. Go goroutines hit ~50 K connections per process; ~12 K processes total. Sharded by user_id with consistent hashing keeps reconnects sticky to preserve cursor state.</td><td>Node.js (single-thread per process limits density); Erlang (great fit, smaller talent pool); long-poll only (battery cost violates &lt;1%/hour idle NFR).</td></tr>
+    <tr><td>APNs / FCM silent push fallback</td><td>iOS/Android background-execution policies kill long-lived sockets within minutes; silent pushes are the only OS-sanctioned way to wake a backgrounded app within the &lt;2 s p95 propagation NFR. Tuned to the 30 s × 15 min OS budget.</td><td>Polling (drains battery far past 1%/hour); foreground-only sync (breaks the use case).</td></tr>
+    <tr><td>Sharded KV (FoundationDB-class) for metadata</td><td>10 B files × 600 B/row = 6 TB hot, 60 TB with versions; transactional KV with range scans gives single-shard reads on a folder listing. Per-namespace partitioning aligns with ACL boundaries (DDIA Ch. 6).</td><td>Sharded MySQL (works; team chose KV for transparent re-sharding); Cassandra (no transactions, painful for vector_clock CAS).</td></tr>
+    <tr><td>Vector clocks per-file <code>{device_id → seq}</code></td><td>Causal consistency without global timestamps (DDIA Ch. 9) — essential because devices commit offline and reconnect with arbitrary clock skew. The 16-op staleness rejection bounds memory and forces stale clients to resync rather than building unbounded clock state.</td><td>Lamport timestamps (no concurrency detection); HLC (works but more complex; no causality benefit at our SLOs).</td></tr>
+    <tr><td>FastCDC content-defined chunking + content-addressed blocks</td><td>30% of changes are partial → 8 PB/day of delta upload; FastCDC gives the bandwidth-efficiency NFR by ensuring a 1-byte insert in a 1 GB file doesn't shift every later boundary. Same chunker as the dedup tier so blocks are reusable.</td><td>Fixed chunking (kills delta ratio on insertions); rsync-style rolling diff (works for whole-file but doesn't compose with content-addressed dedup).</td></tr>
+    <tr><td>Reed-Solomon 10+4 EC on the block store</td><td>1.4x overhead vs 3.0x replication on petabyte-scale block storage; tolerates AZ loss with shards spread across 4 AZs. Identical geometry to the upstream Dropbox-class store so blocks are interchangeable.</td><td>3x replication (cost prohibitive); LRC (lower repair traffic but more complex placement at 5 EB scale).</td></tr>
+    <tr><td>Yjs-style CRDTs for structured documents</td><td>Two devices editing the same Markdown doc offline must converge with no manual conflict copy. Yjs ops commute by construction, eliminating the conflict class (DDIA Ch. 12). Used only where the format permits — binary files still fall back to LWW.</td><td>Operational Transform (server-side mandatory, breaks offline-first); Automerge (excellent; chose Yjs for smaller wire format).</td></tr>
+    <tr><td>Per-namespace revocation epoch</td><td>Revocation NFR ("drop access within seconds") is a security SLO most designs miss. Every WebSocket frame carries the device's known epoch; a mismatch drops the connection and forces re-auth, hitting the 5-second budget without polling the ACL service on every op.</td><td>ACL check per op (latency cost on hot path); periodic re-auth (revocation lag of polling interval).</td></tr>
+    <tr><td>Op-folding gateway (50 ms batch window)</td><td>Hot files where 1,000 users edit a shared doc would saturate one Kafka partition. Folding redundant ops (e.g., 20 cursor moves → 1) within a 50 ms window collapses event volume while preserving causality — a ~10x reduction on the hottest documents.</td><td>No batching (hot partition saturates); larger window (violates 2 s p95 propagation NFR).</td></tr>
+    <tr><td>Snapshot + tail recovery for cold devices</td><td>A laptop offline for a month may have 100 K queued ops; replaying linearly takes minutes and burns mobile battery. Server returns a metadata snapshot + recent ops tail — bounded recovery time independent of how long the device was off.</td><td>Full op replay (unbounded recovery time); periodic full sync (wastes bandwidth).</td></tr>
+    <tr><td>Kafka MirrorMaker for cross-region</td><td>~150 ms cross-region lag NFR with single-file home region matches MirrorMaker's per-partition replication. Files are "homed" in one region for write linearizability; other regions read replicas. The asymmetry mirrors how the Kafka cluster is laid out.</td><td>Active-active per file (consensus latency across regions); custom CDC pipeline (re-implements MirrorMaker poorly).</td></tr>
+    <tr><td>Postgres for ACL service + audit log</td><td>ACLs are low-volume but require strong consistency (a revoke must not race with an op). Audit log needs ad-hoc SQL queries for compliance. Postgres serves both with mature row-level security and JSONB.</td><td>The metadata KV (couples auth plane to data plane); Cassandra (no transactions for ACL flips).</td></tr>
+  </tbody>
+</table>

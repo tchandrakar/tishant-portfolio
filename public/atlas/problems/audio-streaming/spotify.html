@@ -1,0 +1,172 @@
+<h1>Design Spotify (audio streaming at scale)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">audio-streaming</span>
+  <span class="tag">cdn</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design an on-demand music streaming service like Spotify. Users browse a global catalog of ~100M tracks, play any track on-demand under 200ms, build playlists, follow artists, and receive personalized recommendations (Discover Weekly, Daily Mixes). The system must handle royalty-grade play accounting, multi-device synchronization (phone, web, smart speaker, car), offline downloads for premium users, and DRM for label compliance. Scope excludes podcasts ingestion pipeline (handled separately) but includes the core audio plane.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Browse and search catalog (artist, album, track, playlist) with sub-second results.</li>
+  <li>Stream any track on-demand with adaptive bitrate (96/160/320 kbps).</li>
+  <li>Create, edit, share, collaborate on playlists; follow artists/users.</li>
+  <li>Personalized recommendations (Discover Weekly, Release Radar, Daily Mixes).</li>
+  <li>Offline downloads for Premium subscribers (encrypted at rest on device).</li>
+  <li>Cross-device playback resume (Spotify Connect).</li>
+  <li>Royalty-grade play accounting (every &gt;30s play counted exactly once).</li>
+  <li>Like/save tracks; library sync across devices.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> first audio byte under 200ms p99 globally; search under 150ms p99.</li>
+  <li><b>Scale:</b> 600M MAU, 230M premium, 250M DAU, peak 8M concurrent streams.</li>
+  <li><b>Availability:</b> 99.95% playback; 99.9% catalog/search.</li>
+  <li><b>Durability:</b> 11 nines for master audio files; loss = legal risk with labels.</li>
+  <li><b>Consistency:</b> eventual for play counts/recos; strong for billing and library writes.</li>
+  <li><b>Security:</b> Widevine/FairPlay DRM, signed short-lived stream URLs, TLS 1.3.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Catalog:</b> 100M tracks &times; 3 bitrates &times; avg 4MB (160kbps, 3.5min) = ~1.2 PB raw + lossless masters ~10 PB.</li>
+  <li><b>Daily plays:</b> 250M DAU &times; 25 plays/day = 6.25B play events/day = ~72K events/sec average, peak ~250K/sec.</li>
+  <li><b>Streaming bandwidth:</b> 8M concurrent &times; 160kbps avg = 1.28 Tbps egress at peak.</li>
+  <li><b>Daily egress:</b> 6.25B plays &times; 4MB = 25 PB/day from CDN.</li>
+  <li><b>Search QPS:</b> 250M DAU &times; 10 searches/day / 86400 = ~30K QPS average, 100K peak.</li>
+  <li><b>Reco compute:</b> 600M user embeddings (256d &times; 4B) = ~600 GB hot in feature store.</li>
+  <li><b>Play-event log:</b> 6.25B &times; 200B = 1.25 TB/day (compressed ~300 GB) into Kafka.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/playback/start         {trackId, deviceId, bitrate}  -&gt; {streamUrl, sessionId, ttl}
+POST  /v1/playback/heartbeat     {sessionId, posMs, bytesIn}   -&gt; 204
+POST  /v1/playback/end           {sessionId, reason, posMs}    -&gt; 204
+GET   /v1/catalog/track/{id}                                   -&gt; {metadata, audioBlobIds}
+GET   /v1/search?q=&amp;type=                                      -&gt; {tracks, artists, albums}
+POST  /v1/playlists              {name, public, trackIds}      -&gt; {playlistId}
+POST  /v1/playlists/{id}/tracks  {trackIds, position}          -&gt; 204
+GET   /v1/users/{id}/recommendations?type=discover_weekly      -&gt; {tracks[]}
+POST  /v1/library/save           {trackId}                     -&gt; 204
+POST  /v1/connect/transfer       {fromDeviceId, toDeviceId}    -&gt; {sessionId}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Mobile/Web/Speaker]
+       |
+       v
+ [Edge POP / CDN] ----audio bytes---- [Origin Shield] -- [S3/GCS Audio Blobs]
+       |
+       v
+ [API Gateway + Authz]
+       |
+       +--&gt; [Playback Svc] -- [License/DRM Svc] -- [Key Mgmt]
+       |          |
+       |          +--&gt; emit play-events --&gt; [Kafka]
+       |
+       +--&gt; [Catalog Svc] ---- [Cassandra: tracks, albums]
+       |
+       +--&gt; [Search Svc]  ---- [Elasticsearch cluster]
+       |
+       +--&gt; [Library Svc] ---- [PostgreSQL shards]
+       |
+       +--&gt; [Reco Svc]   ----- [Feature Store: Redis + Bigtable]
+                                           ^
+                                           |
+ [Kafka] --&gt; [Flink stream jobs] --&gt; [BigQuery] --&gt; [Spark batch ML training]
+</div>
+<p>Walk-through: a play request hits the nearest POP, gets routed to the Playback service which mints a short-lived signed CDN URL after DRM license check. The client streams encrypted MP4/Opus segments directly from CDN. Heartbeats land in Kafka. Flink computes royalty-eligible plays (&gt;30s) and updates leaderboards. Nightly Spark jobs retrain the recommender; embeddings are pushed to a Redis ANN index for online candidate generation.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Catalog (Cassandra)</h3>
+<pre>CREATE TABLE tracks (
+  track_id uuid PRIMARY KEY,
+  title text, artist_id uuid, album_id uuid,
+  duration_ms int, isrc text,
+  audio_blobs map&lt;text, text&gt;,  -- bitrate -&gt; blob_id
+  available_markets set&lt;text&gt;,
+  release_ts timestamp
+);
+CREATE TABLE artist_tracks (
+  artist_id uuid, release_ts timestamp, track_id uuid,
+  PRIMARY KEY (artist_id, release_ts, track_id)
+) WITH CLUSTERING ORDER BY (release_ts DESC);</pre>
+<h3>7.2 Library &amp; playlists (PostgreSQL, sharded by user_id)</h3>
+<pre>playlists(playlist_id, owner_id, name, public, version)
+playlist_tracks(playlist_id, position, track_id, added_ts)
+user_library(user_id, track_id, saved_ts)</pre>
+<h3>7.3 Why these stores?</h3>
+<p>Cassandra for the catalog: write-once/read-many, multi-DC replication, predictable wide-column scans for "all tracks by artist". PostgreSQL for playlists because users expect strong read-after-write semantics on their own library. Audio bytes live in object storage (S3/GCS) behind a CDN; metadata never inlines bytes.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Playback service</h3>
+<p>Stateless. On <code>/playback/start</code> it (a) validates entitlement (region, premium tier), (b) calls License service for a Widevine license bound to <code>device_id</code>, (c) signs a CloudFront/Fastly URL with 30s TTL, (d) emits a <code>play_started</code> event. The client refreshes the URL every 25s while streaming.</p>
+<h3>8.2 Recommendation pipeline</h3>
+<p>Two-stage: candidate generation via ANN (HNSW over user/track embeddings, 256-d, retrained daily on collaborative-filtering matrix factorization + audio CNN features) returns top 5K candidates in 10ms. A LambdaMART ranker scores them with 200 features (recency, skip rate, time-of-day, device). Discover Weekly is precomputed every Monday into Cassandra; Daily Mix is online.</p>
+<h3>8.3 Spotify Connect (cross-device)</h3>
+<p>Each device opens a long-lived WebSocket to a "device fan-out" service partitioned by <code>user_id</code>. Transfer events push state (track, position, queue) to the new device; old device fades out. State of truth lives in Redis with 24h TTL, persisted to Cassandra on logout.</p>
+<h3>8.4 Play-event ingestion &amp; royalties</h3>
+<p>Heartbeats batched on-device every 10s, posted to Kafka via a thin HTTP collector. Flink job dedupes by <code>(session_id, track_id)</code> and emits a single <code>royalty_play</code> when listened &gt;30s. Output sinks to BigQuery for monthly label reporting; idempotency is critical because every play = money.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot tracks (new release):</b> shielded origin, pre-warm CDN POPs the hour before drop, regional traffic-shaping.</li>
+  <li><b>Cassandra hot partitions:</b> bucket <code>artist_tracks</code> by month to avoid skew on prolific artists.</li>
+  <li><b>Search:</b> Elasticsearch with completion suggester; tier popular queries in Redis (1-min TTL).</li>
+  <li><b>Reco serving:</b> embeddings sharded by user_id; ANN index replicated read-only per region.</li>
+  <li><b>Kafka:</b> partition play events by user_id (256 partitions per topic); retention 7d hot, archived to GCS.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Adaptive bitrate (HLS/DASH)</td><td>Robust on bad networks</td><td>3x storage, encode cost</td></tr>
+<tr><td>Eventual consistency for play counts</td><td>Cheap, scalable writes</td><td>Royalty calc lags hours</td></tr>
+<tr><td>Cassandra over DynamoDB for catalog</td><td>Multi-cloud, no vendor lock</td><td>Ops burden of repair/compaction</td></tr>
+<tr><td>Precomputed Discover Weekly</td><td>Predictable cost, fast read</td><td>Stale by up to 7 days</td></tr>
+<tr><td>Signed URLs vs token-in-header</td><td>CDN-cacheable, no app server</td><td>Leaked URL = 30s of access</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-DC leaderless writes for catalog, leader-follower for PostgreSQL libraries.</li>
+  <li>Ch. 6 Partitioning — bucketed clustering keys to fight hot artists; consistent hashing for cache.</li>
+  <li>Ch. 7 Transactions — playlist edits use serializable snapshot isolation in Postgres.</li>
+  <li>Ch. 9 Consensus — etcd-backed coordination for Spotify Connect device transfer.</li>
+  <li>Ch. 11 Stream Processing — Flink exactly-once on play-event log for royalties.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with a single-region MVP using Postgres for everything, then split catalog to Cassandra once read QPS exceeds 50K, because adding NoSQL too early adds operational cost without payoff."</li>
+  <li>"The hardest part is royalty-grade exactly-once accounting under client retries; my mitigation is idempotent session_id keys and Flink's two-phase commit sink to BigQuery."</li>
+  <li>"For cold-start recommendations, I'd lean on content-based audio embeddings (CNN over mel-spectrograms) before collaborative signals exist."</li>
+  <li>"Offline downloads need encrypted blobs with device-bound keys rotated every 30 days to satisfy label DRM clauses."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Cassandra</b></td><td>Catalog of 100M tracks is write-once/read-many with predictable wide-column scans like "all releases by artist"; bucketed clustering keys on <code>artist_tracks</code> kill hot partitions for prolific artists, and multi-DC leaderless replication keeps reads local at our 250M DAU scale.</td><td>DynamoDB — vendor lock and multi-cloud blocked; HBase — weaker tooling; Bigtable — same lock-in concern</td></tr>
+    <tr><td><b>PostgreSQL</b></td><td>User libraries and playlists demand strong read-after-write ("I just liked a song; show it now") and transactional playlist edits with serializable snapshot isolation; sharding by <code>user_id</code> contains blast radius and keeps each shard well under 5TB.</td><td>MySQL — weaker JSON/array support; Cassandra — eventual consistency unacceptable for user-visible writes</td></tr>
+    <tr><td><b>S3 / GCS</b></td><td>1.2 PB of streaming variants plus 10 PB lossless masters need 11-nines durability at object-store pricing; intelligent tiering shifts long-tail tracks to cold storage, and CDN integration is plug-and-play.</td><td>Self-managed Ceph — operational nightmare at PB scale; HDFS — not designed for random byte-range reads</td></tr>
+    <tr><td><b>CloudFront / Fastly CDN</b></td><td>1.28 Tbps peak egress with 200ms first-byte SLA globally is impossible from origin; signed URLs with 30s TTL keep the edge cacheable yet revocable, and POPs absorb new-release thundering herds.</td><td>Self-built edge — capex + ops; single-CDN — vendor risk during outages</td></tr>
+    <tr><td><b>Kafka</b></td><td>6.25B play events/day (peak 250K/sec) need a durable replay-able log so Flink can recompute royalties idempotently after any bug; partition-by-<code>user_id</code> with 256 partitions sustains throughput while keeping per-user ordering.</td><td>Pulsar — less mature ecosystem in 2018; Kinesis — vendor lock and shard-rebalance pain</td></tr>
+    <tr><td><b>Flink</b></td><td>Royalty-grade exactly-once over 6.25B events/day requires its two-phase-commit sink to BigQuery; event-time windowing with watermarks handles late-arriving heartbeats from offline-then-online clients without double-counting.</td><td>Spark Streaming — micro-batch latency too high for leaderboards; Kafka Streams — weaker windowing primitives</td></tr>
+    <tr><td><b>Redis</b></td><td>Spotify Connect device state needs sub-millisecond reads for "transfer playback" UX; ANN candidate index for Discover fits 600 GB hot embeddings with HNSW, and popular search queries cache with 1-min TTL to absorb 100K peak QPS.</td><td>Memcached — no data structures for sorted sets/HNSW; Hazelcast — heavier ops</td></tr>
+    <tr><td><b>Elasticsearch</b></td><td>30K avg / 100K peak search QPS over track + artist + album with completion suggester and prefix matching; tier-based caching of popular queries in Redis reduces ES load 80%.</td><td>Solr — weaker cloud autoscaling; Algolia — cost prohibitive at 600M MAU</td></tr>
+    <tr><td><b>Bigtable (Feature Store)</b></td><td>Per-user feature vectors served at &gt;1M QPS for online ranking need predictable single-digit-ms reads at scale; row-key by <code>user_id</code> aligns with reco lookup pattern and integrates natively with the Dataflow training pipeline.</td><td>Cassandra — already used elsewhere but Bigtable's hot-row caching is better for skewed reads; DynamoDB — multi-cloud constraint</td></tr>
+    <tr><td><b>Spark</b></td><td>Nightly retraining of collaborative-filtering matrix factorization over 600M users x 100M tracks is an embarrassingly parallel batch job; Spark MLlib's ALS is the canonical implementation and outputs embeddings directly to the feature store.</td><td>Flink batch — less mature ML libs; Hadoop MR — slower iteration on ML training</td></tr>
+    <tr><td><b>BigQuery</b></td><td>Monthly royalty reporting requires ad-hoc SQL over years of play history; serverless scaling means analysts can run "all-time top tracks per market" without provisioning a cluster, and Flink's exactly-once sink lands data here.</td><td>Snowflake — fine technically but GCP gravity for the ML stack; Athena — slower for repeated queries</td></tr>
+    <tr><td><b>etcd</b></td><td>Spotify Connect transfer requires consensus on "which device is the active sink" to prevent split-brain when both phone and speaker think they're playing; Raft-backed etcd gives strong leader election with sub-100ms decisions.</td><td>ZooKeeper — clunkier API; Consul — heavier feature set we don't need</td></tr>
+    <tr><td><b>Widevine / FairPlay (DRM)</b></td><td>Label contracts mandate hardware-backed DRM for paid streams; Widevine covers Android/Chrome and FairPlay covers Apple, both supporting EME for browser playback without a custom plugin.</td><td>Custom DRM — labels won't accept; PlayReady — needed only for Edge/Xbox slice</td></tr>
+    <tr><td><b>HLS / DASH</b></td><td><code>HLS</code> for iOS/Safari and <code>DASH</code> for Android/web give adaptive bitrate switching (96/160/320 kbps) so mobile clients on flaky networks don't stall — critical for 200ms first-byte SLA.</td><td>Progressive MP3 — no adaptive bitrate; SmoothStreaming — Microsoft-only ecosystem</td></tr>
+  </tbody>
+</table>

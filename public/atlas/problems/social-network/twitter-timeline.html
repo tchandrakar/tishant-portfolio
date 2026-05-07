@@ -1,0 +1,139 @@
+<h1>Design Twitter / X Timeline (with celeb fanout problem)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">social-network</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design Twitter's home timeline: a reverse-chronological (with light ranking) stream of tweets from accounts a user follows. Must handle the asymmetric follow graph where a single celebrity tweet can fan out to 100M+ followers, while still delivering tweets to typical users in &lt;1 s and surviving 500K+ tweets/sec at peak (e.g. World Cup final).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Post a tweet (≤280 chars, optional media, reply, quote, retweet).</li>
+  <li>Home timeline (followed accounts) and User timeline (one author).</li>
+  <li>Mentions, notifications, search hashtag/keyword (out of scope here, separate svc).</li>
+  <li>Edge cases: protected accounts, blocks, mutes, retweet-collapse.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 500M MAU, 250M DAU, ~500M tweets/day; peak 500K writes/sec; reads 300K/sec avg, 1.2M/sec peak.</li>
+  <li><b>Latency:</b> home timeline p99 &lt; 200 ms; tweet-to-follower visible p95 &lt; 5 s.</li>
+  <li><b>Availability:</b> 99.99% read; write may degrade to async during spikes.</li>
+  <li><b>Durability:</b> tweet must not be lost once 200 OK is returned.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Tweets: 500M/day = ~5.8K/sec avg, ~50K/sec peak (single-event spikes hit 500K/sec).</li>
+  <li>Fanout: avg 200 followers × 5.8K = 1.16M timeline inserts/sec for pure push.</li>
+  <li>Celeb amplification: a 100M-follower tweet = 100M inserts. Even at 100K inserts/sec/worker, that's 1000 worker-seconds. Pure push cannot meet 5 s SLO — pull needed.</li>
+  <li>Storage: 500M × 300 B avg = 150 GB/day tweets; 5-yr retention ≈ 275 TB on Manhattan (hot) + Hadoop (cold).</li>
+  <li>Cache: timeline cache 250M users × 800 IDs × 16 B ≈ 3.2 TB Redis.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /1.1/statuses/update           {text, mediaIds, replyTo}      → tweetId
+GET   /1.1/statuses/home_timeline?count=50&max_id=...               → [tweet]
+GET   /1.1/statuses/user_timeline/{userId}                          → [tweet]
+POST  /1.1/favorites/create          {tweetId}
+POST  /1.1/statuses/retweet/{tweetId}
+WS    /1.1/streaming/user                                          → live new tweets</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] → [TFE Edge] → [API GW] → [Tweet Write Svc] → [Manhattan (sharded KV)]
+                                          │
+                                          ▼
+                                     [Kafka tweets]
+                                          │
+                          ┌───────────────┴───────────────┐
+                          ▼                               ▼
+                  [Fanout Worker (push)]            [Search Indexer (Earlybird)]
+                          │
+                          ▼
+                  [Redis Timeline Cache]
+                          ▲
+[Timeline Read Svc] ──────┘  + pull celeb tweets from User-tweets cache
+        │
+        ▼
+   [Mixer/Ranker] → [Hydration] → response
+</div>
+<p>Walk-through: a tweet is written to Manhattan (durable), emitted to Kafka, then fanout workers push the tweetId into followers' Redis timelines. For accounts above the celebrity threshold (~10K followers, configurable), fanout is skipped. At read time, the Timeline Read Svc reads the user's Redis timeline and unions it with on-demand pulls of recent tweets from each followed celebrity, merges by time, ranks lightly, and hydrates from Manhattan.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Tweets (Manhattan, sharded by tweet_id)</h3>
+<pre>CREATE TABLE tweets (
+  tweet_id   bigint PRIMARY KEY,   -- Snowflake, ms-precision
+  user_id    bigint, text varchar(280), media_ids list,
+  reply_to   bigint, retweet_of bigint, created_at timestamp
+);
+-- Secondary by user_id for user_timeline:
+CREATE TABLE user_tweets (user_id, created_at, tweet_id) WITH CLUSTERING ORDER BY (created_at DESC);</pre>
+<h3>7.2 Home timeline (Redis ZSET per user)</h3>
+<pre>ZADD ht:{userId} {tweet_id_as_score} {tweet_id}   -- Snowflake encodes time
+ZREVRANGE ht:{userId} 0 799                       -- cap 800</pre>
+<h3>7.3 Why Manhattan?</h3>
+<p>Multi-tenant, multi-DC KV with strong per-key consistency, built for write-heavy social workloads. Wide-row friendly, designed at Twitter for exactly this access pattern.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Fanout service</h3>
+<p>Stateless workers, partitioned by user_id of follower for locality. Idempotent ZADD makes retries safe. Backed by Kafka with at-least-once. SLO: p95 fanout-to-Redis latency &lt; 2 s for non-celebs.</p>
+<h3>8.2 Celebrity pull path</h3>
+<p>Per-author tweet-list cache (Redis LIST keyed by user_id, last 800). At read, Timeline Read Svc fetches user's Redis ZSET + parallel MGET of followed-celeb lists (typically &lt;50 celebs/user). Merge by Snowflake id, dedup retweets, return top N.</p>
+<h3>8.3 Asymmetric follow + threshold tuning</h3>
+<p>Threshold isn't fixed; it's the cost minimum of (push amplification × write rate) vs (pull cost × read rate). Twitter's empirical sweet spot ≈10K followers. Above that, account is "pull-only"; below, "push." Switching is a metadata flag; fanout worker reads it per tweet.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Spike events:</b> backpressure — if Kafka lag &gt; threshold, Fanout Svc switches mid-flight celebrities to pull-only and shrinks push depth from 800 to 200.</li>
+  <li><b>Hot Redis shards:</b> consistent-hash with virtual nodes; replicate top 0.01% celeb-list keys to N replicas.</li>
+  <li><b>Cold cache:</b> rebuild from Manhattan user_tweets clustering by created_at desc; warm in background on first hit.</li>
+  <li><b>Retweet storm:</b> store retweet as a small pointer record; hydration pulls the original.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Hybrid push/pull at 10K threshold</td><td>Bounds tail; cheap common case</td><td>Two paths; complexity in ranking merge</td></tr>
+<tr><td>Snowflake IDs as ZSET score</td><td>Time-sortable, no clock skew issues</td><td>64-bit budget, must coordinate epoch</td></tr>
+<tr><td>Manhattan over MySQL</td><td>Multi-DC built-in, write throughput</td><td>Less ad-hoc query power; ops complexity</td></tr>
+<tr><td>At-least-once fanout (idempotent ZADD)</td><td>Simple, robust to retries</td><td>Double-counting risk for engagement aggregates</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-leader Manhattan replication; tweet event log as a replicated stream.</li>
+  <li>Ch. 6 Partitioning — Snowflake-keyed range vs hash partitioning trade-off; hot-spot mitigation for celebrities.</li>
+  <li>Ch. 11 Stream Processing — Kafka-driven fanout, exactly-once semantics via idempotent sinks.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The interesting design tension is asymmetric follow — one celebrity write touches 100M reader timelines, but the median user has 200 followers, so we need two regimes."</li>
+  <li>"I'd build push first, measure the worker queue depth on a celeb tweet, then add the pull path."</li>
+  <li>"I'd argue against ranking the home timeline heavily on the read path — fan-in is already expensive; offload to async ranking jobs."</li>
+  <li>"For the World Cup spike, I'd discuss admission control and degrading retention depth before throughput."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Manhattan</b> (sharded KV, tweet store)</td><td>Multi-tenant, multi-DC KV with strong per-key consistency built at Twitter for write-heavy social workloads — exactly the access pattern for 500M tweets/day with 5-yr retention (~275 TB hot) where wide-row reads dominate.</td><td>MySQL (sharding ops crushing at this write rate), Cassandra (weaker per-key consistency for read-your-writes), DynamoDB (vendor lock at this scale).</td></tr>
+    <tr><td><b>Redis ZSET</b> (home timeline cache)</td><td>250M users × 800 IDs × 16 B ≈ 3.2 TB hot working set; <code>ZREVRANGE 0 799</code> at p99 sub-ms is what the 200 ms home-timeline SLO requires, and Snowflake-as-score gives us free time-ordering.</td><td>Memcached (no sorted set), in-process LRU (cannot share across read replicas), DynamoDB (per-op cost too high at 1.2M reads/sec peak).</td></tr>
+    <tr><td><b>Apache Kafka</b> (tweet event log)</td><td>500K writes/sec spike events (World Cup) need a buffered, replayable log; Kafka's consumer-lag SLO gates the celeb-pull-switch backpressure mechanism that drops mid-flight celebrities to pull-only when lag exceeds threshold.</td><td>RabbitMQ (no replay for fanout recovery), AWS Kinesis (vendor lock plus throughput limits), direct RPC (loses backpressure and durability before fanout).</td></tr>
+    <tr><td><b>Snowflake IDs</b></td><td>64-bit ms-precision time-sortable IDs let us use the ID itself as ZSET score, eliminating clock-skew issues during merge of pushed-timeline + celeb-pull lists; deduplication of retweets becomes trivial integer comparison.</td><td>UUIDv4 (not sortable, breaks merge-by-time), DB auto-increment (cannot generate 500K IDs/sec across DCs), ULID (Snowflake is the established Twitter convention).</td></tr>
+    <tr><td><b>Earlybird</b> (search indexer)</td><td>Built-at-Twitter Lucene-based real-time index optimized for the temporal locality of tweet search (mostly recent-first); avoids indexing 5-yr archive in the hot path while still serving search queries.</td><td>Elasticsearch (heavier per-doc cost at 5.8K writes/sec sustained), Solr (similar trade-offs without the Twitter-specific tuning), Postgres FTS (cannot scale to billions of tweets).</td></tr>
+    <tr><td><b>Fanout workers</b> partitioned by follower user_id</td><td>Per-tweet classification into push (≤10K followers) vs pull (>10K) requires application logic; partitioning by follower locality lets each worker write to a contiguous Redis shard set, and idempotent <code>ZADD</code> makes at-least-once retries safe.</td><td>Pure-push (100M inserts/celeb tweet violates 5 s SLO), pure-pull (every read does up-to-2K author MGETs), Spark Streaming (batch latency too coarse).</td></tr>
+    <tr><td><b>WebSocket streaming</b> (<code>/1.1/streaming/user</code>)</td><td>Live new-tweet delivery to active users at 1.2M peak reads/sec would generate billions of poll requests/day if HTTP-only; persistent WebSocket per active session keeps server cost flat while giving sub-second tweet visibility.</td><td>HTTP long-poll (more connection churn at 250M DAU), SSE (older mobile client gaps), push notifications (wrong surface for the in-app stream).</td></tr>
+    <tr><td><b>TFE Edge</b> (Twitter Front End)</td><td>1.2M reads/sec peak across regions needs TLS termination, anti-abuse filtering, and request shedding before the API GW; admission control during World Cup spike is the difference between graceful degradation and full outage.</td><td>Generic LB-only (no app-aware shedding), CDN-only (cannot terminate authenticated streaming), nginx-only (no integrated rate-limit backplane at this scale).</td></tr>
+    <tr><td><b>Hadoop</b> (cold tweet archive)</td><td>5-yr retention at 150 GB/day = 275 TB; only the last few days are hot. Hadoop on commodity disk gives us ≤$0.01/GB/month for the cold tail while Manhattan stays sized for the hot working set only.</td><td>All-Manhattan (10× cost), S3 (acceptable but Twitter built on Hadoop), tape archive (recovery latency unsuitable for user-timeline backfill).</td></tr>
+    <tr><td><b>Consistent hash</b> with virtual nodes</td><td>Hot Redis shards on top 0.01% celeb-list keys need to be replicated to N replicas without remapping the entire keyspace; virtual nodes give us cheap rebalancing when we add capacity for spike events.</td><td>Modulo hashing (every resize remaps everything, breaks cache during the worst possible moment), per-shard manual placement (operationally brittle).</td></tr>
+    <tr><td><b>Idempotent ZADD</b> (at-least-once semantics)</td><td>Kafka at-least-once + idempotent ZADD is dramatically simpler than exactly-once; duplicates collapse because the score (Snowflake ID) is identical, so retries during fanout-worker restarts cause no user-visible artifacts.</td><td>Exactly-once via two-phase commit (latency hit on every write), at-most-once (loses tweets on crash, breaks durability promise).</td></tr>
+    <tr><td><b>Mixer/Ranker</b> (light read-time ranking)</td><td>Heavy ranking on read explodes the 200 ms p99 budget; light reranking with offline-precomputed signals (engagement priors, author affinity) keeps the synchronous path cheap while still beating pure reverse-chronological.</td><td>Heavy DNN at read (blows latency), pure chronological (lower engagement), client-side ranking (cannot use server-only signals like global virality).</td></tr>
+  </tbody>
+</table>

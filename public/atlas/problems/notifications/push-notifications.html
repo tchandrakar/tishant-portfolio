@@ -1,0 +1,144 @@
+<h1>Design Push Notification System (APNs + FCM at 100M+ devices)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">notifications</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a push notification platform that fans out application messages to 100M+ mobile devices via Apple Push Notification service (APNs) and Firebase Cloud Messaging (FCM). The system must handle device registration, token rotation, per-app rate limits, priority classes (high/normal), payload templating, and tight feedback loops on undeliverable tokens. Latency target: from publisher API call to device wake-up under 2 s p95 for high-priority alerts.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Register/unregister device tokens keyed by (appId, userId, deviceId).</li>
+  <li>Send notification by userId, deviceId, topic, or segment (1..100M recipients).</li>
+  <li>Support APNs HTTP/2 and FCM HTTP v1; abstract provider choice from caller.</li>
+  <li>Templating with localization, badge counts, deep links, silent/data pushes.</li>
+  <li>Feedback ingestion: invalid token, unregistered, quota exceeded.</li>
+  <li>TTL, collapse keys, priority (high vs normal), per-tenant rate limits.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> publisher-to-provider under 500 ms p95; end-to-end under 2 s p95 for priority=high.</li>
+  <li><b>Scale:</b> 100M devices, 5B sends/day peak, 250k sends/sec sustained, 1M/sec burst.</li>
+  <li><b>Availability:</b> 99.95% — providers may be down, we must buffer.</li>
+  <li><b>Durability:</b> at-least-once for transactional pushes; best-effort for marketing.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 5B/86,400 ≈ 58k avg, peak 4x ≈ 232k sends/sec.</li>
+  <li>Token storage: 100M devices × 256 B (token + metadata) ≈ 25 GB hot, 100 GB with indexes.</li>
+  <li>Provider connections: APNs HTTP/2 supports ~1500 streams/conn; need 250k/1500 ≈ 170 conns × 4 regions.</li>
+  <li>Kafka throughput: 250k msgs/s × 1 KB = 250 MB/s; with RF=3 → 750 MB/s replicated.</li>
+  <li>Feedback: ~3% bounce rate → 7.5k events/sec into the token-invalidation pipeline.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/devices               {appId, userId, token, platform, locale}
+DELETE /v1/devices/{token}
+POST /v1/push/send              {audience, payload, priority, ttl, collapseKey}
+POST /v1/push/batch             {messages:[...]}              -> jobId
+GET  /v1/push/jobs/{jobId}                                    -> status, counts</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Publisher API]
+      |
+      v
+[Ingest GW] --> [Kafka: push.requests (32 partitions/region)]
+                          |
+                          v
+                 [Fanout Worker] --(lookup)--> [Token Store: Cassandra]
+                          |
+                          v
+                 [Kafka: push.dispatch (256 partitions, by deviceId)]
+                          |
+            +-------------+-------------+
+            v                           v
+      [APNs Sender Pool]         [FCM Sender Pool]
+       HTTP/2 long-lived           HTTP v1 long-lived
+            |                           |
+            v                           v
+        Apple APNs                Google FCM
+            |                           |
+            v                           v
+       [Feedback Topic] <-- [Feedback Collector] --> [Token GC]
+</div>
+<p>The ingest layer validates, deduplicates by idempotency key, and persists to Kafka. Fanout workers expand audiences (topic/segment) into per-device messages and re-shard onto a dispatch topic partitioned by deviceId so a single device’s messages stay ordered. Sender pools maintain warm HTTP/2 connections to providers and respect provider rate caps.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Token Store (Cassandra)</h3>
+<pre>CREATE TABLE devices_by_user (
+  app_id text, user_id text, device_id text,
+  token text, platform text, locale text,
+  app_version text, last_seen timestamp,
+  PRIMARY KEY ((app_id, user_id), device_id)
+);
+CREATE TABLE token_index (
+  token text PRIMARY KEY,
+  app_id text, user_id text, device_id text
+);</pre>
+<h3>7.2 Why Cassandra?</h3>
+<p>Wide-column store with linear write scaling, multi-DC replication, and TTL on rows for stale tokens. A user’s devices live on one partition for cheap fan-out by userId; <code>token_index</code> supports O(1) inverted lookup from feedback events.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Sender pool</h3>
+<p>Each sender holds N HTTP/2 connections to APNs/FCM. APNs allows ~1500 concurrent streams per connection; we run a token-bucket per (provider, app) and a circuit breaker that opens on >5% 5xx in a 10-second window. Backpressure propagates to Kafka via consumer-pause rather than dropping.</p>
+<h3>8.2 Idempotency &amp; ordering</h3>
+<p>The <code>idempotencyKey</code> + 5-minute Redis SETNX dedupes retries. Per-device ordering is achieved by hashing deviceId to a dispatch partition; APNs’s <code>collapse-id</code> further coalesces redundant alerts.</p>
+<h3>8.3 Feedback loop</h3>
+<p>APNs returns 410/Unregistered and FCM returns NotRegistered/InvalidRegistration. A feedback collector tails sender error streams and emits to <code>token.invalid</code>; the GC worker deletes from Cassandra after a 24-hour grace period to tolerate brief unsubscribes.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Audience expansion:</b> 1 message → 100M sends. Use a two-stage fanout: shard audience into 1000 chunks via a coordinator job, then per-shard workers.</li>
+  <li><b>Hot users:</b> celebrity tokens get duplicated across 50 devices; cap per-user fanout and async batch.</li>
+  <li><b>Provider rate limits:</b> APNs ~9000 streams/conn-set; horizontally add connection pools per region.</li>
+  <li><b>Storm protection:</b> per-tenant token bucket at the ingress prevents one app exhausting capacity.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Kafka per-deviceId partitioning</td><td>Strict per-device order</td><td>Hot partitions for power users</td></tr>
+<tr><td>At-least-once delivery</td><td>Simple, durable</td><td>Duplicates require client dedup via msgId</td></tr>
+<tr><td>Provider-specific senders</td><td>Optimal protocol use</td><td>More code paths, harder testing</td></tr>
+<tr><td>Cassandra token store</td><td>Linear scale, multi-DC</td><td>Eventual consistency; rare double-send</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-DC token replication for regional failover.</li>
+  <li>Ch. 6 Partitioning — hash-by-deviceId for dispatch ordering.</li>
+  <li>Ch. 11 Stream Processing — Kafka-based fanout and feedback ETL with at-least-once semantics and idempotent consumers.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with FCM-only single-region MVP and layer APNs + multi-region in iteration 2 because connection pool tuning dominates real-world latency."</li>
+  <li>"The hardest part is fanout for 100M-target campaigns without starving transactional traffic; my mitigation is priority lanes on separate Kafka clusters and weighted senders."</li>
+  <li>"Token GC must be conservative — deleting a still-valid token costs us a user. I’d use 24h grace + double-confirmation from the provider."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>APNs HTTP/2 (provider)</td><td>Apple's only supported path for iOS push; ~1500 concurrent streams per connection lets us serve 250k sends/sec with ~170 long-lived connections per region instead of 250k short-lived TCP handshakes that would saturate kernel sockets.</td><td>Legacy APNs binary protocol (deprecated by Apple); third-party relays (extra hop adds latency above the 2s p95 budget).</td></tr>
+<tr><td>FCM HTTP v1 (provider)</td><td>Mandatory for Android delivery; OAuth2-scoped tokens give per-app isolation across thousands of tenants, and JSON payloads simplify the renderer compared to the deprecated legacy XMPP path.</td><td>FCM legacy server keys (deprecated, single shared key); direct GCM (sunset).</td></tr>
+<tr><td>Apache Kafka (push.requests + push.dispatch)</td><td>250k msgs/sec at 1 KB = 250 MB/s replicated to 750 MB/s with RF=3 — Kafka's sequential-IO log handles this on commodity disks, and partition-by-deviceId preserves per-device ordering across 256 partitions.</td><td>RabbitMQ (per-message ack overhead caps near 50k/s/node); AWS SQS FIFO (300 msg/s/group ceiling kills 250k/s target).</td></tr>
+<tr><td>Cassandra (devices_by_user, token_index)</td><td>Linear-scale wide-column writes for 100M tokens; <code>PRIMARY KEY ((app_id, user_id), device_id)</code> co-locates a user's devices on one partition for cheap fan-out, and built-in TTL auto-expires stale tokens.</td><td>DynamoDB (item-size limits and cross-region cost); Postgres sharded (manual resharding pain at 100M rows).</td></tr>
+<tr><td>Redis (idempotency SETNX, token bucket)</td><td>SETNX with 5-minute TTL dedupes retries on the hot path under 1 ms — at 250k sends/sec we cannot afford a Cassandra round-trip per request just to check duplicates; per-tenant token buckets also need atomic INCR.</td><td>Memcached (no atomic SETNX-with-TTL semantics); in-process LRU (incoherent across fanout workers).</td></tr>
+<tr><td>HTTP/2 multiplexing (sender pool)</td><td>APNs caps at ~1500 streams per connection; HTTP/2 multiplexing is the only way to hit 250k sends/sec without thousands of TLS handshakes — each handshake is ~100 ms which would blow the 500 ms publisher-to-provider budget.</td><td>HTTP/1.1 (one request per connection ruins throughput); QUIC (not supported by APNs/FCM yet).</td></tr>
+<tr><td>Token bucket rate limiter (per-tenant)</td><td>Storm protection so one tenant's campaign cannot drain the 1M/sec burst capacity from transactional traffic; bucket state in Redis is shared across ingest replicas.</td><td>Leaky bucket (less burst-friendly for legitimate spikes); fixed window (boundary effects double the effective rate).</td></tr>
+<tr><td>Circuit breaker (sender → provider)</td><td>Opens on >5% 5xx in 10s windows so a regional APNs outage doesn't accumulate a 5B-msgs-deep backlog of doomed retries; pairs with consumer-pause backpressure into Kafka.</td><td>Pure exponential retry (amplifies provider outage by retry storms); fail-open (sends garbage to a known-down APN).</td></tr>
+<tr><td>Consistent hashing (deviceId → dispatch partition)</td><td>Hashing deviceId across 256 dispatch partitions distributes 250k/s evenly; keeps per-device ordering for collapse-id semantics so a user doesn't see "deleted" before "received".</td><td>Random partitioning (breaks ordering); modulo by userId (celebrity hot-key problem amplified).</td></tr>
+<tr><td>Two-stage fanout (coordinator + workers)</td><td>For 100M-target campaigns, a single fanout worker would take 400 seconds at 250k/sec; sharding the audience into 1000 chunks lets 1000 workers finish in &lt;1 s parallelism while sharing the same Kafka dispatch topic.</td><td>Single-stage fan-out (sequential bottleneck); pre-materialized per-segment topics (storage explosion for 50k tenants).</td></tr>
+<tr><td>Multi-DC Cassandra replication (NetworkTopologyStrategy)</td><td>100M tokens must survive a regional APNs outage redirected to another region; multi-DC RF=3 in each DC gives local-quorum reads at single-digit ms while tolerating a full DC loss.</td><td>Single-DC + nightly backup (RTO of hours violates 99.95%); cross-region Postgres logical replication (lag spikes break correctness).</td></tr>
+<tr><td>Feedback collector + token GC worker</td><td>~3% bounce rate at 250k/s = 7.5k invalid tokens/sec; a dedicated stream worker reading APNs 410 / FCM NotRegistered keeps the active token base clean and avoids wasting provider quota on dead devices.</td><td>Inline GC in sender (CPU contention with the hot path); periodic full scan (250 GB scan is too expensive daily).</td></tr>
+</tbody>
+</table>

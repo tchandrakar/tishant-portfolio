@@ -1,0 +1,186 @@
+<h1>Design Mixpanel / Amplitude Event Analytics (funnel + cohort)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">analytics</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a product-analytics SaaS where customers instrument their apps with an SDK that emits semi-structured user events (<code>signup</code>, <code>video_played</code>, <code>checkout</code>) with arbitrary properties. Product managers then run interactive funnel, cohort, retention, and segmentation queries over months of data. Mixpanel publicly handles tens of billions of events per day; Amplitude similarly. Queries must return in seconds despite scanning hundreds of billions of rows.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Ingest JSON events (5&ndash;50 properties each).</li>
+  <li>Funnel query: of users who did <code>view_landing</code>, how many later did <code>signup</code> within 7 days?</li>
+  <li>Cohort: weekly active users by acquisition channel.</li>
+  <li>Retention curve: D1/D7/D30 for any cohort definition.</li>
+  <li>Live "stream" of events for debug.</li>
+  <li>SDKs for web, iOS, Android, server.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Ingest:</b> 50B events/day (~580K eps), bursty 3&times; on launches.</li>
+  <li><b>Query latency:</b> p95 &lt; 5 s for 30-day funnels over 10B events.</li>
+  <li><b>Freshness:</b> events queryable within 60 s.</li>
+  <li><b>Retention:</b> 5 years hot.</li>
+  <li><b>Multi-tenancy:</b> 30K projects, hard isolation.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>50e9 events * 1 KB JSON = <b>50 TB/day raw</b>; ~5 TB/day after columnar Zstd compression.</li>
+  <li>Active users: 2B distinct user_ids/day &rarr; user-state KV ~ 200 GB.</li>
+  <li>Query workload: 10K analyst queries/min; each scans ~1B rows.</li>
+  <li>Shards: target 50 GB/shard &rarr; ~100 shards/project for the largest customers.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /track            { event, distinct_id, time, properties }
+POST /engage           { distinct_id, $set:{plan:"pro"} }      // user props
+POST /query/funnel     { steps:[...], window:"7d", segment:{} }
+POST /query/cohort     { definition, group_by:"acq_channel" }
+GET  /export?from=&amp;to= &rarr; signed S3 URL
+</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[SDK] -&gt; [Edge Collector] -&gt; [Kafka events.raw] --+--&gt; [Validator] --&gt; [Kafka events.clean]
+                                                  |
+                                                  +--&gt; [User-State Stream Joiner (Flink)]
+                                                                 |
+                                                                 v
+                                                       [Columnar Lake (Parquet on S3)]
+                                                                 |
+                                       [ClickHouse / Druid hot tier] &lt;-- bulk loader
+                                                 ^
+                                                 |
+                              [Query Engine] &lt;-- [API GW] &lt;-- [Web UI]
+</div>
+<p>The SDK batches events client-side, posts to the edge, which writes to Kafka. Stream processors enrich each event with the latest user-properties (a stream-table join — DDIA Ch. 11), partition by <code>(project_id, user_id)</code>, and write Parquet files to S3 every minute. A bulk loader ingests fresh files into a column store (ClickHouse) for sub-second analytics; older partitions are queried directly from S3 via a Trino-like engine.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Event row</h3>
+<pre>CREATE TABLE events (
+  project_id   UInt32,
+  event_date   Date,
+  user_id      String,
+  event_name   LowCardinality(String),
+  ts           DateTime64(3),
+  props        Map(String, String),
+  device_id    String,
+  session_id   UUID
+) ENGINE = MergeTree
+PARTITION BY (project_id, event_date)
+ORDER BY    (project_id, user_id, ts);</pre>
+<h3>7.2 Why ORDER BY user_id?</h3>
+<p>Funnels are user-centric: "did THIS user do step A then step B?" Co-locating a user's events on disk turns funnel evaluation into a sequential scan with O(events_per_user) memory, not a full table sort. This is the same insight as DDIA Ch. 3's clustered indexes.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Funnel evaluator</h3>
+<p>For each user, walk events in time order, advance a step pointer when the next required event matches and falls inside the conversion window. Emit <code>(user, max_step_reached)</code>. Aggregate. This is a stateful stream operator and runs in O(N) — DDIA Ch. 11 sessionization pattern.</p>
+<h3>8.2 Schema-on-read</h3>
+<p>Properties are stored as a Map; per-project a metadata service tracks observed keys for autocomplete. Hot keys are promoted to materialized columns nightly (DDIA Ch. 10 batch job) to skip JSON parsing.</p>
+<h3>8.3 Cohort retention</h3>
+<p>Pre-compute a daily bitmap (RoaringBitmap) per (project, event_name, day) of active user_ids. D7 retention = popcount(bitmap[D]  AND  bitmap[D+7]) / popcount(bitmap[D]). Bitmaps fit in &lt; 1 GB even for 100M-user products.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Schema explosion:</b> cap distinct property keys per project at 1000; reject the rest with a warning.</li>
+  <li><b>Skewed users:</b> a "test" user_id with 1B events kills the partition — detect and bucket-shard suffixed keys.</li>
+  <li><b>Late events:</b> mobile reconnects after 7 days — Flink uses event-time with 7d allowed lateness, then drops; reconciliation batch job repairs Parquet daily.</li>
+  <li><b>Query concurrency:</b> small per-tenant ClickHouse cluster + global query queue; expensive queries spill to Trino.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>ClickHouse hot + S3/Parquet cold</td><td>Cheap, scalable, fast recent</td><td>Two engines to operate</td></tr>
+<tr><td>ORDER BY user_id (clustered)</td><td>Funnel = sequential scan</td><td>Time-range pruning is weaker</td></tr>
+<tr><td>Schema-on-read (Map)</td><td>Customers add props freely</td><td>Type errors found at query time</td></tr>
+<tr><td>RoaringBitmaps for cohorts</td><td>O(1) set algebra</td><td>Bitmap maintenance batch job</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 11 Stream Processing</b> — sessionization, stream-table joins for user-property enrichment, event-time windowing with allowed lateness, watermarks for late mobile events.</li>
+  <li><b>Ch. 10 Batch Processing</b> — nightly Parquet compaction, hot-key promotion, bitmap rebuilds, Trino-on-S3 federated batch queries.</li>
+  <li><b>Ch. 3 Storage &amp; Retrieval</b> — column-stores, sort-key clustering, LSM compaction (MergeTree).</li>
+  <li><b>Ch. 4 Encoding</b> — schema-on-read pros/cons captured in our Map vs. promoted-column trade-off.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Funnel queries are the single most important workload, so I clustered on user_id even though it hurts time-range scans — design follows the dominant query."</li>
+  <li>"I'd ship with schema-on-read because customers will rebel against rigid schemas; we promote hot keys nightly."</li>
+  <li>"The trickiest bug at scale is late-arriving mobile events; I'd reserve a daily reconciliation batch job from day 1."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>ClickHouse for interactive analytics</td>
+      <td>Funnel and cohort queries scan 50B events/day across 100s of properties. ClickHouse's columnar MergeTree with vectorized execution returns 30-day funnels in &lt;2 s p95; a row store would take minutes and saturate IO at this scale.</td>
+      <td>Postgres (row store, OOM at 1B rows); Druid (weaker JOINs for funnel); Snowflake (10&times; cost, slower point-queries)</td>
+    </tr>
+    <tr>
+      <td>Parquet on S3 for cold/historical tier</td>
+      <td>Past 90 days of events (~5 PB) is queried weekly, not interactively. Parquet's columnar layout + Snappy compression yields 8&times; size reduction over JSON; partition pruning by date lets ad-hoc Spark jobs read only the relevant slice instead of the full 5 PB.</td>
+      <td>ORC (smaller ecosystem); JSON.gz (no column pruning); Avro (row-oriented, slow scans)</td>
+    </tr>
+    <tr>
+      <td>ORDER BY (user_id, event_time) clustering in ClickHouse</td>
+      <td>Funnel queries are the dominant workload &mdash; 60% of all queries pull "all events for user X". Clustering on user_id lets the engine read each user's events as a contiguous run, turning a fan-out scan into a single sequential read.</td>
+      <td>ORDER BY (event_time) (kills funnel perf); no clustering (10&times; slower point lookup)</td>
+    </tr>
+    <tr>
+      <td>Schema-on-read with promoted hot keys</td>
+      <td>Customers send unpredictable JSON properties; a rigid schema would block onboarding. Storing the raw JSON blob plus nightly-promoted top-50 properties as typed columns gives schema-on-write performance for hot paths and schema-on-read flexibility for the long tail.</td>
+      <td>Strict schema (slow customer onboarding); pure schema-on-read (10&times; slower queries)</td>
+    </tr>
+    <tr>
+      <td>Kafka as the durable event log</td>
+      <td>50B events/day = 580K events/sec average, 5M peak. Kafka decouples ingest from ClickHouse, lets the warehouse fall behind safely during compaction, and feeds independent consumers (real-time alerting, ML feature store, audit archive) from one source of truth.</td>
+      <td>Kinesis (lower per-partition throughput); RabbitMQ (no replay for backfills)</td>
+    </tr>
+    <tr>
+      <td>Flink for streaming sessionization &amp; real-time funnels</td>
+      <td>Customers expect today's data in dashboards within minutes. Flink's event-time windows + watermarks correctly sessionize at 5M events/sec with exactly-once semantics; Spark micro-batch would add 30-60 s of dashboard staleness.</td>
+      <td>Spark Streaming (micro-batch, weaker event-time); Kafka Streams (no large state)</td>
+    </tr>
+    <tr>
+      <td>Spark on S3 for nightly batch reconciliation (Lambda arch)</td>
+      <td>Late-arriving mobile events (up to 7 days late) silently break streaming aggregates. A nightly Spark job over immutable Parquet recomputes "true" daily counts; product analysts demand reproducible numbers across definition changes &mdash; that needs batch-on-immutable-input.</td>
+      <td>Streaming-only (Kappa) (no reconciliation for late events); Hive (10&times; slower than Spark)</td>
+    </tr>
+    <tr>
+      <td>RoaringBitmap for cohort/funnel user sets</td>
+      <td>Retention queries intersect "users who did X on day 0" with "users who returned on day N" &mdash; sets of 10M-100M user IDs. Roaring stores these in 100 MB and intersects in milliseconds via popcount; without bitmaps a JOIN approach is O(N&times;M) and times out.</td>
+      <td>JOIN on user_id (slow at 100M users); HyperLogLog (no exact intersection)</td>
+    </tr>
+    <tr>
+      <td>HyperLogLog sketches for cardinality (DAU/MAU)</td>
+      <td>"Unique users in last 30d" across 50B events at 1% accuracy fits in 16 KB per cohort; merging is associative so we precompute per-day sketches and union at query time, returning sub-second instead of scanning 1.5T events.</td>
+      <td>COUNT(DISTINCT) (full scan); Theta sketches (heavier, marginal accuracy gain)</td>
+    </tr>
+    <tr>
+      <td>Schema registry (Confluent / Avro)</td>
+      <td>50+ producer teams emit events; without a schema contract a single bad rename breaks every consumer. Centralized schema registry with backward-compat checks prevents the "broken pipeline at 3 AM" failure mode that costs analyst-hours.</td>
+      <td>Free-form JSON (no contracts); Protobuf without registry (no compat enforcement)</td>
+    </tr>
+    <tr>
+      <td>Materialized views for top-N dashboards</td>
+      <td>The top 20 dashboards account for 80% of query load. ClickHouse materialized views maintain pre-aggregated daily/hourly rollups so dashboard refresh stays &lt;200 ms even as raw event volume grows; without them the same query would scan billions of rows every refresh.</td>
+      <td>Query-time aggregation (slow); separate Druid cube (extra system to operate)</td>
+    </tr>
+    <tr>
+      <td>Iceberg/Hive table format for the data lake</td>
+      <td>Schema evolution and partition compaction over 5 PB of Parquet must be transactional &mdash; otherwise readers see half-written partitions. Iceberg's snapshot isolation gives ACID over S3 so daily reconciliation jobs can rewrite without blocking analyst queries.</td>
+      <td>Plain Parquet directories (no atomicity); Delta Lake (good alt, weaker multi-engine)</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,204 @@
+<h1>Design Live Polling / Voting at Scale (1M+ votes/sec, real-time aggregation)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">misc</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a real-time polling system used during live TV (e.g., Eurovision, IPL fan-poll) and global product surveys. Tens of millions of viewers cast votes during a 30-minute window with peaks above 1 M votes/sec. Aggregate counts must update on screen within 2 seconds, votes must be one-per-user (or N-per-user with rate limit), bot-and-fraud flagged, and final tallies auditable.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Cast a vote for option O on poll P.</li>
+  <li>Real-time aggregate (per option, optionally per region/age bucket).</li>
+  <li>Per-user vote rules: one-and-only-one, or N-per-window.</li>
+  <li>Live leaderboard for multi-option polls (top-K options by votes).</li>
+  <li>Auditable final tally with signed Merkle root.</li>
+  <li>Fraud detection: bot rings, geographic anomalies, mass-vote scripts.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> ack &lt; 200 ms p99; aggregate visible &lt; 2 s p99.</li>
+  <li><b>Scale:</b> 1.5 M votes/sec peak, 30 min event window, 100 M total votes.</li>
+  <li><b>Durability:</b> zero vote loss after ack; survive AZ failure.</li>
+  <li><b>Integrity:</b> tamper-evident final tally signed by 3 independent attesters.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>1.5 M votes/sec × 256 B = 400 MB/s ingress; Kafka 1024 partitions × ~400 KB/s/partition.</li>
+  <li>If aggregator is single-counter per option × 10 options = 1.5 M increments/s on 10 keys ⇒ classic hot key. Solution below.</li>
+  <li>Per-region rollups: 200 regions × 10 options × 4 buckets = 8K counters ⇒ trivial after sharding.</li>
+  <li>Storage: 100 M votes × 200 B = 20 GB raw events; Cassandra retains 1 yr.</li>
+  <li>Bandwidth: 30 min × 1.5 M × 256 B = 720 GB total event volume.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/polls/{id}/vote   {option, idempotencyKey}   → {accepted, voteId}
+GET  /v1/polls/{id}/live                                → {totals:{A:..,B:..}, ts}
+GET  /v1/polls/{id}/final                               → {totals, merkleRoot, signers}
+WS   /v1/polls/{id}/stream                              → push aggregate every 1 s</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App]──HTTPS──►[Edge GW]──►[Vote Ingest (stateless)]──►[Kafka: votes (1024 parts)]
+       │                          │
+       │                          ▼
+       │                   [Idempotency Cache (Redis)]
+       │
+       ▼
+[Anti-fraud: rate limit + JWT + device attest]
+
+[Kafka: votes]──►[Flink Pre-Agg (per-partition local count)]──►[Kafka: agg-deltas]
+                                                                   │
+                                                                   ▼
+                                                         [Flink Global Agg]──►[Redis Live Counters]
+                                                                   │                    │
+                                                                   ▼                    ▼
+                                                       [Cassandra: vote_log]   [WS Fanout]
+                                                                   │
+                                                                   ▼
+                                                        [Audit + Merkle builder]
+</div>
+<p>Votes append to Kafka; per-partition local counters pre-aggregate (combiner pattern), emit deltas every 200 ms; global aggregator merges into Redis counters; WS fanout pushes 1 Hz updates to all viewers.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Vote log (Cassandra)</h3>
+<pre>CREATE TABLE votes (
+  poll_id UUID, ts_bucket BIGINT, vote_id timeuuid,
+  user_id BIGINT, option SMALLINT, region TEXT,
+  device_attestation TEXT,
+  PRIMARY KEY ((poll_id, ts_bucket), vote_id)
+);</pre>
+<h3>7.2 Live counters (Redis)</h3>
+<p><code>INCRBY poll:{id}:opt:{o}:s{shard} 1</code>; 64 shards per option to dodge hot key. Read-side sums all shards every 1 s and caches.</p>
+<h3>7.3 Idempotency (Redis)</h3>
+<p><code>SET dedup:{userId}:{pollId} 1 NX EX 86400</code>: returns OK only on first call. Reject 429 otherwise (and don't write to Kafka).</p>
+<h3>7.4 Audit Merkle tree</h3>
+<p>Each minute, Cassandra reader scans the minute's votes, computes a Merkle root, signs with HSM. Final root = root over per-minute roots, co-signed by 3 attesters at poll close.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Hot-counter elimination via sharded INCR</h3>
+<p>Even Redis flinches at 150 K INCR/s on one key. We shard each option counter into 64 keys; ingest writes to a random shard, reader sums shards (64 GETs ~ 0.5 ms pipelined). This is the same pattern as Cassandra counter-shards.</p>
+<h3>8.2 Combiner pre-aggregation</h3>
+<p>Flink per-partition operator buffers counts in memory, emits delta-snapshots every 200 ms (~5 events/s instead of 1.5 M). Global aggregator handles ~5 K events/s — trivial. This is DDIA Ch. 11's "stream-stream join with windowed reduce" pattern.</p>
+<h3>8.3 Approximate live, exact final</h3>
+<p>Live UI shows the Redis-derived count, accepting up to 2 s lag; final tally is recomputed from Cassandra <code>vote_log</code> after dedup and fraud removal. Discrepancy displayed with a "preliminary results" banner during the window.</p>
+<h3>8.4 Fraud detection</h3>
+<p>Online: per-IP rate limit (10/min), device-attestation token, suspicious-UA list. Offline: count-min sketch tracks per-user vote frequency; HLL counts unique users per option per region — a sudden HLL/total-vote ratio drop indicates botting (1M votes from 100 users). Suspicious votes are kept in Cassandra but excluded from final tally.</p>
+<h3>8.5 Backpressure &amp; load shedding</h3>
+<p>If Kafka ingress lag exceeds 5 s, Vote Ingest sheds: 5xx + Retry-After to non-priority cohorts (clients in regions already heavily over-quota). This preserves global representativeness during overload.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot Kafka partition (one option):</b> partition by <code>hash(userId)</code>, not <code>option</code>; combiners do per-option counting locally.</li>
+  <li><b>Idempotency Redis hot key:</b> dedup key includes <code>userId</code>, naturally distributed.</li>
+  <li><b>WS fanout to 30 M viewers:</b> SSE-over-CDN with shared aggregate snapshot every 1 s — only 86 KB/s aggregate egress at origin (one snapshot per second × ~64 KB).</li>
+  <li><b>Audit replay:</b> Cassandra full scan of 100 M rows runs in 10–15 min on parallel readers; runs once after poll close.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Sharded INCR (64 shards)</td><td>Removes hot key</td><td>Read-side scatter-gather</td></tr>
+<tr><td>Combiner pre-agg</td><td>Drops downstream load 100K×</td><td>Aggregate lag bounded by emit interval (200 ms)</td></tr>
+<tr><td>Live ≠ Final</td><td>Snappy UI, accurate tally</td><td>UX must show "preliminary"</td></tr>
+<tr><td>Cassandra append-only log</td><td>Auditable, fast writes</td><td>Replay cost on final tally</td></tr>
+<tr><td>Per-IP rate limit at edge</td><td>Cheap fraud blocker</td><td>NAT'd users (offices, schools) may share IP</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — Kafka log + Flink windowed aggregation; combiner pattern; exactly-once via idempotent producer + dedup key.</li>
+  <li>Ch. 9 Consistency — final tally requires a strict serialization point (poll close timestamp); we use Kafka offset as the cut.</li>
+  <li>Ch. 5 Replication — Cassandra LOCAL_QUORUM keeps the audit log durable across AZs.</li>
+  <li>Sketch data structures — count-min sketch for per-user vote frequency, HyperLogLog for unique-voter counts, Bloom filters for fast "have we seen this idempotency key?" check before Redis hit.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The interesting subproblem isn't ingestion — Kafka eats 1.5 M/sec for breakfast — it's the single hot counter. Sharding INCR is the move."</li>
+  <li>"Live and final must be different views of the same log. Confusing them is how you ship a tally that mismatches what people saw on screen."</li>
+  <li>"Bot votes are 80% of operational pain. I'd budget 30% of design effort on attestation + offline anomaly scoring, not just the happy path."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Apache Kafka (1024 partitions)</td>
+      <td>1.5 M votes/s × 256 B = 400 MB/s ingress; 1024 partitions hold per-partition rate at ~400 KB/s with comfortable headroom for the 30-min event; partition by <code>userId</code> (not option) avoids the catastrophic single-option hotspot during a polarised vote.</td>
+      <td>Kinesis (rejected: shard rebalance painful at 1.5 M/s), RabbitMQ (rejected: not partition-scalable).</td>
+    </tr>
+    <tr>
+      <td>Sharded Redis INCRBY (64 shards/option)</td>
+      <td>Single Redis key flinches at 150 K INCR/s; 64 shards per option drop per-key load to ~2.3 K/s — well within sub-ms territory; reader sums shards via 64 GETs pipelined in 0.5 ms, total scatter-gather still &lt;5 ms.</td>
+      <td>Single counter (rejected: hot-key meltdown), Cassandra counters (rejected: 4× write cost via Paxos).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink (combiner pre-agg)</td>
+      <td>Per-partition local counters emit 200 ms delta-snapshots — DDIA Ch. 11's combiner pattern; reduces 1.5 M events/s to ~5 K/s downstream, making the global aggregator trivial and capping aggregate visibility lag at 200 ms (well under the 2 s SLA).</td>
+      <td>Direct write to global counter (rejected: hot key), Spark Streaming (rejected: micro-batch lag).</td>
+    </tr>
+    <tr>
+      <td>Redis SETNX + 24h TTL (idempotency)</td>
+      <td><code>SET dedup:{userId}:{pollId} 1 NX EX 86400</code> returns OK only on first call, atomically — keys naturally distributed by userId (no hot key), and 24h TTL covers the entire poll lifetime plus retries without unbounded RAM growth.</td>
+      <td>Database UNIQUE (rejected: hot row contention), client-side guard (rejected: trivially bypassed).</td>
+    </tr>
+    <tr>
+      <td>Cassandra (vote audit log)</td>
+      <td>100 M votes × 200 B = 20 GB per event, append-only with 1-yr retention; partition <code>(poll_id, ts_bucket)</code> with timeuuid clustering keeps partitions under ~1 GB; LSM trees swallow 1.5 M writes/sec across the cluster easily.</td>
+      <td>Postgres (rejected: vacuum cost), DynamoDB (rejected: write-unit cost at 100 M votes).</td>
+    </tr>
+    <tr>
+      <td>Count-min sketch (per-user vote frequency)</td>
+      <td>Tracking exact per-user vote counts across 30 M users would cost gigabytes; CMS in &lt;5 MB flags users hitting unusual rates (e.g., 100 votes/min), feeding the offline fraud-removal pass before final tally.</td>
+      <td>Per-user counters (rejected: GB memory), sampling (rejected: misses small bot rings).</td>
+    </tr>
+    <tr>
+      <td>HyperLogLog (unique voters per option)</td>
+      <td>Detects bot rings by HLL/total-vote ratio — 1 M votes from only 100 unique users is the signal; 12 KB per option per region gives 0.81% error vs storing 30 M userIds, critical at 1.5 M votes/s ingest.</td>
+      <td>Redis SETs of userIds (rejected: GBs of memory), no signal (rejected: leaves bot detection blind).</td>
+    </tr>
+    <tr>
+      <td>Bloom filter (idempotency pre-check)</td>
+      <td>Cheap "have we seen this idempotency key?" filter sits in front of Redis SETNX — kills round-trip on duplicates from retry storms; with 1% false-positive rate the worst case is a redundant Redis call, no correctness risk.</td>
+      <td>Direct Redis call (rejected: round-trip on every retry), perfect dedup (rejected: cost-prohibitive in path).</td>
+    </tr>
+    <tr>
+      <td>Merkle tree + HSM signing</td>
+      <td>Per-minute Merkle root over the minute's votes signed by HSM, final root co-signed by 3 attesters — gives tamper-evident integrity for the final tally; 100 M leaf hashes computable offline in &lt;15 min on parallel readers.</td>
+      <td>Append-only log only (rejected: no integrity proof), full blockchain (rejected: massive overkill for 30-min event).</td>
+    </tr>
+    <tr>
+      <td>SSE over CDN (WS fanout)</td>
+      <td>30 M viewers × 1 Hz aggregate = unmanageable WS fan-out at origin; SSE-over-CDN serves a 64 KB shared snapshot every 1 s — origin egress drops to ~64 KB/s while every viewer sees fresh totals within 1 s of refresh.</td>
+      <td>WebSockets per-viewer (rejected: 30 M connections), polling (rejected: 30 M GET/s thundering herd).</td>
+    </tr>
+    <tr>
+      <td>JWT + device attestation</td>
+      <td>Vote ingest validates a short-lived JWT minted at app launch plus device-attestation token (Play Integrity / DeviceCheck) — kills the trivial scripted-vote attacker before they ever reach Kafka, and the per-IP rate limit handles the residue.</td>
+      <td>Captcha (rejected: friction), no edge auth (rejected: bot floor unbounded).</td>
+    </tr>
+    <tr>
+      <td>Token bucket rate limit (edge)</td>
+      <td>Per-IP 10 votes/min at edge gateway sheds the bulk of script-driven traffic before it consumes Kafka partitions; combined with backpressure shedding when Kafka lag &gt;5 s, preserves global representativeness during 1.5 M/s overload.</td>
+      <td>No edge limit (rejected: Kafka saturates), per-user only (rejected: anonymous abuse path open).</td>
+    </tr>
+    <tr>
+      <td>Monotonic clock cut (poll close)</td>
+      <td>Final tally requires a strict serialization point — Kafka offset at the close instant defines the cut, not wall-clock; consumers read up-to-offset and stop, eliminating any "did this vote sneak in 50 ms late?" ambiguity that could invalidate the audit.</td>
+      <td>Wall clock cut (rejected: NTP skew across consumers), no cut (rejected: tally drift).</td>
+    </tr>
+    <tr>
+      <td>Cassandra LOCAL_QUORUM</td>
+      <td>2-of-3 replica acks per write keeps audit-log durable across AZs without paying cross-region latency; survives single-AZ failure with zero vote loss after ack — directly hits the durability NFR for the live broadcast event.</td>
+      <td>EACH_QUORUM (rejected: 100 ms cross-region per write), ONE (rejected: data loss on replica crash).</td>
+    </tr>
+  </tbody>
+</table>

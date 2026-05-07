@@ -1,0 +1,85 @@
+<h1>Backpressure & flow control</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">backpressure</span>
+  <span class="tag">flow-control</span>
+  <span class="tag">resilience</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Every multi-stage system has a slowest stage. <b>Backpressure</b> is the discipline of letting that slow stage <i>tell upstream to slow down</i> instead of silently dropping work, blowing up memory, or cascading timeouts. Flow control is the implementation: bounded queues, credit-based flow, blocking sends, or explicit "pause/resume" signals. Without backpressure, a 100x burst at the front turns into unbounded queue growth, GC death spirals, and a half-finished mess when the system finally falls over.</p>
+
+<h2>Why it matters</h2>
+<p>Most "the system fell over under load" outages are backpressure failures, not throughput failures. The system kept accepting work it could not finish. Latency exploded, queues grew, retries multiplied, and what started as a 2x spike became a 20x meltdown. Designing backpressure in from day one is one of the highest-leverage habits in distributed systems.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>TCP:</b> The classic. Receive window tells the sender how many bytes it can have in flight. No window, no send. Backpressure baked into the wire.</li>
+  <li><b>Kafka consumers:</b> Consumer pulls; broker never pushes faster than the consumer asks. Built-in backpressure.</li>
+  <li><b>gRPC streaming:</b> Flow-control credits per stream; matches HTTP/2 framing.</li>
+  <li><b>Reactive Streams (RxJava, Project Reactor, Akka Streams):</b> The <code>request(n)</code> protocol — subscriber asks for N items, publisher sends at most N.</li>
+  <li><b>Node.js streams:</b> <code>writable.write()</code> returns false when the buffer is full; you're expected to wait for <code>'drain'</code>.</li>
+  <li><b>BBR / congestion control:</b> Datacenter networks (Google, Meta) use bandwidth-delay-product probing for backpressure across the fabric.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">PUSH (no backpressure)
+  Producer --burst--> [ unbounded queue ] --> Consumer (slow)
+                       ^^^ memory grows forever, GC stalls, OOM
+
+PULL (backpressure)
+  Producer  <--- "give me 100" --- Consumer
+            ---  100 items   ---->
+                                   processes 100, asks for 100 more
+                                   if slow, asks slowly. Producer naturally blocks.
+
+CREDIT-BASED
+  Sender has C credits. Sends 1 -> credit-=1.
+  Receiver processes, returns credit. Sender refills.
+  If C reaches 0, sender stops. Bounded memory by construction.
+</div>
+<p>The unifying principle: somewhere in the pipeline there must be a <i>finite</i> resource (window, credits, queue slots) that the slow stage controls. When it runs out, upstream stops. There is no other way — every alternative (drop, OOM, retry storm) is failure.</p>
+
+<h2>Strategies</h2>
+<ul>
+  <li><b>Bounded queues:</b> The simplest, most powerful tool. Pick a size; when full, blocking-put forces upstream to wait. Magic number: bounded = backpressure; unbounded = ticking bomb.</li>
+  <li><b>Pull-based consumption:</b> Consumer asks for work. Trivially backpressured. Kafka, SQS long-poll, request-driven workers.</li>
+  <li><b>Credit-based flow:</b> Receiver grants N credits; sender sends at most N. Decoupled and works across async boundaries (HTTP/2, AMQP, RSocket).</li>
+  <li><b>Token bucket at ingress:</b> Bound the rate at which work enters the system. Doesn't help mid-pipeline pressure, but prevents pathological floods.</li>
+  <li><b>Load shedding:</b> When backpressure hits the front door, return 429/503 fast. Better to tell 10% of users "try again" than melt for everyone.</li>
+  <li><b>Adaptive concurrency limits:</b> Netflix's concurrency-limits library: dynamically adjust max-in-flight based on observed latency (Little's Law). Self-tuning backpressure.</li>
+  <li><b>Backpressure all the way to the client:</b> The browser, mobile app, or upstream service must see the slowdown. If you absorb it silently in a queue, the symptom moves but doesn't disappear.</li>
+</ul>
+
+<h2>Anti-patterns and failure modes</h2>
+<ul>
+  <li><b>Unbounded in-memory queue:</b> "Java's <code>LinkedBlockingQueue</code>" with no capacity. Looks fine in load test, OOMs in production. Always set a bound.</li>
+  <li><b>Async fire-and-forget without bound:</b> <code>executor.submit(...)</code> in a loop, no limit on pending tasks. Memory grows; latency follows.</li>
+  <li><b>Retry storms:</b> Slow service returns timeouts. Caller retries 3x. Now the slow service has 4x the load. Now it's even slower. Use deadlines + jittered exponential backoff + circuit breakers; never retry on a deadline-exceeded.</li>
+  <li><b>Backpressure that hides:</b> Service A blocks because B is slow, but A's clients see only "everything is fine, just slow." Healthchecks pass; you're degraded but invisible. Surface queue depth, in-flight count, and saturation as first-class metrics.</li>
+  <li><b>"We'll just add a Kafka in front":</b> A queue in front of an overloaded service hides the problem until the queue fills disk. You bought time, not capacity. Ship a plan to drain or scale, not just a buffer.</li>
+  <li><b>Head-of-line blocking on a slow consumer:</b> One slow consumer in a multi-tenant pipeline halts the entire stream. Use per-tenant partitions or bulkheads.</li>
+  <li><b>Mismatched timeouts:</b> Client timeout 1s, server timeout 30s. Client retries while server is still working. Always nest timeouts: caller &lt; callee.</li>
+  <li><b>Queue length as the only signal:</b> A short queue can still mean disaster if items are huge or processing is degraded. Watch latency and saturation, not just depth.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Treating backpressure as an optimization rather than a correctness property. It's correctness — without it, the system has no defined behavior under overload.</li>
+  <li>Adding caches and queues to "absorb spikes" without bounding them. You've moved the failure, not prevented it.</li>
+  <li>Forgetting to surface backpressure in API contracts. If a client can't tell that you're saturated, they retry, making it worse.</li>
+  <li>Confusing rate-limiting with backpressure. Rate limits cap input; backpressure responds to actual capacity. You typically need both.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're building an image-processing pipeline: HTTP upload &rarr; queue &rarr; resize worker &rarr; ML tagger &rarr; persistent store. The ML tagger uses a GPU and processes 50 images/sec. Uploads can spike to 5,000/sec. Where do you place backpressure, what does the user see during a spike, and how do you keep the GPU pegged at 100% without head-of-line blocking small users behind one user's 10,000-image upload?
+  <br/>
+  <b>Hint:</b> The slowest stage owns the truth. Walk backward from the GPU. What does it tell upstream? What does upstream tell the HTTP layer? What does the HTTP layer tell the user — synchronously, asynchronously, or both?
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-rate-limiter">Design a rate limiter</a> — ingress-side flow control complements internal backpressure.</li>
+  <li><a href="#problem/design-distributed-counter">Design a distributed counter</a> — write coalescing as a backpressure mechanism.</li>
+</ul>

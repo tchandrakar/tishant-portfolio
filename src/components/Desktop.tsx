@@ -6,6 +6,7 @@ import {
   Cpu,
   Mail,
   FileText,
+  Library,
 } from 'lucide-react';
 
 const DESKTOP_ICONS = [
@@ -14,6 +15,7 @@ const DESKTOP_ICONS = [
   { id: 'about', label: 'About Me', Icon: User },
   { id: 'projects', label: 'Projects', Icon: Globe },
   { id: 'skills', label: 'Skills', Icon: Cpu },
+  { id: 'atlas', label: 'Atlas', Icon: Library },
   { id: 'contact', label: 'Contact', Icon: Mail },
   { id: 'resume', label: 'Resume', Icon: FileText },
 ];

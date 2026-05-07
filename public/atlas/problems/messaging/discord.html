@@ -1,0 +1,147 @@
+<h1>Design Discord (low-latency voice + text + servers)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">messaging</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">audio-streaming</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design Discord: a chat platform where "guilds" (servers) host text channels, voice channels, and screen-share / video channels. Real Discord serves ~200M MAU and ~14M concurrent users at peak, with per-guild member counts up to 250k+ and voice channels of up to ~99 simultaneous speakers. The design must couple cheap durable text storage with a hard-realtime voice pipeline (UDP, jitter buffers, SFU).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Guilds (servers) with channels: text, voice, video/screen-share, threads, stage.</li>
+  <li>Real-time text with reactions, replies, edits, embeds.</li>
+  <li>Voice channels with 99-user cap, push-to-talk, low-latency mute/deafen.</li>
+  <li>Video / screen-share with up to ~25 active streams per channel.</li>
+  <li>Roles, permissions, mentions; presence and typing.</li>
+  <li>Direct messages and group DMs (up to 10).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Voice latency:</b> p99 mouth-to-ear under 150 ms.</li>
+  <li><b>Text latency:</b> p99 send-to-receive under 300 ms.</li>
+  <li><b>Scale:</b> 14M concurrent, 4B msgs/day, 1M concurrent voice users.</li>
+  <li><b>Availability:</b> 99.95% chat; voice region-isolated to limit blast radius.</li>
+  <li><b>Cost:</b> commodity hardware; voice priced in cents/user/month.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Text QPS: 4B/day ≈ 46k/sec avg, peak 150k/sec.</li>
+  <li>Sockets: 14M concurrent WSS at 100k/box ⇒ 140 gateway boxes.</li>
+  <li>Voice: 1M concurrent at ~32 kbps Opus = 32 Gbps upstream; SFU fan-out ratio ~15x (avg listeners per speaker) ≈ 480 Gbps egress.</li>
+  <li>Storage: 4B msgs/day * 1 KB ≈ 4 TB/day raw; ~5 PB/year.</li>
+  <li>Cassandra cluster: tens of thousands of nodes (Discord publicly reports ~177 nodes for messages historically, growing with ScyllaDB migration).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Gateway WSS (text + presence)
+IDENTIFY {token, intents}                → READY {sessionId, guilds[]}
+MESSAGE_CREATE {channelId, content}      → broadcast
+TYPING_START   {channelId}
+PRESENCE_UPDATE {status, activities[]}
+
+// Voice signaling (separate WSS)
+VOICE_STATE_UPDATE {guildId, channelId} → server returns voiceServer endpoint
+VOICE_SERVER_UPDATE {endpoint, token}
+// Then UDP/RTP to media server (SFU):
+RTP packets, opus payload, SSRC per speaker</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──WSS──[Gateway]──[Session Cache]──[Guild Service]
+   │                                          │
+   │                                  [ScyllaDB messages]
+   │                                          │
+   │                                       [Redis presence]
+   │
+   └──UDP/RTP──[Voice Edge / SFU]──[Voice Coordinator]
+                    (region pinned)
+</div>
+<p>Walk-through: client connects to a regional Gateway WSS; gateway joins the user to all their guild channels via a fan-out bus. Text messages persist to ScyllaDB and broadcast over Redis pub/sub to all gateways holding members of that channel. Voice is bootstrapped by the gateway returning a voice-edge endpoint; client opens a UDP/RTP session to that SFU, which forwards packets to the other speakers/listeners in the channel.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Messages (ScyllaDB / Cassandra)</h3>
+<pre>CREATE TABLE messages (
+  channel_id BIGINT,
+  bucket     INT,           -- 10-day buckets
+  message_id BIGINT,        -- snowflake
+  author_id  BIGINT,
+  content    TEXT,
+  PRIMARY KEY ((channel_id, bucket), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);</pre>
+<h3>7.2 Why ScyllaDB?</h3>
+<p>Discord migrated from Cassandra to ScyllaDB primarily for tail-latency: GC pauses on JVM Cassandra caused p99 spikes that user-perceptible chat traffic could not tolerate. ScyllaDB (C++, shard-per-core) delivers consistent low p99. Bucketing by 10-day windows prevents unbounded partitions on hot channels.</p>
+<h3>7.3 Guild metadata (Postgres)</h3>
+<pre>guilds(id, name, owner_id, region, ...)
+roles(id, guild_id, name, permissions BIGINT)
+members(guild_id, user_id, roles JSONB, joined_at)</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Gateway</h3>
+<p>Elixir/BEAM-based; one process per session. Subscribes to Redis pub/sub channels per guild and per DM. On reconnect, replays missed events from a per-session ring buffer keyed by sequence number — clients send last-seen seq to resume.</p>
+<h3>8.2 Voice SFU (Selective Forwarding Unit)</h3>
+<p>WebRTC-based, but Discord built a custom Rust SFU. Each speaker uploads one Opus stream; SFU forwards that single stream to N listeners — no transcoding, no mixing. For video, SVC (scalable video coding) layers let listeners on bad networks pull a lower-bitrate substream from the same upload.</p>
+<h3>8.3 Voice region affinity</h3>
+<p>Each guild picks a region; voice edge servers are pinned to that region. Cross-region calls degrade gracefully via inter-region relays. UDP NAT punching first, TURN fallback for symmetric NATs.</p>
+<h3>8.4 Permissions</h3>
+<p>Guild roles encode a 64-bit permission bitfield. Channel-level overrides stored as (channel_id, role_id, allow, deny). On every action, server computes effective permission = base ∪ role grants − denies. Cached per (user, channel) in Redis with invalidation on role change.</p>
+<h3>8.5 Fan-out for huge guilds</h3>
+<p>A 250k-member guild can't push presence to every member. Discord uses "lazy guilds": a member only receives presence updates for users currently visible (member list scrolled into view, or in the same voice channel). This caps fan-out at the visible window (~100 users) regardless of guild size.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot channel partition:</b> a 1M-message-per-day channel breaks Cassandra; bucketed partition key (channel, 10-day-bucket) keeps each partition under ~1M rows.</li>
+  <li><b>Presence storms:</b> at game launch, millions update presence; lazy guild + Redis pipelines + coalesce updates into 5s windows.</li>
+  <li><b>Voice SFU CPU:</b> packet forwarding is cheap; congestion control (TWCC) and packet pacing are the real cost. Use kernel-bypass (DPDK / io_uring) at scale.</li>
+  <li><b>Video bandwidth:</b> uplink from a screen-sharer at 8 Mbps × 25 listeners = 200 Mbps egress; SVC + simulcast lets listeners subscribe to a 500 Kbps layer.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>SFU vs MCU</td><td>Cheap, no transcoding</td><td>Client decodes N streams</td></tr>
+<tr><td>UDP/RTP for voice</td><td>Low latency, packet loss tolerated</td><td>Firewall traversal pain</td></tr>
+<tr><td>ScyllaDB for messages</td><td>Tight p99, high write throughput</td><td>Smaller ecosystem than Cassandra</td></tr>
+<tr><td>Lazy guilds</td><td>Bounded fan-out</td><td>Member-list UX must paginate</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — bucketed partition keys to bound partition size on hot channels.</li>
+  <li>Ch. 8 Distributed systems — UDP packet loss, jitter, partial visibility.</li>
+  <li>Ch. 11 Stream processing — pub/sub fan-out via Redis / Kafka.</li>
+  <li>Ch. 5 Replication — multi-region replication for guild metadata.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Voice and text are two completely different runtimes joined by a gateway — I'd resist the temptation to unify them."</li>
+  <li>"The hardest part is huge guilds; lazy fan-out and view-windowed presence are the only ways to keep N*M from melting the gateway."</li>
+  <li>"I'd choose ScyllaDB over Cassandra specifically for p99 — chat UX is unforgiving of GC tail latency."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Elixir / BEAM (Gateway)</td><td>One lightweight process per session lets a single box hold ~100k WSS connections, putting 14M concurrent users on ~140 gateway boxes. Per-session ring buffer for resume + sequence-number replay maps cleanly onto BEAM's per-process mailbox model.</td><td>Go (heavier per-conn, GC pauses hurt p99), Node.js (single-thread bottleneck), Java/Netty (JVM tuning needed for 100k conns)</td></tr>
+    <tr><td>ScyllaDB</td><td>Discord migrated off Cassandra specifically because JVM GC pauses caused p99 spikes that broke the &lt;300 ms text NFR — ScyllaDB's C++ shard-per-core architecture delivers consistent low p99 at 46k avg / 150k peak msgs/sec. Bucketed (channel_id, 10-day) partitions stay under ~1M rows.</td><td>Cassandra (rejected: GC tail latency), DynamoDB (cost at 5 PB/year), CockroachDB (too transactional for this write pattern)</td></tr>
+    <tr><td>PostgreSQL (guild metadata)</td><td>Guilds, roles, members, and 64-bit permission bitfields need ACID for transactional role/permission edits — every action computes effective permission and a stale read could leak channels. Volume is small (millions, not billions of rows) so SQL fits.</td><td>ScyllaDB (no transactions), MySQL (Discord's choice was Postgres for JSONB role storage), DynamoDB (vendor lock-in)</td></tr>
+    <tr><td>WebSockets (WSS) gateway</td><td>Bidirectional frames are required for typing, presence, and MESSAGE_CREATE push; HTTP long-poll can't meet the &lt;300 ms text p99 with 14M concurrent. Stateful sockets enable the per-session sequence-number resume that avoids re-sending the world on reconnect.</td><td>HTTP/2 SSE (one-way), gRPC streaming (browser limits), MQTT (no native browser support)</td></tr>
+    <tr><td>UDP / RTP (voice transport)</td><td>The 150 ms p99 mouth-to-ear NFR rules out TCP — head-of-line blocking on a single packet retransmit alone can blow the budget. RTP provides timestamps and SSRC for jitter buffers; lost packets are ignored, not retried.</td><td>TCP (HoL blocking), QUIC (still maturing for media at Discord's launch), WebRTC over TCP (only as fallback)</td></tr>
+    <tr><td>Custom Rust SFU</td><td>Voice forwarding for 1M concurrent users + 32 Gbps upstream needs zero-GC, deterministic-latency code; Rust gives memory safety without a runtime. SFU pattern (forward, no transcode) keeps CPU cheap so packet pacing and TWCC dominate.</td><td>MCU (transcoding cost prohibitive), Janus / mediasoup (less control), C++ (memory safety risk at scale)</td></tr>
+    <tr><td>Opus codec</td><td>32 kbps Opus gives broadcast-quality voice at the bandwidth target (1M users * 32 kbps = 32 Gbps) — at 150 ms latency budget, Opus's 20 ms frame size keeps codec delay sub-perceptual. Royalty-free unlike AAC.</td><td>AAC (licensing), Speex (deprecated), G.711 (8 kHz, much lower quality)</td></tr>
+    <tr><td>SVC / simulcast (video)</td><td>A screen-sharer at 8 Mbps × 25 listeners = 200 Mbps egress per speaker; SVC layers let bandwidth-poor listeners pull a 500 Kbps substream from the same upload, cutting fan-out cost by 16x without re-encoding.</td><td>Single-bitrate broadcast (forces transcoding), per-listener encoding (CPU explosion on speaker), MCU mixing (latency)</td></tr>
+    <tr><td>Redis pub/sub</td><td>Per-guild + per-DM message broadcast across the 140 gateway boxes is exactly the pub/sub primitive — sub-millisecond delivery and ephemeral semantics fit. Lazy guilds attach/detach subs as the member list scrolls.</td><td>Kafka (over-durable for transient pushes), NATS (less ops experience at Discord), per-gateway gossip (O(N²))</td></tr>
+    <tr><td>Snowflake message IDs</td><td>The 64-bit timestamp-prefixed ID doubles as the clustering key for ScyllaDB partitions and gives global ordering without coordination — needed at 150k peak msgs/sec where central sequence services would be a bottleneck.</td><td>UUID v4 (random, kills LSM), Redis INCR (single point of failure), DB autoincrement (per-shard gaps)</td></tr>
+    <tr><td>DPDK / io_uring (kernel-bypass)</td><td>At 480 Gbps SFU egress, the kernel network stack becomes the bottleneck; kernel-bypass paths reach line rate on commodity NICs. Required for the cents/user/month voice cost target.</td><td>Stock Linux sockets (CPU-bound at this rate), eBPF/XDP (less mature for RTP), hardware offload (vendor-specific)</td></tr>
+    <tr><td>Redis (permission cache)</td><td>Effective permission = base ∪ role grants − denies is recomputed on every action; caching per (user, channel) in Redis with role-change invalidation keeps the hot path under 1 ms instead of round-tripping Postgres on each MESSAGE_CREATE.</td><td>In-process cache (stale on role change), Postgres prepared statement (still adds 5+ ms), Memcached (no pub/sub for invalidation)</td></tr>
+    <tr><td>TURN servers (NAT fallback)</td><td>UDP NAT punching fails on symmetric NATs; without a relay, a meaningful fraction of users couldn't join voice. TURN is the documented WebRTC escape hatch and the cost is bounded because most users punch directly.</td><td>STUN-only (fails for symmetric NAT), proprietary relay (worse interop), TCP fallback (latency too high)</td></tr>
+  </tbody>
+</table>

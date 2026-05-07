@@ -1,0 +1,137 @@
+<h1>Design Surge Pricing (real-time supply-demand pricing)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a real-time pricing service that computes a per-cell, per-product multiplier (1.0×, 1.5×, 2.7×, …) reflecting local supply/demand imbalance. Riders see the multiplier before they request; drivers see surge "heatmaps" to nudge them toward shortage zones. Updates must be fast enough to actually rebalance the market — typically every 60–120s.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Compute surge multiplier per (city, hex_cell, product) every 60s.</li>
+  <li>Expose the multiplier in fare estimates and lock it for the duration of a single quote (~5 min).</li>
+  <li>Driver heatmap: serve a tiled overlay showing surge zones with multiplier color buckets.</li>
+  <li>Cap multipliers per regulatory rules (e.g., NYC max 4×, no surge during emergencies).</li>
+  <li>Provide an audit log: for any historical trip, why was surge X applied?</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> read p99 &lt; 30 ms (it's on the rider critical path).</li>
+  <li><b>Freshness:</b> compute lag &lt; 90s end-to-end.</li>
+  <li><b>Scale:</b> ~200 cities × ~5 K cells × 4 products = 4 M keys; recomputed every 60s.</li>
+  <li><b>Stability:</b> no flapping — apply hysteresis so a multiplier doesn't oscillate between 1.0× and 1.5× minute-by-minute.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Read QPS: 50 K fare estimates/sec + 200 K driver-heatmap polls/sec ≈ 250 K reads/sec.</li>
+  <li>Write QPS: 4 M keys / 60s ≈ 70 K writes/sec from the surge job.</li>
+  <li>Stream input: open requests (~3 K/s) + driver pings (1.25 M/s) → aggregate per-cell counters.</li>
+  <li>Storage: keep 90 days of per-minute snapshots = 4 M × 60 × 24 × 90 = ~518 B rows; ClickHouse compresses to ~5 TB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET  /v1/surge?cell=8a2a1072b59ffff&amp;product=uberx        → {multiplier, capAt, ttl}
+GET  /v1/surge/quote?origin=&amp;product=                    → {quoteId, multiplier, expires}
+GET  /v1/surge/heatmap/{city}?z=12                       → vector tile
+POST /v1/surge/override {city, cell, mult, reason, byUserId}  (admin)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Rider req stream] -+
+[Driver pings]    -+--> [Kafka] --> [Flink job: per-cell counters]
+                                          |
+                                          v
+                                 [Surge Calculator]
+                                  (D/S ratio + smooth)
+                                          |
+                                          v
+                                  [Redis (per-cell)]
+                                          ^
+                                          |
+[Rider/Driver app] -> [Surge API] --------+
+                                          |
+                                          v
+                                  [ClickHouse: history]
+</div>
+<p>Flink maintains a 1-minute sliding window of (open_requests, idle_drivers) per cell. The Surge Calculator reads the window, applies a smoothing model, and writes the multiplier to Redis. The Surge API is a thin read-through cache. A nightly batch job replays into ClickHouse for analytics and the auditor.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Live multipliers (Redis)</h3>
+<pre>HSET surge:{city}:{cell}:{product}
+     mult 1.7  cap 4.0  ts 1700000060  reason "demand>supply"
+TTL 180s (so a stalled producer lets values fall back to 1.0)</pre>
+<h3>7.2 Historical (ClickHouse)</h3>
+<pre>CREATE TABLE surge_history (
+  ts DateTime, city LowCardinality(String),
+  cell FixedString(15), product LowCardinality(String),
+  open_req UInt32, idle_drv UInt32, mult Float32
+) ENGINE = MergeTree() PARTITION BY toYYYYMMDD(ts) ORDER BY (city, cell, ts);</pre>
+<h3>7.3 Quote table (Postgres)</h3>
+<p>Ephemeral — captures the multiplier locked at quote time, used at fare-finalization to prove "the price you saw."</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Demand-supply estimator</h3>
+<p>For each cell C, compute D(C) = open ride requests in past 60s; S(C) = idle drivers currently in C plus those whose ETA to C ≤ 5 min. Raw multiplier = max(1.0, (D / max(S, 1))^α) with α tuned per product (UberX α≈0.7, Pool α≈0.5).</p>
+<h3>8.2 Smoothing &amp; hysteresis</h3>
+<p>Apply EWMA over the last 3 minutes; require 2 consecutive minutes above the threshold before stepping up; only step up by one bucket per minute (1.0 → 1.2 → 1.4 …). Buckets are coarse — riders find continuous numbers untrustworthy.</p>
+<h3>8.3 Cap and policy layer</h3>
+<p>Pluggable rules engine: regulatory cap, "state of emergency" override, marketing campaigns ("no surge for new riders for 7 days"). Policy decisions logged for compliance.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Tiny denominator:</b> a cell with 0 idle drivers gives infinite raw surge; clamp to bucket cap and merge with neighbor cells when supply is &lt; 3.</li>
+  <li><b>Hot keys:</b> Times Square gets every read; cache at the edge with 30s TTL — fresh enough for the use case.</li>
+  <li><b>Producer lag:</b> Redis TTL of 180s ensures a stalled Flink job degrades to 1.0× instead of frozen-stale 5×.</li>
+  <li><b>Spatial granularity:</b> H3 res 8 (~0.7 km²) — finer is noisier, coarser misses neighborhood differences.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Coarse multiplier buckets</td><td>Stable, trustworthy</td><td>Less revenue-optimal</td></tr>
+<tr><td>Per-minute recompute</td><td>Cheap, smooth</td><td>Lags fast events</td></tr>
+<tr><td>H3 hex grid for cells</td><td>Uniform neighbor distance</td><td>Doesn't match street geometry</td></tr>
+<tr><td>Lock multiplier at quote</td><td>Trust: "price I saw is what I pay"</td><td>Requires quote storage and TTL</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream processing — Flink windowed aggregation, exactly-once via checkpointing.</li>
+  <li>Ch. 12 Future of data systems — surge as a derived dataset; rebuild from event log on logic change.</li>
+  <li>Ch. 7 Transactions — quote locking is read-snapshot semantics on a fast-changing key.</li>
+  <li>Ch. 9 Consistency — eventual consistency is OK for surge reads; stale &lt; 90s is a feature.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd resist the urge to make this real-time — minute-level updates and coarse buckets are deliberate, because rider trust is the asset."</li>
+  <li>"The denominator-zero problem is the most common bug; my mitigation is neighbor-merge plus a hard regulatory cap."</li>
+  <li>"Surge is a market mechanism, so I'd A/B test α per city and per product, with revenue and rider conversion as the joint metric."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>H3 (resolution 8, ~0.7 km²)</td><td>200 cities × 5 K cells × 4 products = 4 M keys are recomputed every 60s; uniform hex neighbors let us merge with adjacent cells when supply &lt; 3, avoiding the denominator-zero blow-up.</td><td>Geohash → uneven cells distort the D/S ratio at high latitudes; S2 → fine but neighbor merge logic is messier on cube-projected squares.</td></tr>
+    <tr><td>Kafka (req + ping streams)</td><td>1.25 M driver pings/sec plus 3 K rider requests/sec land in a partitioned log keyed by city; Flink consumes both streams to build per-cell counters with exactly-once semantics over a 1-min sliding window.</td><td>RabbitMQ → no replay, weaker windowing; Pulsar → fine but smaller Flink connector ecosystem.</td></tr>
+    <tr><td>Flink (windowed aggregator)</td><td>Sliding 1-min window per (city, cell, product) computes (open_requests, idle_drivers); checkpointed state survives AZ failure and the &lt;90s freshness SLO is met because the window emits every 60s.</td><td>Spark Streaming → micro-batch boundary too coarse for 60s cadence; Kafka Streams → harder to express dual-stream join with hysteresis.</td></tr>
+    <tr><td>Redis (live multipliers)</td><td>250 K reads/sec on the rider critical path needs &lt;30 ms p99; HSET surge:{city}:{cell}:{product} with a 180s TTL means a stalled producer degrades to 1.0× rather than serving frozen 5× values.</td><td>Memcached → no per-field TTL; DynamoDB → 2–10 ms p99 at 250 K rps would cost 5–10× more.</td></tr>
+    <tr><td>ClickHouse (90-day history)</td><td>4 M cells × 60 min × 24 h × 90 days = ~518 B rows; columnar compression lands this in ~5 TB and per-(city, cell) auditor queries return in seconds. PARTITION BY toYYYYMMDD lets us drop old data cheaply.</td><td>Druid → equally fine; Postgres → would die at 70 K wps and 500 B-row scans; S3 + Athena → too slow for interactive auditor lookups.</td></tr>
+    <tr><td>Postgres (quote table)</td><td>Ephemeral quoteId → multiplier mapping with 5-min TTL needs read-after-write semantics so the fare-finalization step proves "the price you saw"; per-row TTL via a cleanup job keeps the table small.</td><td>Redis → loses durability on restart, makes regulator audits weaker; DynamoDB TTL → fine but Postgres co-locates with the rest of the trip lifecycle.</td></tr>
+    <tr><td>EWMA + bucket smoother</td><td>Hysteresis (2 consecutive minutes above threshold, single bucket step per minute) is what stops 1.0×↔1.5× flapping; coarse buckets (1.0, 1.2, 1.4, …) are deliberate because rider trust is the asset.</td><td>Continuous values → riders find them untrustworthy; per-second updates → market thrash and bad press.</td></tr>
+    <tr><td>Vector tiles (driver heatmap)</td><td>200 K driver-heatmap polls/sec at city zoom z=12 are served as Mapbox-style vector tiles; binary encoding is 5–10× smaller than GeoJSON and the GPU on the driver phone renders them efficiently.</td><td>Raster PNG tiles → no client-side restyling; raw GeoJSON → bandwidth-heavy at 200 K rps.</td></tr>
+    <tr><td>CDN (edge cache for hot cells)</td><td>Times Square gets every read; a 30s TTL at the CDN edge collapses 90%+ of reads on the hottest cells before they reach Redis, fresh enough given the 60s recompute cadence.</td><td>Origin-only → 10× backend cost on tournament-night spikes; client cache only → no cross-user benefit.</td></tr>
+    <tr><td>gRPC (Surge API)</td><td>Surge read sits on the rider critical path at p99 &lt; 30 ms; protobuf + HTTP/2 keeps internal hops (Surge API → Redis → fare estimate) under a few ms each.</td><td>REST/JSON → 5–10 ms parse cost is unaffordable in the budget; Thrift → smaller polyglot tooling.</td></tr>
+    <tr><td>Rules engine (cap + policy)</td><td>NYC max 4×, "no surge during emergencies", "no surge for new riders for 7 days" are non-numeric policy decisions; a pluggable rules layer keeps regulatory + marketing changes out of the calculator code path.</td><td>Hardcoded if/else → audit nightmare; full BPMN engine → overkill for this rule shape.</td></tr>
+    <tr><td>S3 + Parquet (audit trail)</td><td>"Why was surge X applied to trip Y?" needs a long-tail durable answer; Parquet on S3 partitioned by day/city stores the raw counters and policy decisions for years at &lt;$0.05/GB.</td><td>ClickHouse only → great for analytics, but expensive for cold years-old reads; HDFS → no managed multi-region.</td></tr>
+    <tr><td>A/B testing framework</td><td>α (the surge exponent) is tuned per city and per product; an experimentation framework with revenue and rider-conversion as joint metrics is required because this is a market mechanism, not a feature flag.</td><td>Hardcoded α → leaves money on the table and can hurt rider trust where elasticity differs.</td></tr>
+  </tbody>
+</table>
+

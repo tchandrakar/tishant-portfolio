@@ -1,0 +1,59 @@
+<h1>Sharding (partitioning): range, hash, directory</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Easy</span>
+  <span class="tag">sharding</span>
+  <span class="tag">partitioning</span>
+  <span class="tag">scalability</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Sharding is splitting one big dataset into many smaller pieces — <i>shards</i> — that live on different machines, so reads and writes spread across the fleet instead of crushing a single node. The whole game is choosing the right <b>partition key</b> and <b>partition strategy</b>: <b>range</b> (sort by key, slice into contiguous ranges), <b>hash</b> (hash the key, mod the bucket count), or <b>directory</b> (a lookup service decides which shard owns which key). Pick well and growth is just "add nodes". Pick badly and you get hot shards, cross-shard joins, and resharding nightmares.</p>
+
+<h2>Why it matters</h2>
+<p>Vertical scaling runs out. Replication helps reads but not writes — every replica still holds the full dataset. Once your data or write throughput exceeds what one machine can do, sharding is the only path forward. It's also one of the most error-prone decisions in distributed systems: a bad partition key shows up months later as one shard at 95% CPU while the others sit at 10%.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Range sharding (HBase, Bigtable):</b> rows sorted by key, contiguous ranges per region. Great for range scans; risky for monotonic keys (timestamps -> hot tail shard).</li>
+  <li><b>Hash sharding (Cassandra, DynamoDB):</b> hash(partition_key) decides the node. Even distribution by default; range scans become expensive.</li>
+  <li><b>Directory sharding (Vitess, Figma's approach):</b> a metadata service maps tenant -> shard. Flexible re-balancing; the directory itself becomes a critical dependency.</li>
+  <li><b>Geosharding (Uber):</b> shard by region/city — natural locality, but cross-region trips need special handling.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  RANGE                       HASH                       DIRECTORY
+  keys: A..Z                  hash(key) mod 4            lookup(key) -> shard
+  +-------+ +-------+         +---+ +---+ +---+ +---+    +-----------+
+  | A..F  | | G..M  | ...     | 0 | | 1 | | 2 | | 3 |    | metadata  |
+  +-------+ +-------+         +---+ +---+ +---+ +---+    |  service  |
+  good for scans              even spread                +-----------+
+  bad for hot tail            bad for range scans            |   |   |
+                                                           shard shard shard
+
+  Resharding pain (with naive hash mod N): adding one node
+  remaps ~all keys. Use CONSISTENT HASHING to remap only ~1/N.
+</div>
+<p>Consistent hashing places both nodes and keys on a ring; each key belongs to the next node clockwise. Adding a node only steals keys from its immediate neighbor, not the whole cluster — this is why every modern key-value store uses it.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Choosing a low-cardinality partition key (like <code>country</code>). The biggest country becomes a permanent hot shard.</li>
+  <li>Sharding by timestamp. All writes pile into the most recent shard while older ones sit idle.</li>
+  <li>Forgetting cross-shard queries. A SQL <code>JOIN</code> across shards either fans out (slow) or moves to the application layer (complex).</li>
+  <li>Plain hash-mod-N instead of consistent hashing. The first time you add a node, you reshuffle nearly the entire dataset.</li>
+  <li>No rebalancing plan. Shards grow unevenly over time; without splits/merges, you end up back at "one giant shard".</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're sharding a tweets table across 16 nodes. Two candidate partition keys: <code>user_id</code> or <code>tweet_id</code>. Which gives more even load? Which makes "show this user's timeline" cheap? What happens to your design when one user has 50M followers and tweets every second?
+  <br/>
+  <b>Hint:</b> The "even load" answer and the "cheap timeline" answer are not the same key. Celebrity users break naive partitioning — search "hot key problem" for the rabbit hole.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-dynamodb">Design DynamoDB</a> — hash partitioning with adaptive capacity for hot keys.</li>
+  <li><a href="#problem/design-cassandra-cluster">Design Cassandra</a> — consistent-hash ring with virtual nodes.</li>
+  <li><a href="#problem/design-uber">Design Uber</a> — geosharding by H3 cell to keep trips local.</li>
+</ul>

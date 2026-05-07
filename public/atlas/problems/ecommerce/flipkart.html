@@ -1,0 +1,147 @@
+<h1>Design Flipkart (Big Billion Day flash-sale handling)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">ecommerce</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design Flipkart with the central design constraint of surviving Big Billion Day (BBD): traffic spikes 10–20x normal, hot SKUs (a Rs.10k phone limited to 50k units) are reserved within seconds, and the payment pipeline must stay correct under partial UPI/PSP outages. The system must protect against oversell, payment double-charge, and bot abuse while keeping good customers in the funnel.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Browse, search, PDP — same as a normal e-comm site.</li>
+  <li>Flash-sale mode: server-side rate-limited add-to-cart, queue-based checkout.</li>
+  <li>Coupons, EMI, Pay Later, COD, UPI, cards — all must idempotently charge.</li>
+  <li>Order tracking, returns, replacements, marketplace seller flow.</li>
+  <li>Bot/scalper detection on hot inventory.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> PDP p99 &lt; 250 ms; ATC p99 &lt; 400 ms even at peak.</li>
+  <li><b>Scale:</b> 350M users, BBD peak 1.5M concurrent users, 200k ATC/s, 30k orders/s.</li>
+  <li><b>Availability:</b> 99.99% browsing; checkout degrades gracefully (queue) before failing.</li>
+  <li><b>Correctness:</b> 0 oversell, 0 double-charge, &lt;1 ppm duplicate orders.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: peak 800k catalog reads/s, 200k ATC/s, 30k orders/s, 60k payment calls/s.</li>
+  <li>Storage: 200M SKUs, 800M orders/yr, ~3 PB cumulative orders + events.</li>
+  <li>Bandwidth: 400 Gbps CDN egress at peak; ~10 Gbps API traffic.</li>
+  <li>Inventory hot-keys: 100 SKUs receive 50% of all reservation traffic.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/sale/queue/enter   {userId, saleId}      → token, position
+POST /v1/cart/reserve       {sku, qty, token}     → reservationId, ttl
+POST /v1/checkout/init      {reservationId}       → checkoutId
+POST /v1/payment/charge     {checkoutId, method, idemKey} → paymentId
+POST /v1/order/confirm      {paymentId}           → orderId</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Mobile/Web]
+     |
+[Akamai CDN] -- static assets, PDP HTML
+     |
+[Edge WAF + Bot Mgmt]
+     |
+[API GW] -- token-bucket per user (10 req/s)
+     |
+[Sale Queue Svc] --&gt; [Redis Streams] (virtual waiting room)
+     |
+[Cart/Reserve Svc] --&gt; [Inventory Svc] --&gt; [Postgres "stock" row, FOR UPDATE]
+     |                                       \
+     v                                        \--&gt; [Kafka inv-events]
+[Checkout Svc] --&gt; [Payment Orchestrator]
+                          |
+                +---------+---------+--------+
+                |         |         |        |
+              [UPI]    [Cards]   [PayLtr]  [COD]
+                |
+                v
+          [Saga Coordinator] --&gt; [Order Svc] --&gt; [Sharded Postgres]
+                          \
+                           --&gt; [Notif] [Fulfilment] [Refund]
+</div>
+<p>The waiting-room pattern is the headline: clients can't even reach checkout without a queue token, so backend pressure is bounded.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Inventory (Postgres + Redis cache)</h3>
+<pre>CREATE TABLE stock (
+  sku_id  bigint PRIMARY KEY,
+  available int NOT NULL CHECK (available &gt;= 0),
+  reserved  int NOT NULL DEFAULT 0,
+  version   bigint NOT NULL
+);</pre>
+<p>Single-row decrement under <code>SERIALIZABLE</code> or <code>SELECT ... FOR UPDATE</code>; Redis hash mirrors counts for fast reads only — never authoritative.</p>
+<h3>7.2 Reservations (Redis with TTL)</h3>
+<pre>HSET resv:{id} sku 9988 qty 1 user 42 exp 1715000000  EX 600</pre>
+<h3>7.3 Orders (sharded by userId hash)</h3>
+<pre>orders, order_items, payments — same shard so checkout is local-tx.</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Virtual waiting room</h3>
+<p>Before sale start, users park in a queue keyed by (saleId, joinTs). Tokens are admitted at a controlled rate (e.g., 5k/sec) matching downstream capacity. Token JWT carries an expiry and an admit-by timestamp.</p>
+<h3>8.2 Inventory service</h3>
+<p>Authoritative single-row decrement is the chokepoint. We shard by sku_id across N Postgres primaries; hot SKUs get their own shard. The decrement is wrapped in a serializable transaction (DDIA Ch.7) — anything weaker risks oversell.</p>
+<h3>8.3 Payment orchestrator</h3>
+<p>State machine: <i>INIT → CHARGING → CAPTURED | FAILED → REFUNDING</i>. Every PSP call carries an idempotency key derived from checkoutId. On PSP timeout we poll status before retry to avoid double-charge.</p>
+<h3>8.4 Bot defense</h3>
+<p>Edge fingerprinting + per-account velocity limits + CAPTCHA on second attempt. Suspicious tokens are silently shadow-queued.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot SKU row:</b> dedicated shard; co-located reservation worker pinned to that primary; batch-decrement (group N requests, one tx).</li>
+  <li><b>PSP outage:</b> circuit-breaker per PSP, automatic failover (Razorpay → BillDesk → bank direct).</li>
+  <li><b>Thundering herd at sale start:</b> randomized client-side jitter + queue admission.</li>
+  <li><b>Read amplification on PDP:</b> price/stock pulled separately so price page is cacheable; only the small "stock pill" hits origin.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Postgres serializable inventory</td><td>Zero oversell, simple reasoning</td><td>Throughput ceiling per shard</td></tr>
+<tr><td>Virtual waiting room</td><td>Predictable load, fair</td><td>Visible wait time hurts UX</td></tr>
+<tr><td>Idempotency keys on payments</td><td>Safe retries</td><td>Storage + dedup table cost</td></tr>
+<tr><td>Soft holds in Redis</td><td>Fast UX, releases on TTL</td><td>Not authoritative; must reconcile</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 7 Transactions — serializable isolation for the stock decrement; anomalies under snapshot isolation.</li>
+  <li>Ch. 8 Trouble — handling PSP timeouts where outcome is unknown.</li>
+  <li>Ch. 9 Consensus — leader election for the sharded inventory primary; Redlock caveats for soft holds.</li>
+  <li>Ch. 11 Stream Processing — Kafka-backed order saga and refund pipeline.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"My single biggest correctness risk is oversell on a hot SKU; I'd rather slow the queue than relax isolation."</li>
+  <li>"Payments must be idempotent end-to-end; the idempotency key is generated client-side at checkout init and survives retries."</li>
+  <li>"I'd ship the waiting room first; it converts a reliability problem into a UX problem, which is far easier to solve incrementally."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Akamai CDN</td><td>BBD pushes 400 Gbps of static and PDP HTML egress. Akamai's India POPs cut TTFB for 350M domestic users; surrogate-key purges let us invalidate just the price/stock fragment without flushing full PDP HTML, preserving the 800k catalog reads/s cache hit rate.</td><td>CloudFront (weaker India presence historically); self-hosted Varnish (cannot match 400 Gbps without massive ops).</td></tr>
+<tr><td>Redis Streams (waiting room)</td><td>The virtual waiting room admits 5k tokens/sec from a 1.5M concurrent backlog at sale start. Redis Streams give us O(1) append + ordered consumer groups; tokens with admit-by timestamps survive across cells. Without this, 200k ATC/s would crush downstream Postgres.</td><td>Kafka (heavier; consumer-group rebalances are painful for short-lived sale flows); SQS FIFO (throughput too low for sale-start spikes).</td></tr>
+<tr><td>Postgres SERIALIZABLE (inventory)</td><td>The Rs.10k phone with 50k units sees 100 SKUs taking 50% of reservation traffic. Serializable single-row decrement with FOR UPDATE is the only isolation level that provably prevents the lost-update anomaly that causes oversell. Anything weaker can sell a phantom 51,000th unit.</td><td>Snapshot isolation (write-skew oversells); Redis INCR (loses correctness under partition); Spanner (latency too high in India region).</td></tr>
+<tr><td>Redis (soft holds + ATP cache)</td><td>HSET resv:{id} with EX 600 gives 10-minute soft holds at sub-ms latency, freeing the Postgres primary for authoritative decrements only. Mirrors stock counts for storefront reads at 800k/s — never authoritative, always reconciled against Postgres on reserve.</td><td>Memcached (no TTL on hash fields, no eviction policy fit); in-process cache (no cross-instance view of holds).</td></tr>
+<tr><td>Kafka (order/inv events)</td><td>30k orders/s and 60k payment calls/s feed the saga, refund pipeline, and analytics. Partition by sku_id for inventory and by user_id for orders; 7-day retention enables saga replay after a coordinator failure without losing in-flight BBD orders.</td><td>RabbitMQ (no log replay); Pulsar (less Indian operational expertise on team).</td></tr>
+<tr><td>Saga coordinator (orchestrated)</td><td>The state machine INIT → CHARGING → CAPTURED | FAILED → REFUNDING needs explicit lifecycle ownership across UPI, Cards, PayLater, COD. Orchestration centralizes timeout policy (poll PSP before retry) and compensations, preventing the &lt;1 ppm duplicate-order budget from being blown.</td><td>Choreography (no single owner of timeouts); 2PC (PSPs don't support it).</td></tr>
+<tr><td>Multi-PSP (Razorpay/BillDesk)</td><td>Indian UPI/PSP outages happen during BBD (NPCI, bank gateways flap). Circuit breaker per PSP with auto-failover keeps checkout 99.99% available even when one PSP is down. Idempotency key per checkoutId stops double-charge across the failover path.</td><td>Single PSP (single point of failure during sale); direct bank integrations only (slower onboarding, weaker fraud).</td></tr>
+<tr><td>Edge WAF + bot mgmt</td><td>Scalpers can drain 50k phone units in seconds. Edge fingerprinting + per-account velocity limits + CAPTCHA on second attempt block bots before they consume queue tokens. Suspicious tokens shadow-queued so attackers don't learn they're flagged.</td><td>Captcha-everywhere (tanks legit conversion); app-layer-only (already too late, queue token spent).</td></tr>
+<tr><td>API Gateway + token bucket</td><td>10 req/s per user at the gateway is the first line of defense before the 200k ATC/s pressure point. JWT-bound buckets let abusive users get a 429 without burning Postgres connection slots. Cheap, correct, fast.</td><td>NGINX rate limit (works, but token-bucket on logical user-id is cleaner via API GW); in-app rate limit (too late).</td></tr>
+<tr><td>Sharded Postgres (orders)</td><td>Sharding by userId hash co-locates orders, order_items, and payments on one shard so checkout becomes a local transaction — no 2PC needed for a 30k orders/s peak. Each shard handles ~3k orders/s, well below Postgres ceiling.</td><td>CockroachDB (cross-region tax); single Postgres (won't survive 30k orders/s peak).</td></tr>
+<tr><td>JWT queue tokens</td><td>Stateless JWTs let any cell admit a queued user without a Redis lookup on the hot path. Encodes saleId, joinTs, admit-by; signed so attackers can't forge their position. Perfect for 1.5M concurrent users where stateful token store would cost millions.</td><td>Opaque tokens with Redis lookup (extra hop on every request); cookie-only (replayable across users).</td></tr>
+<tr><td>Idempotency-key store</td><td>0 double-charge requirement on UPI/cards demands a dedup table keyed by (checkoutId, psp). On PSP timeout, we poll PSP status before retry; the idempotency key ensures the second call is a no-op if the first succeeded. The table itself is shed older than 30 days.</td><td>Best-effort retry (causes double-charge on PSP timeout); DB unique constraint only (works but harder to introspect).</td></tr>
+</tbody>
+</table>
+

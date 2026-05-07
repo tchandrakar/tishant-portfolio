@@ -1,0 +1,206 @@
+<h1>Design a B-tree Storage Engine (page-based, WAL, buffer pool)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h1></h1>
+
+<h2>1. Problem statement</h2>
+<p>Design the workhorse storage engine behind PostgreSQL, MySQL/InnoDB, Oracle, SQL Server, and SQLite — a disk-resident B+-tree with a fixed-size page abstraction, a buffer pool, and a write-ahead log (ARIES-style). The interview here is about <i>data structure honesty</i>: page splits, latch coupling, recovery, partial page writes, and why B-trees still win for OLTP point-and-update workloads even though LSM trees win sequential write throughput (DDIA Ch. 3, "B-Trees" and "Comparing B-Trees and LSM-Trees").</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Indexed point lookups, range scans, inserts, updates, deletes on a primary key.</li>
+  <li>Crash recovery via redo + undo logs (ARIES).</li>
+  <li>Multi-row transactions with row-level locking (or MVCC via undo segments).</li>
+  <li>Online index build / vacuum without long write blackouts.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Read latency:</b> in-memory tuple in &lt; 50 us; disk-resident in 1 SSD seek (~100 us NVMe).</li>
+  <li><b>Write throughput:</b> 50-100k tx/s on a single node; bound by WAL fsync and page flushes.</li>
+  <li><b>Durability:</b> redo log fsync before COMMIT; recovery from any crash &lt; 1 min.</li>
+  <li><b>Cache hit ratio:</b> &gt; 99% for OLTP working set in the buffer pool.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Page size 8 KB (Postgres default 8 KB; InnoDB 16 KB). Tree fan-out ~200-500 keys/page.</li>
+  <li>1 B rows -> ceil(log_400(1e9)) = 4 levels; 4 page reads per cold lookup.</li>
+  <li>Buffer pool 64 GB hosts ~8 M pages — typical OLTP working sets fit fully.</li>
+  <li>WAL: 50k tx/s * 200 B/record = 10 MB/s; 1 hour = 36 GB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>BEGIN;                                  -- assigns txId
+SELECT v FROM t WHERE k = ?;            -- shared latch on leaf, S row lock
+INSERT INTO t VALUES (?,?);             -- X latch on leaf, possible split
+UPDATE t SET v = ? WHERE k = ?;         -- in-place; undo record written
+DELETE FROM t WHERE k = ?;              -- mark deleted; vacuum reclaims
+COMMIT;                                 -- WAL flush + commit record</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">     SQL  ->  Executor  ->  Access methods (heap, B+tree)
+                                |
+                                v
+                +----------------------------+
+                |      Buffer Pool (LRU)     |  pages pinned/latched
+                +----------------------------+
+                  |                  |
+         page-in (read)        page-out (checkpoint/eviction)
+                  |                  |
+                  v                  v
+              +---------+        +---------+
+              | Disk    |        | Disk    |
+              | data    |        | data    |
+              +---------+        +---------+
+                  ^
+                  | redo log replay on crash
+                  |
+                  +------------ WAL (sequential, fsync per commit) </div>
+<p>Walk-through: every page modification is preceded by a WAL record (write-ahead). The dirty page sits in the buffer pool; a periodic <i>checkpoint</i> flushes dirty pages and emits a checkpoint record, bounding recovery time. After a crash, recovery does redo from the last checkpoint to the end of the log, then undoes losers (uncommitted transactions) using undo records — the canonical ARIES trio of <i>analysis, redo, undo</i>.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 B+-tree page</h3>
+<pre>+--------+------------------+--------------+----------+
+| Header | Slot array (off) | Free space   | Tuples   |
++--------+------------------+--------------+----------+
+Header: pageId, LSN, level, slot count, right-sibling pointer.
+Leaf:   (key, tid) sorted by key; tid points into heap pages.
+Internal: (key, childPageId) routing entries.</pre>
+<h3>7.2 Heap (Postgres) vs clustered (InnoDB)</h3>
+<p>Postgres stores tuples in an unordered <i>heap</i> with the B-tree storing TIDs into it; InnoDB clusters the row in the leaf of the primary B-tree. Clustered indexes give cheaper PK scans but expensive secondary indexes (which must store the PK and re-traverse).</p>
+<h3>7.3 Splits and merges</h3>
+<p>On insert into a full leaf, allocate a new sibling, split keys, push the median up. Latch-couple from root downward, releasing parent latches when the child has room (the classic "safe node" optimization). Right-sibling pointers (B-link tree) let concurrent readers traverse without holding internal latches (DDIA Ch. 3, "Concurrency control").</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Buffer pool</h3>
+<p>Hash table <code>pageId -&gt; frame</code>; replacement via clock-sweep or LRU-K. Each frame has pin count and dirty bit. Background <i>bgwriter</i> trickles dirty pages to disk to keep checkpoints short. Double buffering protects against torn pages: Postgres writes a <i>full-page image</i> to WAL on first dirty after checkpoint; InnoDB uses the doublewrite buffer.</p>
+<h3>8.2 Write-ahead log (ARIES)</h3>
+<p>Every page update writes a redo (and optionally undo) record carrying the LSN. The page header's <code>pageLSN</code> &gt;= log LSN guarantees the page reflects that record on disk. Recovery: scan from checkpoint, build the dirty-page table and transaction table, redo all records whose LSN &gt; pageLSN, then undo losers with CLRs to make undo idempotent.</p>
+<h3>8.3 Concurrency control</h3>
+<ul>
+  <li><b>Latches</b> protect physical structure (pages); short-lived, OS mutex-like.</li>
+  <li><b>Locks</b> protect logical objects (rows); 2PL ensures serializability.</li>
+  <li><b>MVCC:</b> Postgres keeps multiple row versions in heap (HOT chains); InnoDB keeps the latest in place + undo segments. Snapshot reads do not block writers — DDIA Ch. 7 "Snapshot Isolation."</li>
+</ul>
+<h3>8.4 Vacuum / purge</h3>
+<p>MVCC accumulates dead tuples. Postgres VACUUM scans pages, marks dead tuples free, and updates the visibility map; InnoDB purge thread truncates undo segments past the oldest snapshot. Tuning autovacuum is the single most common Postgres production task.</p>
+<h3>8.5 Group commit</h3>
+<p>Multiple transactions piggyback one fsync of the WAL; commit latency rises slightly but throughput multiplies 10-50x on rotational/cloud disks.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>WAL contention:</b> single sequential file becomes the bottleneck. Mitigation: bigger WAL buffers, group commit, NVMe with stable cache.</li>
+  <li><b>Right-edge insert hotspot:</b> monotonic keys (timestamps, auto-inc) cause all inserts on one leaf. Mitigation: key randomization, hash partitioning.</li>
+  <li><b>Long-running transactions:</b> block vacuum, bloat MVCC chains. Monitor <code>oldest_xmin</code>.</li>
+  <li><b>Index bloat:</b> non-HOT updates double-write index entries; rebuild concurrently.</li>
+  <li><b>Buffer pool eviction storms:</b> large analytical scans pollute LRU; use ring buffers or hint <code>BUFFER_USAGE_LIMIT</code>.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>B-tree vs LSM</td><td>Lower read amp; in-place updates; mature recovery</td><td>Random writes; lower write throughput; higher tail variance under hot pages</td></tr>
+<tr><td>Clustered (InnoDB)</td><td>Fast PK scans &amp; range</td><td>Expensive secondary indexes</td></tr>
+<tr><td>Heap (Postgres)</td><td>Flexible, cheap secondary indexes</td><td>HOT-chain pruning required; bloat without vacuum</td></tr>
+<tr><td>Full-page writes in WAL</td><td>Survives torn pages</td><td>WAL volume spikes after checkpoint</td></tr>
+<tr><td>2PL locking vs MVCC</td><td>Strict serializability; simple</td><td>Readers block writers; deadlocks</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 "B-Trees" — page splits, WAL, copy-on-write variants (LMDB).</li>
+  <li>Ch. 3 "Comparing B-Trees and LSM-Trees" — write amplification, predictability of latency.</li>
+  <li>Ch. 7 "Weak Isolation Levels" — read committed via row versioning; snapshot isolation; serializable via SSI.</li>
+  <li>Ch. 7 "Serializable Snapshot Isolation" — Postgres SSI exploits MVCC to detect rw-conflicts.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd default to a B-tree for OLTP because in-place updates keep read amp constant and ARIES recovery is well-understood — the LSM win only shows up when ingest dominates."</li>
+  <li>"The trickiest correctness story is torn pages on 8 KB writes vs 4 KB sectors; I'd require either FPW in the WAL or a doublewrite buffer."</li>
+  <li>"Under contention I'd reach for B-link tree latching plus optimistic descent; lock-coupling alone limits scalability above ~32 cores."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>B+-tree (vs B-tree)</td>
+      <td>All values live in leaves connected by right-sibling pointers, so range scans are sequential I/O while internal nodes stay small enough to cache. DDIA Ch. 3 highlights this layout as the OLTP workhorse: 4 levels for 1B rows with fan-out ~400.</td>
+      <td>Plain B-tree (values in internal nodes balloon node size, hurts fan-out); LSM (better write throughput but higher read amp; wrong default for point-and-update OLTP).</td>
+    </tr>
+    <tr>
+      <td>8 KB / 16 KB fixed pages</td>
+      <td>Aligns with filesystem block size and OS page cache, makes torn-write detection tractable, and gives stable fan-out for capacity math. Postgres 8 KB / InnoDB 16 KB are the canonical defaults DDIA references when sizing buffer pools.</td>
+      <td>Variable-size pages (complicate buffer pool slot management); 4 KB (lower fan-out, more tree levels); 64 KB (wastes buffer pool slots for sparse leaves).</td>
+    </tr>
+    <tr>
+      <td>ARIES recovery (analysis/redo/undo + CLRs)</td>
+      <td>The only recovery algorithm in production use that handles partial rollbacks, repeated crashes during recovery, and fine-grained locking simultaneously (DDIA Ch. 3 "Making B-trees reliable"). CLRs make undo idempotent so a crash mid-undo replays cleanly.</td>
+      <td>Shadow paging (LMDB-style — simple but doubles write cost and breaks fine-grained locking); no-undo logging (forces no-steal, kills buffer manager flexibility).</td>
+    </tr>
+    <tr>
+      <td>Buffer pool with clock-sweep / LRU-K</td>
+      <td>Caches hot pages in RAM so 99% of OLTP requests never hit disk. Clock-sweep approximates LRU at O(1) without a global lock; LRU-K (Postgres) resists scan pollution by counting K-th-most-recent access. Pin counts and dirty bits coordinate with bgwriter and checkpoints.</td>
+      <td>Pure LRU (mutex on every access — bottleneck above 32 cores); FIFO (poor hit rate); page cache only (loses pin/latch semantics required for ARIES).</td>
+    </tr>
+    <tr>
+      <td>Latch coupling + B-link right-sibling pointers</td>
+      <td>Latches are short-lived OS-level mutexes that protect physical page integrity during traversal. B-link pointers (Lehman-Yao) let a reader follow a right-link if the page split mid-descent, so internal latches can be released early — the standard way to scale concurrent readers past lock-coupling limits.</td>
+      <td>Lock-coupling alone (every descent holds parent latch — caps concurrency); copy-on-write tree (LMDB — write serialization bottleneck).</td>
+    </tr>
+    <tr>
+      <td>Two-level concurrency: latches (physical) + locks (logical)</td>
+      <td>Latches protect the page; locks protect the row/tuple. This separation is what DDIA Ch. 7 calls out: 2PL on locks gives serializability while latches stay short — long-held latches would tank throughput.</td>
+      <td>Single locking layer (forces row locks to be held during page traversals — disastrous); lock-free tree (research-grade, no production engine ships it for OLTP).</td>
+    </tr>
+    <tr>
+      <td>MVCC via heap version chains (Postgres) or undo segments (InnoDB)</td>
+      <td>Snapshot isolation without readers blocking writers — the central DDIA Ch. 7 win for OLTP. Postgres keeps multiple row versions in heap with HOT chains; InnoDB keeps the latest in place plus an undo log for older versions, which makes vacuum cheaper but secondary index updates more expensive.</td>
+      <td>Pure 2PL no MVCC (readers block writers, kills mixed workloads); SI in WAL only (cannot answer reads without log replay).</td>
+    </tr>
+    <tr>
+      <td>Full-page writes (Postgres) / doublewrite buffer (InnoDB)</td>
+      <td>4 KB sectors are atomic on NVMe but 8/16 KB pages are not — a crash mid-write produces a torn page. FPW logs the entire page on first dirty after checkpoint; doublewrite writes the page to a scratch area first. Either survives torn writes that ARIES redo otherwise cannot repair.</td>
+      <td>No torn-page protection (silent data corruption on crash); per-write fsync of the page file (defeats sequential WAL).</td>
+    </tr>
+    <tr>
+      <td>Group commit on the WAL</td>
+      <td>Multiple transactions piggyback one fsync, multiplying throughput 10-50x on cloud disks where fsync is ~1 ms. The pattern DDIA Ch. 3 references for keeping commit latency floor near disk-fsync time without serializing commits.</td>
+      <td>Per-transaction fsync (caps tps at 1/fsync); async commit (loses durability — different contract).</td>
+    </tr>
+    <tr>
+      <td>Checkpoints with bgwriter trickle flush</td>
+      <td>Bounded recovery time = WAL volume since last checkpoint. Trickling dirty pages between checkpoints (Postgres bgwriter, InnoDB page cleaner) avoids the I/O storm of flushing the entire dirty set at once, keeping commit latency stable.</td>
+      <td>Big-bang flush at checkpoint (latency cliff every N minutes); never-checkpoint (replay time grows unbounded).</td>
+    </tr>
+    <tr>
+      <td>Heap (Postgres) vs clustered index (InnoDB)</td>
+      <td>For this design we choose heap to keep secondary indexes cheap (they store TIDs, not the PK + payload). DDIA Ch. 3 notes the trade-off: clustered wins PK range scans but every secondary index becomes a two-step lookup that re-traverses the primary tree.</td>
+      <td>Clustered index (cheaper PK scans but expensive secondary indexes — penalty grows with index count); IOT-only (Oracle) — same trade-off, less flexibility.</td>
+    </tr>
+    <tr>
+      <td>Vacuum / autovacuum</td>
+      <td>MVCC accumulates dead tuples; without reclamation, tables bloat indefinitely. Autovacuum scans pages, marks dead tuples free, updates the visibility map (which lets index-only scans skip heap probes). Tuning autovacuum is the #1 Postgres production task DDIA implies but doesn't enumerate.</td>
+      <td>Manual VACUUM only (gets forgotten — bloat outpaces operators); aggressive purge thread always-on (consumes CPU/IO budget that OLTP needs).</td>
+    </tr>
+    <tr>
+      <td>Serializable Snapshot Isolation (SSI)</td>
+      <td>Postgres Ch. 7 SSI tracks rw-conflict edges between snapshot transactions and aborts one if a dangerous cycle could form — getting full serializability with the throughput of SI. The right choice when correctness requires no anomalies but workload is mostly read-heavy.</td>
+      <td>2PL serializable (readers block writers, throughput collapses); SI without SSI (allows write-skew and phantom anomalies).</td>
+    </tr>
+    <tr>
+      <td>NVMe with stable write cache (or BBU/PLP)</td>
+      <td>WAL fsync is the commit-latency floor; cheap NVMe with volatile DRAM cache lies about durability on power loss. Power-loss-protected enterprise NVMe (or RAID with battery-backed cache) makes fsync honest at ~50-200 us — the assumption every section of this design rests on.</td>
+      <td>Consumer NVMe (silent data loss on power cut); HDD with NVRAM controller (slower but acceptable for cold tiers).</td>
+    </tr>
+  </tbody>
+</table>

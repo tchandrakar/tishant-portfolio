@@ -1,0 +1,147 @@
+<h1>Design Instagram (feed + stories + reels)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">social-network</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">file-storage</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design an Instagram-class media-first social network: photo/video feed (permanent), Stories (24-hour ephemeral), and Reels (short vertical video with algorithmic discovery). The system must ingest ~100M media uploads/day, transcode and CDN-distribute globally, and serve personalized feeds at p99 &lt; 200 ms to 2B MAU.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Upload photo (≤10 MB) or video (≤100 MB, ≤60 s for reels, ≤90 s for posts).</li>
+  <li>Permanent feed posts; 24h-expiring Stories with seen-by tracking; Reels with looping playback.</li>
+  <li>Likes, comments (threaded one-deep), DMs (out of scope here), follow/follower model.</li>
+  <li>Discovery: Explore tab and Reels feed, both ML-ranked.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 2B MAU, 1.2B DAU, 100M uploads/day, 500M Stories views/day, Reels 200B plays/day.</li>
+  <li><b>Latency:</b> feed open p99 &lt; 200 ms; first-frame Reels p95 &lt; 800 ms; upload-to-visible p95 &lt; 30 s after transcode.</li>
+  <li><b>Availability:</b> 99.99% read; uploads must accept retries.</li>
+  <li><b>Durability:</b> 11 nines for media (S3-class).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Uploads: 100M/day = 1160/sec avg, 5K/sec peak. At avg 3 MB → 300 TB/day ingest, ~110 PB/year (raw).</li>
+  <li>After transcoding (5 ABR ladders for video) ≈ 2× → 220 PB/year.</li>
+  <li>Feed reads: 1.2B DAU × 8 sessions × 30 posts = 290B impressions/day = 3.4M/sec avg, ~12M/sec peak.</li>
+  <li>Stories: 500M views/day × ~6 stories/session ≈ peak 100K/sec story fetches.</li>
+  <li>Reels CDN egress: 200B plays × 5 MB avg = 1 EB/day egress (ABR + edge cache halves origin pulls).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/media/upload/init     {type, size, mime}             → uploadUrl, mediaId
+PUT   {uploadUrl}                                              ← chunked direct-to-blob
+POST  /v1/posts                 {mediaId, caption, location}   → postId
+POST  /v1/stories               {mediaId, stickers}            → storyId  (TTL 24h)
+GET   /v1/feed?cursor=...                                       → [post]
+GET   /v1/stories/tray                                          → [user, latestStoryId, unseen]
+GET   /v1/reels/feed?cursor=...                                 → [reel]
+POST  /v1/reels/{id}/event      {watchedMs, completed}          → ok</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Mobile] → [Edge POP / CDN] → [API GW]
+   │ direct upload                        │
+   ▼                                      ▼
+[Blob Store (S3-like)] → [Transcode Workers (FFmpeg, GPU)] → [HLS/DASH ABR]
+                                ↓ Kafka                               │
+                           [Post/Story/Reel Svc] → [Sharded MySQL/RocksDB]
+                                ↓ Kafka post-events                   │
+                           [Fanout Svc] → [Timeline Cache Redis]      ▼
+                                ↓                              [Reel CDN edges]
+                           [Reels Ranker (DNN, 2-stage)] ← [Feature Store]
+                                ↓
+                           [Engagement Stream] → [Counters Cassandra]
+</div>
+<p>Walk-through: client uploads to a presigned URL directly to blob store (bypass app servers). A Kafka event triggers transcode workers; outputs are written back to blob and registered in metadata DB. Post/Story/Reel Svc emits create-events; Fanout Svc updates follower timelines (hybrid push/pull). Reels uses a separate ranker because the candidate set is global discovery, not follow-graph.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Posts (sharded by user_id)</h3>
+<pre>CREATE TABLE posts (
+  post_id   bigint PRIMARY KEY,   -- Snowflake
+  user_id   bigint, caption text, media_ids json,
+  type      enum('photo','carousel','video','reel'),
+  created_at timestamp
+);</pre>
+<h3>7.2 Stories (TTL via partition rotation)</h3>
+<pre>-- Cassandra: TTL set on insert
+CREATE TABLE stories (
+  user_id bigint, story_id bigint, media_id text,
+  created_at timestamp, PRIMARY KEY(user_id, created_at)
+) WITH default_time_to_live = 86400;
+-- Seen-by:
+CREATE TABLE story_seen (story_id bigint, viewer_id bigint, seen_at timestamp,
+  PRIMARY KEY(story_id, viewer_id)) WITH default_time_to_live = 86400;</pre>
+<h3>7.3 Media blobs</h3>
+<p>Original in cold tier (S3 IA), HLS renditions in hot tier with CDN; immutable URLs keyed by content hash for cacheability.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Upload + transcode pipeline</h3>
+<p>Resumable chunked upload (TUS protocol). On finalize, emit Kafka. Worker pool: photo (resize to 7 sizes, WebP+JPEG, EXIF strip) ~150 ms; video (5 ABR ladders + thumbnail extraction) ~0.5–2× real-time. Idempotent by content hash.</p>
+<h3>8.2 Stories tray</h3>
+<p>Per-user "tray" cache: Redis HSET storing followed-users → latest story_id. Updated on story create. Read returns the tray sorted by recency × affinity. Seen-bit kept in Bloom filter per viewer (false-positive tolerable: shows seen instead of unseen, recoverable on tap).</p>
+<h3>8.3 Reels feed</h3>
+<p>Discovery, not follow-graph driven. Two-stage ML: candidate gen by ANN (FAISS/ScaNN over user-reel embeddings, ~1000 candidates); ranker DNN scoring P(watch_complete), P(like), P(share) blended. Diversity reranking (MMR) prevents repetitive content. Cold-start: trending pool by region.</p>
+<h3>8.4 CDN strategy</h3>
+<p>Multi-CDN (Akamai + Cloudflare + own POPs). Origin shielding for hot reels. Pre-warm top 1% predicted reels to edges before they explode.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Transcode backlog:</b> autoscale GPU pool on Kafka lag; degrade to lower-tier ladder during spikes.</li>
+  <li><b>Hot reel:</b> consistent-hash + edge shielding; pre-fetch first segment on tray render.</li>
+  <li><b>Story expiry:</b> TTL-driven Cassandra compaction is cheap; metadata cleanup via tombstones.</li>
+  <li><b>Counter contention:</b> like counts via sharded counters + async aggregation.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Direct-to-blob upload</td><td>Bypass app tier; cheap bandwidth</td><td>Auth complexity, presigned URL TTLs</td></tr>
+<tr><td>Cassandra TTL for stories</td><td>Auto-expiry, no janitor job</td><td>Tombstones can hurt reads if hot</td></tr>
+<tr><td>HLS ABR</td><td>Smooth playback over weak networks</td><td>5× storage; encoder cost</td></tr>
+<tr><td>Separate Reels ranker</td><td>Optimizes discovery objective</td><td>Two ranking stacks to maintain</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-DC media metadata; eventually-consistent like counters with CRDTs.</li>
+  <li>Ch. 6 Partitioning — sharding posts by user_id; rebalancing media chunks; hot partition mitigation.</li>
+  <li>Ch. 11 Stream Processing — Kafka-driven transcode and fanout; engagement stream powering features.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd separate three product surfaces — feed, stories, reels — because each has a different access pattern and different DB requirements; one schema does not fit all."</li>
+  <li>"The hardest part is Reels CDN economics; my mitigation is multi-CDN + predictive pre-warming for the top 1%."</li>
+  <li>"For Stories I'd lean on TTL primitives instead of building a janitor — leveraging the database is cheaper than rolling your own."</li>
+  <li>"I'd discuss client-side prefetch as part of the feed contract — bandwidth-aware, drops to lower bitrates on cellular."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>S3-class blob store</b> (media)</td><td>11-nines durability for 220 PB/year of transcoded media is non-negotiable; presigned-URL direct upload bypasses the app tier so 5K/sec peak uploads don't saturate API bandwidth, and immutable content-hashed keys make the CDN trivially cacheable.</td><td>Local SAN/NAS (cannot scale to PB), HDFS (designed for batch reads, not media serving), DB BLOBs (would require sharding 300 TB/day of binary).</td></tr>
+    <tr><td><b>FFmpeg on GPU</b> (transcode workers)</td><td>5 ABR ladders per video at ~0.5–2× real-time for 100M uploads/day requires hardware-accelerated encoding; CPU-only would require ~5× the worker fleet, blowing the 30 s upload-to-visible SLO during peaks.</td><td>CPU-only x264 (too slow at this volume), AWS Elemental MediaConvert (vendor lock + per-minute pricing at 100M/day is brutal), client-side transcoding (cannot trust client output).</td></tr>
+    <tr><td><b>HLS / DASH ABR</b></td><td>200B Reels plays/day across cellular networks needs adaptive-bitrate streaming so weak connections get the 480p ladder while WiFi gets 1080p; first-frame p95 &lt; 800 ms requires segment-0 prefetch which only works with chunked segmented formats.</td><td>Progressive MP4 (no adaptation, breaks on weak networks), proprietary streaming (loses CDN compatibility), WebRTC (overkill for one-way playback).</td></tr>
+    <tr><td><b>Sharded MySQL/RocksDB</b> (post metadata)</td><td>2B MAU with hash-partitioning by <code>user_id</code> gives us write locality on 100M post creates/day; MySQL's transactional updates handle privacy/visibility mutations, RocksDB gives us LSM write throughput for the hot index.</td><td>DynamoDB (cost at 12M reads/sec peak), Cassandra (weaker secondary index for moderation), single MySQL (cannot shard).</td></tr>
+    <tr><td><b>Cassandra</b> (Stories with TTL)</td><td>24 h ephemeral stories use <code>default_time_to_live = 86400</code> as a database primitive — no janitor job needed; tombstone-based expiry plus per-partition compaction handles 500M views/day cleanup automatically.</td><td>Redis with TTL (RAM cost too high for 500M views/day footprint), MySQL with cleanup cron (operational overhead and lag), DynamoDB TTL (vendor lock).</td></tr>
+    <tr><td><b>Redis</b> (Stories tray HSET + Timeline)</td><td>Per-user followed-users → latest <code>story_id</code> tray needs sub-ms point-lookup at feed open; 100K story-fetches/sec peak demands an in-memory store and the HSET primitive maps perfectly to (followed_user → story_id).</td><td>DynamoDB (per-op cost too high), Cassandra (point-read latency too high for 200 ms feed-open SLO), Memcached (no HSET primitive).</td></tr>
+    <tr><td><b>Apache Kafka</b> (transcode trigger + post-events)</td><td>Decouples upload-finalize from transcode (which can take 0.5–2× video length) and from fanout; replayable log lets us reprocess transcodes after worker bug fixes without losing originals, and consumer-lag drives transcode-pool autoscaling.</td><td>SQS (no replay), RabbitMQ (no durable log), direct RPC (loses backpressure and reprocess capability).</td></tr>
+    <tr><td><b>FAISS / ScaNN</b> (Reels candidate ANN)</td><td>Reels discovery is global-corpus, not follow-graph — billions of candidate videos need sub-millisecond user-embedding × video-embedding nearest-neighbor at 1.2M plays/sec; HNSW indexes hit this at acceptable recall.</td><td>Exact kNN (impossible at billion scale), Elasticsearch vector (slower per-query, higher RAM), Annoy (lower recall at this scale).</td></tr>
+    <tr><td><b>Multi-CDN</b> (Akamai + Cloudflare + own POPs)</td><td>1 EB/day Reels egress cannot ride a single CDN's economics; multi-CDN gives us peering negotiation leverage, regional fallback when one CDN has an outage, and pre-warming top 1% predicted-viral reels across providers.</td><td>Single-CDN (cost and outage risk), origin-only (impossible — would need PB/sec origin), no edge cache (defeats the 800 ms first-frame SLO).</td></tr>
+    <tr><td><b>Cassandra counters</b> (engagement)</td><td>Sharded distributed counters for likes at 200B Reels plays/day need write-throughput optimization; Cassandra's counter type with eventual consistency is fine because counts are advisory and per-user vote state lives separately.</td><td>Redis INCR (would saturate single-shard hot keys), MySQL counter row (lock contention), DynamoDB counters (cost).</td></tr>
+    <tr><td><b>Bloom filter</b> (story seen-bit)</td><td>Per-viewer seen-tracking across 500M views/day with full-fidelity storage would explode; Bloom's space efficiency wins because false-positive (showing seen instead of unseen) is recoverable with one tap, while false-negative cannot happen.</td><td>Per-user set in Redis (RAM blowup), no tracking (UX regression), exact RoaringBitmap (more space than Bloom for the FP-tolerant case).</td></tr>
+    <tr><td><b>TUS protocol</b> (resumable upload)</td><td>≤100 MB video uploads on flaky cellular networks need resume-from-byte-N; TUS is the open standard with broad client SDK support and avoids re-uploading the first 80 MB after a network blip.</td><td>Plain PUT (full re-upload on failure), proprietary chunked protocol (client-SDK fragmentation), S3 multipart-only (works but TUS is the cleaner abstraction).</td></tr>
+    <tr><td><b>Two-stage DNN ranker</b> (Reels)</td><td>1000 candidates from ANN ranked into top-N at the feed-open budget needs candidate-gen separated from heavy ranking; multi-task heads scoring P(watch_complete), P(like), P(share) with MMR diversity prevents the filter-bubble that kills retention.</td><td>Single-stage exhaustive (impossible at billion-corpus scale), pure-popularity (kills personalization), client-side rerank (cannot use server-side counters).</td></tr>
+    <tr><td><b>WebP + JPEG</b> (photo renditions)</td><td>7 photo sizes × WebP (modern) + JPEG (fallback) lets newer clients save 25–35% bandwidth while older devices still render; EXIF strip is mandatory for privacy on the 100M uploads/day surface.</td><td>JPEG-only (loses bandwidth savings), AVIF-only (decode support gaps on older devices), single-size (kills mobile rendering).</td></tr>
+  </tbody>
+</table>

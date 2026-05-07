@@ -1,0 +1,140 @@
+<h1>Design Netflix (VOD at planetary scale)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">cdn</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a global video-on-demand service that streams a curated catalog of ~17,000 titles to roughly 250 million subscribers across 190+ countries. Netflix accounts for ~15% of global internet downstream traffic at peak, delivers about 1 billion hours of viewing per week, and must keep startup latency under two seconds while maintaining 99.99% playback availability. The system spans content ingest, multi-codec transcoding, a private CDN (Open Connect), personalization, billing, and viewing telemetry.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Browse a personalized home page with rows of titles per profile.</li>
+  <li>Search the catalog by title, actor, genre.</li>
+  <li>Start, pause, resume, and seek within any title from any device.</li>
+  <li>Sync watch progress across devices within seconds.</li>
+  <li>Support offline downloads for mobile profiles.</li>
+  <li>Recommend "next title" based on viewing history and similar users.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> playback start &lt; 2 s p95; trick-play seek &lt; 500 ms.</li>
+  <li><b>Scale:</b> 250 M MAU, ~100 M concurrent peak (e.g., a tentpole release), 1 B viewing hours/week.</li>
+  <li><b>Availability:</b> 99.99% for playback, 99.9% for control plane.</li>
+  <li><b>Throughput:</b> tens of Tbps egress at peak from edge caches.</li>
+  <li><b>Durability:</b> 11 nines for master mezzanines.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 100 M concurrent / 30 s heartbeat ≈ 3.3 M control-plane RPS; manifest fetches add another 2 M RPS.</li>
+  <li>Storage: 17 K titles × 50 encodes (codec × bitrate × HDR variants) × ~5 GB avg ≈ 4 PB master + 200 PB across regional caches.</li>
+  <li>Bandwidth: avg bitrate 5 Mbps × 100 M concurrent = 500 Tbps theoretical; actual peak ~200 Tbps thanks to ABR shaping.</li>
+  <li>Telemetry: 100 M concurrent × 1 event/2 s = 50 M events/s into Kafka.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/home?profileId=...                     → rows[ {rowId,title,items[]} ]
+GET   /v1/title/{id}                              → metadata, art, trailer
+POST  /v1/playback/start  {titleId,deviceCaps}    → manifestUrl, sessionToken
+POST  /v1/playback/heartbeat {sid,position,abr}   → 204
+GET   /v1/search?q=...                            → results[]
+POST  /v1/recs/feedback  {titleId,signal}         → 204</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client TVs/Mobile]
+       │  manifest + segments
+       ▼
+[Open Connect Appliance @ ISP] ── miss ──► [Regional Fill Tier] ── miss ──► [S3 Origin]
+       │
+       │ control plane (HTTPS)
+       ▼
+[AWS Edge / Zuul GW] → [API Aggregator] → [Playback Svc] → [License/DRM]
+                                    ├──► [Personalization Svc] ← [Cassandra: viewer state]
+                                    ├──► [Catalog Svc] ← [EVCache + Cassandra]
+                                    └──► [Search (Elasticsearch)]
+                                                 │
+                                       [Kafka: play-events] → [Flink] → [S3 + Iceberg] → [Reco training]
+</div>
+<p>Clients first hit AWS for auth, manifest URLs, and personalization. Video bytes never traverse AWS — they come from Open Connect appliances (OCAs) embedded inside ISP networks, which is what makes the unit economics work at this scale.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Viewer state (Cassandra)</h3>
+<pre>CREATE TABLE viewer_progress (
+  profile_id uuid,
+  title_id   uuid,
+  position_ms bigint,
+  updated_at timestamp,
+  device_id text,
+  PRIMARY KEY (profile_id, title_id)
+);</pre>
+<h3>7.2 Why Cassandra?</h3>
+<p>Multi-region active-active with tunable consistency (LOCAL_QUORUM for writes, ONE for reads). DDIA Ch. 5 explains why leaderless replication wins for write-heavy, geographically distributed workloads where last-write-wins on a per-row basis is acceptable.</p>
+<h3>7.3 Catalog &amp; assets</h3>
+<p>Title metadata in MySQL (source of truth, low write rate) → CDC to Cassandra/EVCache for read scale. Encoded video sits in S3 (mezzanines) and is replicated to OCAs via the Open Connect proactive fill protocol nightly during off-peak hours.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Open Connect (CDN)</h3>
+<p>Custom FreeBSD appliances with NVMe and ~200 Gbps NICs, deployed inside ISPs. Each OCA stores the most-popular ~80% of the catalog for its locale. Cache fill is <i>predictive</i> — Netflix knows viewing patterns and pushes content before peak hours rather than relying on demand-driven fill, which avoids origin thundering herds.</p>
+<h3>8.2 Playback service</h3>
+<p>Issues a signed manifest pointing to the closest healthy OCA based on client IP → ISP → OCA mapping. DRM keys (Widevine/PlayReady/FairPlay) are returned via a separate license server with short TTLs.</p>
+<h3>8.3 Recommendations</h3>
+<p>Two-stage: candidate generation via collaborative filtering + content embeddings (matrix factorization, then graph-based ANN), followed by a per-row ranking model (LambdaMART). Features come from a feature store fed by Flink jobs reading the Kafka play-event stream.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Tentpole releases (e.g., new season drop):</b> pre-warm OCAs globally; rate-limit clients with progressive backoff.</li>
+  <li><b>Regional AWS outage:</b> Netflix's Chaos Monkey + region failover lets the control plane fall over to two surviving regions in &lt; 7 minutes; playback already in progress continues because it reads from OCAs.</li>
+  <li><b>Hot title:</b> consistent-hashed within an OCA cluster + tier-2 regional fill so a single appliance never melts.</li>
+  <li><b>Cassandra hot partitions:</b> bucket viewer_progress by (profile_id, day_bucket) for high-velocity profiles.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Per-title encoding ladders (vs fixed)</td><td>Saves ~20% bandwidth</td><td>Encoder cost &amp; complexity</td></tr>
+<tr><td>Owned CDN (Open Connect)</td><td>Cost, control, ISP relationships</td><td>Capex, ops burden</td></tr>
+<tr><td>Eventual consistency on progress</td><td>Cheap multi-region writes</td><td>Resume position can lag a few seconds</td></tr>
+<tr><td>Predictive cache fill</td><td>No origin thrash</td><td>Wastes some disk on cold titles</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — leaderless quorum writes for viewer state across regions.</li>
+  <li>Ch. 6 Partitioning — bucketed keys to avoid hot partitions on heavy viewers.</li>
+  <li>Ch. 11 Stream Processing — Kafka + Flink pipeline for play telemetry feeding the feature store.</li>
+  <li>Ch. 12 Future of Data Systems — derived data via CDC from MySQL → search/cache.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd separate control plane (AWS) from data plane (OCAs) on day one — it's the single decision that makes Netflix economics work."</li>
+  <li>"For a tentpole launch, the bottleneck is not encoding or storage, it's last-mile ISP capacity, so I'd lean on predictive fill 24 hours ahead."</li>
+  <li>"The hardest part is recommendation freshness — viewing patterns shift hourly but model retraining is daily; my mitigation is a real-time re-ranker on top of cached candidates."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Open Connect (custom CDN)</b></td><td>200 Tbps peak egress is uneconomical on commercial CDNs; FreeBSD appliances at 200 Gbps NICs sit inside ISPs serving 80% of catalog locally and skip transit costs entirely.</td><td>Akamai/Cloudfront — transit cost prohibitive at 1B hours/week; Fastly — edge compute great but no ISP-embedded boxes</td></tr>
+    <tr><td><b>Cassandra</b></td><td>Viewer progress is 250M profiles writing every 30s across 190 countries; leaderless quorum (LOCAL_QUORUM write, ONE read) gives multi-region active-active without coordinator bottleneck on resume-position writes.</td><td>DynamoDB — region lock-in; CockroachDB — strong consistency unneeded for last-write-wins progress; MySQL — no multi-region active-active</td></tr>
+    <tr><td><b>EVCache (memcached)</b></td><td>Catalog reads dominate (3.3 M control-plane RPS) and metadata is small/immutable per release; Netflix's tiered EVCache absorbs reads at sub-ms latency, freeing Cassandra for write-heavy state.</td><td>Redis — single-threaded bottleneck for this fan-out; in-process LRU — no shared state across stateless nodes</td></tr>
+    <tr><td><b>MySQL</b></td><td>Title catalog is the source of truth — low write rate, transactional updates on artwork/availability windows, requires referential integrity for content rights. CDC fans it out to read stores.</td><td>Postgres — fine alternative, MySQL was the historical choice; Cassandra — no transactions for rights changes</td></tr>
+    <tr><td><b>Kafka</b></td><td>50 M telemetry events/s require a partitioned log that can be replayed for reco model training and counter-factual analysis; Kafka's retention + consumer-group semantics make play-events a durable source-of-truth stream.</td><td>Pulsar — less mature in 2010s when chosen; Kinesis — AWS lock-in conflicts with multi-region DR</td></tr>
+    <tr><td><b>Apache Flink</b></td><td>Stream processing for real-time features feeding the reco feature store; exactly-once semantics on 50 M events/s, event-time windowing for sessionization across the play heartbeat stream.</td><td>Spark Streaming — micro-batch latency too high; Storm — no exactly-once</td></tr>
+    <tr><td><b>S3</b></td><td>11 nines durability for 4 PB of mezzanine masters at $0.023/GB; intelligent-tiering lets old titles drop to Glacier-IR for AV1 backfill without restore latency.</td><td>HDFS — 11-nines requires triple-replicate at 3× cost; GCS — multi-cloud already, no migration value</td></tr>
+    <tr><td><b>Apache Iceberg</b></td><td>Schema evolution on petabyte-scale viewing tables for reco training; time-travel for back-testing model regressions; works over the same S3 buckets without copying data.</td><td>Delta Lake — Databricks-leaning; Hive — no ACID, no schema evolution</td></tr>
+    <tr><td><b>Elasticsearch</b></td><td>Catalog search across title/actor/genre needs fuzzy matching, language analyzers for 30+ locales, and faceted aggregations; 17 K titles fits comfortably in a small cluster with sub-100ms queries.</td><td>Solr — equivalent capability, smaller ecosystem; Postgres FTS — no language analyzers at this depth</td></tr>
+    <tr><td><b>Zuul</b></td><td>API gateway that handles 3.3 M control-plane RPS with dynamic routing, canarying, and per-device-class throttling; Netflix-owned so it tightly integrates with Eureka service discovery.</td><td>Envoy — viable today; AWS API Gateway — quotas don't fit Netflix scale</td></tr>
+    <tr><td><b>Widevine / PlayReady / FairPlay</b></td><td>Studios contractually require all three DRM systems for premium 4K HDR content across browsers, Android, and Apple devices; short-TTL license tokens limit key-leak blast radius.</td><td>Single-DRM — studio contracts forbid; clear-key — non-starter for studio content</td></tr>
+    <tr><td><b>Per-title encoding (VMAF-driven)</b></td><td>Saves ~20% bandwidth at equivalent perceived quality; on 200 Tbps peak, that's ~40 Tbps and millions in transit savings vs a fixed bitrate ladder.</td><td>Fixed ladder — wastes bandwidth on simple content; per-shot encoding — even better but encoder cost too high for 17K catalog</td></tr>
+    <tr><td><b>Chaos Monkey / FIT</b></td><td>99.99% playback availability isn't reachable without continuous failure injection; Netflix proves regional failover by killing it weekly so the 7-minute recovery is a measured number, not a hope.</td><td>Manual GameDays — too infrequent; no chaos testing — outages caught in production</td></tr>
+  </tbody>
+</table>

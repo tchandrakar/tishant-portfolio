@@ -1,0 +1,160 @@
+<h1>Design Video Upload &amp; Processing Pipeline (chunked, resumable, virus scan, thumbnails)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">file-storage</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the end-to-end upload path for a video platform: from a creator pressing "Upload" on flaky mobile data, all the way through chunked transfer, integrity verification, virus/malware scanning, thumbnail extraction, and handoff to the transcoding pipeline. The system must support multi-GB files (a 4K hour-long video can be ~20 GB), survive network drops, deduplicate identical re-uploads, and reject malicious content before it ever becomes visible.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Resumable, chunked upload with byte-range continuation.</li>
+  <li>Client-side and server-side hash verification (SHA-256).</li>
+  <li>Pre-signed direct-to-object-store uploads (bypass app servers).</li>
+  <li>Virus / malware scan on the assembled file.</li>
+  <li>Probe (codec, duration, resolution) and reject malformed files.</li>
+  <li>Thumbnail extraction (poster + storyboard sprite).</li>
+  <li>Deduplication: if hash already exists, skip transcoding.</li>
+  <li>Webhook / callback when ready for transcode.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Reliability:</b> tolerate up to 100 retries / connection drops per upload session; sessions valid for 7 days.</li>
+  <li><b>Throughput:</b> ingest 720 TB/day raw at YouTube-scale; spike to 2× during creator events.</li>
+  <li><b>Security:</b> 100% of files virus-scanned before transcode kickoff; no execution path that bypasses scan.</li>
+  <li><b>Latency:</b> finalize-to-thumbnail &lt; 30 s for a 1 GB file.</li>
+  <li><b>Cost:</b> upload bytes are billed once; avoid double-write.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Sessions: 5 M creators/day × 1.5 uploads = 7.5 M sessions/day → ~90 sessions/s avg, ~1k/s peak.</li>
+  <li>Chunks: avg 8 MB chunk × 100 chunks/file × 7.5 M files = 750 M chunks/day = ~9k chunks/s.</li>
+  <li>Storage staging: 7-day retention on raw uploads = ~5 PB rolling.</li>
+  <li>Scan compute: ~1 s/GB on a modern engine × 1 PB/day = ~12 scan-CPU-yrs/day → ~12k scanner cores.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/upload/init   {filename,size,sha256,mime}    → {uploadId, partSize, urls[]}
+PUT   {urls[i]}         (presigned S3 multipart part)   → ETag header
+POST  /v1/upload/{id}/complete  {parts:[{n,ETag}]}      → {assetId, status:scanning}
+GET   /v1/upload/{id}/status                            → {state, missingParts[]}
+POST  /v1/upload/{id}/abort                             → 204
+POST  /v1/webhook/transcode-ready (internal)            → 204</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Creator]
+   │
+   ▼  init  ┌────────────────┐
+[Edge GW] ─►│ Upload Init Svc│─► allocates uploadId, returns presigned URLs
+            └───────┬────────┘
+                    ▼
+           [DynamoDB: sessions]
+   │
+   │  PUT chunks (presigned, direct)
+   ▼
+[S3 multipart staging bucket]
+   │
+   ▼  complete
+[Upload Finalize Svc] ─► assemble (S3 CompleteMultipartUpload)
+                         │
+                         ├─► [Probe Worker] (ffprobe → metadata)
+                         ├─► [Hash check]   (SHA-256 vs client-provided)
+                         ├─► [Virus Scanner] (ClamAV / commercial)
+                         ├─► [Thumbnail Worker] (poster + sprite)
+                         │
+                         ▼
+                 [Asset DB] ── on success ──► [Transcode Job Queue]
+                                                    │
+                                                    ▼
+                                             [Transcode Pipeline]
+</div>
+<p>Direct-to-S3 multipart uploads with presigned URLs is the architectural cornerstone — bytes never traverse app servers, so the upload service stays cheap and the bandwidth bill is paid only once.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Upload session (DynamoDB)</h3>
+<pre>CREATE TABLE upload_sessions (
+  upload_id   string PK,
+  user_id     string,
+  asset_id    string,
+  size        bigint,
+  sha256      string,
+  state       string,    -- init|uploading|assembling|scanning|ready|failed
+  parts       list&lt;{n:int,etag:string,size:int}&gt;,
+  created_at  timestamp,
+  ttl         number     -- 7-day TTL
+);</pre>
+<h3>7.2 Why DynamoDB / KV?</h3>
+<p>Single-key access pattern (upload_id), TTL for cleanup, predictable single-digit-ms reads. No relational queries needed.</p>
+<h3>7.3 Object layout</h3>
+<p>Staging bucket: <code>uploads/{userId}/{uploadId}/parts/...</code> with 7-day lifecycle to delete unfinished sessions. Finalized objects move (server-side copy) to <code>raw/{assetId}/master.mp4</code> with object lock.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Resumable chunking</h3>
+<p>Client splits the file into N parts (S3 multipart minimum 5 MB except last). On a network drop, client calls <code>/status</code>, receives <code>missingParts</code>, and PUTs only those. Each PUT is idempotent because S3 keys parts by partNumber.</p>
+<h3>8.2 Hash verification</h3>
+<p>Client provides full-file SHA-256 at init. After CompleteMultipartUpload the finalize worker streams the assembled object through SHA-256 and compares. Mismatch → reject; this catches both transmission corruption and tampering between init and complete.</p>
+<h3>8.3 Virus scan</h3>
+<p>Scan in a sandbox VPC with no egress to the public internet, results published to a Kafka topic. Quarantine bucket holds infected files for forensic review; scanner version is recorded per asset so rescans can be triggered when sigs update. Crucially: nothing reads from <code>raw/</code> until the scan is green.</p>
+<h3>8.4 Probe + thumbnails</h3>
+<p>ffprobe extracts duration, codec, container, AV streams. Reject if duration &gt; max, codec is unknown, or no video stream. Thumbnails generated at 0% / 25% / 50% / 75% + a sprite sheet (10×10 grid at uniform intervals) for scrubber preview.</p>
+<h3>8.5 Deduplication</h3>
+<p>Lookup sha256 in an asset_hash index. On hit, return the existing assetId without re-running transcode — saves enormous compute on identical re-uploads (common for multi-account creators or restoration jobs).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot creator burst:</b> presigned URLs are stateless — the upload service horizontally scales without coordination.</li>
+  <li><b>Scanner backlog:</b> autoscale on queue depth; ClamAV is CPU-bound, so spot fleets work well.</li>
+  <li><b>Mobile flakiness:</b> default chunk size = 8 MB to minimize re-PUT cost on retries; client adaptively shrinks chunk size on bad networks.</li>
+  <li><b>Abandoned sessions:</b> 7-day TTL on session row + S3 lifecycle on parts prefix prevents storage leak from sessions that never call complete.</li>
+  <li><b>Replay attacks:</b> presigned URLs scoped to (uploadId, partNumber) and expire in 1 hour.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Direct-to-S3 multipart</td><td>Bandwidth bypasses app tier</td><td>Client SDK must understand S3 quirks</td></tr>
+<tr><td>Mandatory virus scan gate</td><td>No malware reaches viewers</td><td>Adds 30–60 s to publish latency</td></tr>
+<tr><td>SHA-256 dedup</td><td>Saves transcode compute on re-uploads</td><td>Must guard against hash collision (use full-file SHA-256, not partial)</td></tr>
+<tr><td>7-day session TTL</td><td>Resumable for travelers</td><td>Storage cost on abandoned uploads</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 7 Transactions — multipart-upload assembly is logically a single atomic commit; CompleteMultipartUpload is the commit boundary.</li>
+  <li>Ch. 11 Stream Processing — pipeline events (uploaded → scanned → probed → ready) modeled as an event log so any consumer (transcode, search, moderation) can react.</li>
+  <li>Ch. 8 Trouble with Distributed Systems — idempotent chunk PUTs and at-least-once finalize.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The single biggest design lever is presigned direct-to-store uploads — without it, you're paying for upload bandwidth twice."</li>
+  <li>"I'd treat the virus scan as a hard gate, not a side-effect — assets are unreadable by transcode until the scan emits a green event."</li>
+  <li>"For mobile creators, adaptive chunk size on the client is more impactful than any server-side change; an 8 MB chunk on 3G is a disaster."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>S3 multipart uploads</b></td><td>Native byte-range parts (5 MB minimum, 10K max parts) with idempotent partNumber semantics handle the 20 GB 4K hour-long video cleanly; CompleteMultipartUpload acts as the atomic commit boundary.</td><td>Single PUT — fails for &gt; 5 GB; tus.io — not natively cloud-managed; custom chunking — reinvents what S3 already does</td></tr>
+    <tr><td><b>Presigned URLs</b></td><td>Bytes flow direct to object store; the upload service stays cheap because no app server proxies 720 TB/day. Per-(uploadId, partNumber) scope with 1-hour expiry blocks replay attacks.</td><td>App-server proxy — pays for upload bandwidth twice; public bucket — security disaster</td></tr>
+    <tr><td><b>DynamoDB</b></td><td>Single-key access on upload_id with predictable single-digit-ms reads at 1k sessions/s peak; native TTL on session rows cleans up abandoned uploads after 7 days without a sweep job.</td><td>Postgres — TTL needs cron, scaling at 9k chunks/s painful; Redis — no durability for 7-day sessions</td></tr>
+    <tr><td><b>SHA-256</b></td><td>Collision-resistant integrity check on assembled file; client-provided hash compared post-CompleteMultipartUpload catches both transmission corruption and tampering between init and complete.</td><td>MD5 — collision attacks defeat dedup; CRC32 — too weak for hash-based dedup index</td></tr>
+    <tr><td><b>ClamAV (or commercial scanner)</b></td><td>Mandatory virus gate before transcode kickoff; sandbox VPC with no public egress contains malicious payloads even if scanner has 0-day; ~1 s/GB on modern engines covers 12k scanner cores at 1 PB/day.</td><td>No scan — viewers exposed; on-publish scan — too late, transcode already burned compute</td></tr>
+    <tr><td><b>FFprobe</b></td><td>Probes codec, duration, container, AV streams in one shot before transcode; rejects malformed files at upload-time so we don't waste encoder slots on garbage inputs.</td><td>MediaInfo — works but FFprobe is closer to FFmpeg pipeline; manual parsing — fragile</td></tr>
+    <tr><td><b>Apache Kafka</b></td><td>Pipeline events (uploaded → scanned → probed → ready) modeled as an event log so transcode, search, moderation, and analytics consume independently; replay capability for backfilling missed scan rescans on signature updates.</td><td>SNS/SQS — no replay; webhooks — no fan-out across consumers</td></tr>
+    <tr><td><b>S3 lifecycle rules</b></td><td>7-day expiry on <code>uploads/{userId}/{uploadId}/parts/</code> prefix automatically reclaims storage from sessions that never call complete; no cleanup cron required.</td><td>Cron-based cleanup — race conditions; manual TTL — bug-prone</td></tr>
+    <tr><td><b>S3 Object Lock</b></td><td>Finalized raw masters in <code>raw/{assetId}/master.mp4</code> are immutable; protects against accidental overwrite or ransomware on the irreplaceable source.</td><td>Versioning only — still allows overwrite; no protection — single bug deletes user content</td></tr>
+    <tr><td><b>Pub/Sub-style webhook</b></td><td>Transcode-ready notification is a clean handoff to the next pipeline stage; idempotent receiver pattern means at-least-once delivery is safe.</td><td>Synchronous call — couples upload to transcode availability; polling — wastes RPS</td></tr>
+    <tr><td><b>Adaptive client chunk size</b></td><td>8 MB default minimizes re-PUT cost on retries; client shrinks to 1–2 MB on bad mobile networks to keep retry penalty bounded — a single 8 MB chunk failing on 3G is a 60s setback.</td><td>Fixed 8 MB — kills mobile UX; fixed 1 MB — too many round trips on fast networks</td></tr>
+    <tr><td><b>Hash-based dedup index</b></td><td>SHA-256 lookup on init returns existing assetId for identical re-uploads (common for multi-account creators / restoration); skips transcode entirely, saving the 30-min standard ladder cost.</td><td>No dedup — wastes encoder fleet; partial hash — collision risk</td></tr>
+    <tr><td><b>Edge gateway with rate limit</b></td><td>Hot creator burst (1k init/s peak) protected by per-user-id token-bucket; presigned URLs are stateless so the upload service horizontally scales without coordination.</td><td>No rate limit — abuse vector; coordinated state — adds bottleneck</td></tr>
+  </tbody>
+</table>

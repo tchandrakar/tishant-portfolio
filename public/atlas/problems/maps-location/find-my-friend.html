@@ -1,0 +1,192 @@
+<h1>Design Find My Friend / Find My Device (real-time location)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a privacy-respecting service that shares the user's live location with a small allow-list of friends/family, plus a "Find My Device" mode for offline phones using a crowdsourced Bluetooth mesh. Hard requirements: end-to-end encryption, fine-grained sharing controls, last-known-location even when the device is offline, sub-10 s update propagation, and battery efficiency on the device side.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Share live location with N specific contacts (N ≤ 50) for a duration (1 h, 8 h, indefinitely).</li>
+  <li>See contacts on a map with name, accuracy circle, last-update age, battery %.</li>
+  <li>Geofence alerts: notify when contact arrives/leaves a place.</li>
+  <li>Offline device finding: nearby Apple-/Google-style Bluetooth mesh reports encrypted beacons.</li>
+  <li>"Notify when leaves home" recurring rules; SOS sharing on demand.</li>
+  <li>End-to-end encryption: server cannot read locations.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> location update visible to friend &lt; 10 s p99.</li>
+  <li><b>Scale:</b> 800 M users, 200 M concurrent sharers, ~1 update/30 s while moving.</li>
+  <li><b>Throughput:</b> 6.6 M location writes/s peak.</li>
+  <li><b>Battery:</b> &lt;2% per hour on phone (significant location change API).</li>
+  <li><b>Privacy:</b> E2EE; server-side keys never see plaintext lat/lng.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Writes: 200 M sharers × 2/min = 6.6 M wps; each ciphertext 80 B → 530 MB/s ingest.</li>
+  <li>Last-known store: 800 M users × 200 B = 160 GB — Redis cluster + persistent backing.</li>
+  <li>Pub/Sub fanout: avg 5 subscribers per sharer → 33 M wps push notifications via long-lived WebSocket.</li>
+  <li>BLE beacons (offline finding): 1 B devices × 1 beacon/2 s = 500 M beacons/s globally; reports stochastically uploaded by passers-by → ~3 M reports/s.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/share/start    {audience:[uid…], ttl, ekey}        → shareId
+POST  /v1/location       {shareId, ts, ciphertext, accuracy} → 204
+GET   /v1/locations      via WebSocket subscribe(audienceId) → push frames
+POST  /v1/geofence       {placeId, radius_m, on:[enter|exit]} → ruleId
+POST  /v1/beacons/report {ephemeralId, ts, observer_loc_hash}→ 204 (BLE finder)
+POST  /v1/devices/lookup {ephemeralIdHashes}                 → encrypted reports</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Phone]──TLS──▶[Edge Gateway]──gRPC──▶[Location Ingest]──▶[Kafka: locations]
+   ▲                                                                │
+   │ WebSocket push                                                  ▼
+[Phone Friend]◀────[Fanout Svc]◀────[Stream Processor: route by audience]
+                         │
+                         ▼
+                 [Redis: last_known_loc{uid}]
+                 [Cassandra: history (E2EE blobs)]
+                 [Geofence Engine] ─▶ [Push (APNs/FCM)]
+
+[BLE Mesh]──passers-by uploads──▶[Beacon Ingest]──▶[Encrypted index by HMAC(ephId)]
+[Owner lookup]──▶[Match → encrypted report list]──▶[Owner decrypts]
+</div>
+<p>The phone encrypts (lat,lng,ts) under a per-share symmetric key shared E2E with the audience; server stores opaque ciphertext. Audience clients hold the key and decrypt locally. Stream processor routes by audienceId without inspecting payload — privacy by construction.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Last-known (Redis)</h3>
+<pre>HSET loc:{uid} ts &lt;epoch&gt; ct &lt;b64 ciphertext&gt; acc 12 batt 73</pre>
+<h3>7.2 History (Cassandra, 7-day TTL)</h3>
+<pre>CREATE TABLE loc_hist (
+  uid uuid, ts timestamp, ciphertext blob, accuracy int,
+  PRIMARY KEY (uid, ts)) WITH default_time_to_live = 604800;</pre>
+<h3>7.3 BLE finder index (sharded RocksDB)</h3>
+<pre>row_key = HMAC(ownerKey, ephemeralId)  // server can match without knowing owner
+val     = encrypted{observer_loc, ts}</pre>
+<h3>7.4 Why this mix?</h3>
+<p>Redis: sub-ms reads on the hot last-known per user — UI demands snap responsiveness. Cassandra: cheap timeseries with TTL to cap storage; also the only thing the server keeps long-term, and it is opaque ciphertext. RocksDB w/ HMAC keying gives obliviousness for offline finding (Apple's actual design).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Push fanout</h3>
+<p>Persistent WebSocket per friend client → routed via consistent-hash on audienceId. Backpressure: server drops intermediate frames if friend is slow (we only need latest); FIFO is unnecessary, latest-wins.</p>
+<h3>8.2 E2EE key management</h3>
+<p>X3DH-style initial handshake when a share starts; per-share symmetric key wrapped to each member's identity key. Server stores wrapped keys, never the raw key. Revocation: rotate key, push to remaining audience.</p>
+<h3>8.3 Geofence engine (DDIA Ch. 11)</h3>
+<p>Stream processor consumes Kafka location topic, maintains in-memory R-tree per user shard of their fences, emits enter/exit events to APNs/FCM. Because lat/lng is encrypted, fences are evaluated <i>on-device</i> for E2EE shares; only "send notification ABC" instructions hit the server.</p>
+<h3>8.4 Offline device finding</h3>
+<p>Lost device broadcasts ephemeral BLE IDs derived from a rolling secret. Other phones nearby (any vendor user opted in) hash the ID with their location and upload. Owner, knowing the secret schedule, queries by HMAC and decrypts reports locally.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>WebSocket count:</b> 200 M concurrent — needs ~200 K connection servers at 1 K conn each; sticky LB by audience hash.</li>
+  <li><b>Battery:</b> use OS "significant location change" + activity recognition — only stream when moving.</li>
+  <li><b>Hot audiences (e.g., parent → kid):</b> dedup writes from same uid within 5 s window.</li>
+  <li><b>BLE flood:</b> probabilistic upload (1 in 100 observers) keeps load tractable while preserving find-rate.</li>
+  <li><b>Disaster mode:</b> SOS bypasses E2EE with explicit consent — emergency contacts get plaintext.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>E2EE locations</td><td>Strong privacy, audit-friendly</td><td>Server-side geofencing impossible; ML on locations forbidden</td></tr>
+<tr><td>Latest-wins fanout</td><td>Cheap, low memory</td><td>Lose breadcrumb trail on slow client</td></tr>
+<tr><td>BLE crowdsourced finding</td><td>Find offline devices anywhere</td><td>Privacy risk if rotation broken; legal complexity</td></tr>
+<tr><td>WebSocket vs polling</td><td>Sub-second push</td><td>Connection state management</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — Kafka + per-audience routing.</li>
+  <li>Ch. 5 Replication — Redis active-passive across regions for last-known.</li>
+  <li>Ch. 8 Trouble — clock skew on devices; we trust server-stamped receive_ts for ordering.</li>
+  <li>Ch. 12 Future — privacy by computation (E2EE) over privacy by policy.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The product is a privacy product first; if I can't say 'the server cannot read your location,' I haven't designed Find My."</li>
+  <li>"BLE crowdsourced finding is the most interesting subsystem — happy to whiteboard the rotating-ID scheme."</li>
+  <li>"Battery is the silent killer; significant-change API + adaptive cadence beats a fixed 30 s timer."</li>
+  <li>"For MVP, do server-side plaintext + TLS, ship in a quarter, then layer E2EE in v2 with key rotation."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Redis Cluster (last-known location)</td>
+      <td>800 M users × 200 B = 160 GB of last-known state with sub-ms read SLA on the friend-map UI. Redis HSET keyed by uid serves the 6.6 M wps overwrite traffic and 33 M fan-out reads with predictable latency; persistent backing handles failover.</td>
+      <td>Memcached (no replication or persistence); DynamoDB (5-10 ms p99 too slow); in-memory app state (no durability across pod restarts).</td>
+    </tr>
+    <tr>
+      <td>Cassandra (E2EE history with TTL)</td>
+      <td>Server cannot read the payload, so we just need cheap append-only storage with 7-day TTL. Cassandra's per-row TTL automatically reclaims space; clustering by ts gives cheap "last 24 h trail" reads. Linear write scaling matches 6.6 M wps peak.</td>
+      <td>S3 (latency too high for tail reads); DynamoDB (TTL is best-effort, 48 h delay); ScyllaDB (similar, chose Cassandra for ecosystem).</td>
+    </tr>
+    <tr>
+      <td>Kafka (location ingest fanout)</td>
+      <td>6.6 M wps with audience-routed fanout to 33 M push events/s requires a durable, replayable stream. Partitioning by audienceId co-locates a sharer's writes with the fanout consumer's keyed state, eliminating cross-partition shuffles at peak.</td>
+      <td>NATS JetStream (less mature for our scale); SQS (no ordering, fanout is 1× not free); Pulsar (smaller talent pool).</td>
+    </tr>
+    <tr>
+      <td>WebSocket (push to friend clients)</td>
+      <td>200 M concurrent sharers and the &lt;10 s end-to-end SLA make polling untenable — at 30 s polls we'd burn ~6 M rps just on heartbeats. Persistent WebSocket gives sub-second push and lets us implement "latest-wins" frame dropping when a client falls behind.</td>
+      <td>HTTP long-poll (3× connection churn); SSE (no client→server channel for ack); MQTT (great fit, chose WebSocket for browser compat parity).</td>
+    </tr>
+    <tr>
+      <td>X3DH key agreement (E2EE setup)</td>
+      <td>The product promise is "server cannot read your location." X3DH (Signal's protocol) lets a sharer establish per-share keys with up to 50 audience members without round-trips per session, even when they're offline at handshake time — critical for 30 s update cadence.</td>
+      <td>Plain ECDH (requires both parties online); MLS (overkill for ≤50-member groups, still maturing); server-managed keys (defeats E2EE purpose).</td>
+    </tr>
+    <tr>
+      <td>RocksDB + HMAC keying (BLE finder index)</td>
+      <td>Offline finding ingests ~3 M beacon reports/s; the server matches without knowing owners by storing rows keyed on HMAC(ownerKey, ephemeralId). RocksDB's LSM gives cheap sequential writes for this append-heavy workload, and per-shard isolation contains the 500 M-beacon-equivalent index size.</td>
+      <td>Bigtable (similar, chose RocksDB for tighter latency control); Cassandra (heavier compaction overhead per beacon); plain S3 (no point-lookup on HMAC at this rate).</td>
+    </tr>
+    <tr>
+      <td>BLE rotating ephemeral IDs (Apple/Google scheme)</td>
+      <td>An owner needs to find their lost AirTag/phone via crowdsourced reports without enabling stalking. Rotating IDs derived from a shared secret schedule (every ~15 min) give the owner pseudonymous lookup ability while making cross-time tracking by adversaries computationally expensive.</td>
+      <td>Static MAC broadcast (trivially trackable); centralised GPS upload (not "offline finding"); device-mesh protocols (no BLE-only consumer device support).</td>
+    </tr>
+    <tr>
+      <td>R-tree (in-memory geofence engine)</td>
+      <td>Each user has up to ~10 fences; checking a stream of 6.6 M wps locations against fences needs O(log n) point-in-rect tests per shard. R-tree on a per-user-shard basis fits in MB of RAM and adds &lt;1 µs per ping when fences are rare.</td>
+      <td>KD-tree (worse for rectangle queries); brute scan (fine for a few fences but doesn't compose with shared-state operators); PostGIS (orders of magnitude too slow at 6.6 M wps).</td>
+    </tr>
+    <tr>
+      <td>APNs / FCM (push notifications)</td>
+      <td>Geofence enter/exit and SOS alerts must reach the recipient when the app is backgrounded — only the platform push services hit the OS-level wakeup path. Reliability and battery cost are amortised by the OS provider rather than by us holding 200 M extra background sockets.</td>
+      <td>Custom WebSocket while backgrounded (iOS kills it; battery hostile); SMS (cost prohibitive); email (latency, deliverability).</td>
+    </tr>
+    <tr>
+      <td>Significant Location Change API (battery)</td>
+      <td>Hard NFR: &lt;2% battery/hour. iOS/Android's significant-change API uses cell-tower triangulation, only waking the app when the user has actually moved ~500 m. This collapses our typical update cadence from 1/30 s while idle to 1/several minutes — the difference between a viable product and one users uninstall.</td>
+      <td>Continuous GPS (drains 10%+/hr); fixed 30 s timer (battery hostile while parked); accelerometer-only (poor lat/lng accuracy).</td>
+    </tr>
+    <tr>
+      <td>Consistent-hash routing on audienceId</td>
+      <td>200 M concurrent WebSocket connections need sticky LB so a sharer's writes hit the same fanout instance as the audience's subscriptions, avoiding cross-pod RPC at 33 M push/s. Consistent hashing also keeps reshuffle small (~1/N keys) when we scale connection servers.</td>
+      <td>Random LB (would need cross-pod gossip); session-affinity cookies (don't survive reconnects); sharded broker (extra hop).</td>
+    </tr>
+    <tr>
+      <td>Daily-rotating salt for device-id hashing</td>
+      <td>BLE finder reports must not let any single party (server or observer) build long-term tracking profiles. Hashing device IDs with a daily salt provides unlinkability across days while preserving same-day deduplication for spam control.</td>
+      <td>Static hash (trivially linkable); per-request salt (breaks dedup); zero-knowledge proofs (mature in research but heavy at 3 M reports/s).</td>
+    </tr>
+    <tr>
+      <td>Latest-wins frame dropping (fanout backpressure)</td>
+      <td>Friends only need the freshest pin; intermediate frames can be dropped when a client is slow. This trades the breadcrumb trail for bounded memory per connection — at 200 M sockets, even 100 KB of buffered frames per slow client equals 20 TB of RAM saved.</td>
+      <td>FIFO with bounded queue (drops new data, worse UX); per-frame ack (10× fanout amplification); store-and-forward via Cassandra (extra read per push).</td>
+    </tr>
+  </tbody>
+</table>

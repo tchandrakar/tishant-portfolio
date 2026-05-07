@@ -1,0 +1,137 @@
+<h1>Design Distributed ID Generator (Snowflake, ULID, K-sortable)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">misc</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a service that issues globally-unique 64-bit (or 128-bit) IDs across thousands of producer hosts in multiple data centers, with no coordination on the hot path. The IDs must be roughly time-sortable so that B-tree-based indexes append on the right edge instead of fragmenting. Twitter Snowflake (10 K IDs/ms/worker, 1024 workers) and Instagram's sharded counters are the canonical references; we want both.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Generate 64-bit IDs at &gt; 1 M/sec aggregate, with optional 128-bit ULID variant.</li>
+  <li>K-sortable: monotonic per worker; globally near-monotonic.</li>
+  <li>Embed metadata: timestamp, worker, sequence (so we can shard by ID).</li>
+  <li>Survive worker restarts, clock skew, leap seconds without duplicates.</li>
+  <li>Optional sidecar library (in-process) and standalone gRPC service.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> in-process &lt; 200 ns; gRPC sidecar p99 &lt; 1 ms.</li>
+  <li><b>Throughput:</b> 4096 IDs/ms/worker, 1024 workers/region → 4 B IDs/sec/region.</li>
+  <li><b>Uniqueness:</b> mathematically impossible duplicates within the configured epoch (~69 yr).</li>
+  <li><b>Availability:</b> 99.999% on the hot path — dependency for every write in the platform.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Bit budget: 41 timestamp ms (~69 yr) + 10 worker (1024) + 12 seq (4096/ms) = 63 + sign.</li>
+  <li>At 4 K IDs/ms × 1024 workers = 4.1 B/sec. One region exhausts 64-bit space in ~70 yr — fine.</li>
+  <li>ZooKeeper for worker-id leases: ~1024 znodes, &lt; 1 MB total state.</li>
+  <li>NTP-disciplined clocks; PTP in racks for ±100 µs.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// In-process
+uint64_t snowflake_next(SfCtx* ctx);
+
+// Sidecar
+rpc NextID(BatchReq{count}) returns (BatchResp{ids[]});
+rpc Decode(IDReq{id}) returns (Parts{ts, worker, seq});
+
+// REST shim
+GET  /v1/id?count=100        → {ids:[...]}
+GET  /v1/id/decode/{id}      → {ts, worker, seq}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">                       +---------------------+
+[App pod] --rpc--&gt;     |  Snowflake sidecar  |  &lt;-- ZooKeeper /workers/{region}/{id}
+                       +----------+----------+
+                                  |
+                                  | (in-process lib)
+[App] --link-time--&gt; libsf.so   --+
+                                  |
+                                  v
+                  64 bits = [ 1 sign | 41 ts-ms | 10 wkr | 12 seq ]
+                                  ^
+                                  |
+                  NTP/PTP --&gt; monotonic clock guard --&gt; refuse to issue if clock went backward
+</div>
+<p>Walk-through: each worker boots, leases an unused worker-id from ZooKeeper (ephemeral znode); the lease lasts the worker lifetime. Every call advances the millisecond timestamp; if the same ms, increment the 12-bit seq; if seq overflows, busy-wait to next ms. If wall clock moves backward, refuse to issue (or stall) until clock catches up.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Worker registry (ZooKeeper)</h3>
+<pre>/idgen/
+  /regions/us-east-1/workers/0042   (ephemeral, value = host:pid)
+  /regions/us-east-1/workers/0043   (ephemeral, value = host:pid)</pre>
+<h3>7.2 ULID variant (128-bit)</h3>
+<pre>128 bits = [ 48 ts-ms (Unix epoch, ~10889 AD) | 80 random ]
+Crockford-base32 encoding -&gt; 26 chars, sortable lexically.</pre>
+<h3>7.3 Why k-sortable?</h3>
+<p>B-tree primary keys (Postgres, MySQL) suffer page splits and write amplification when keys are random (UUIDv4). K-sortable IDs keep inserts on the right edge — see DDIA Ch. 3, "Comparing B-Trees and LSM-Trees", and Ch. 6 on partitioning by key range vs hash.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Clock-skew defense</h3>
+<p>On boot, sync to NTP and refuse to start if offset &gt; 50 ms from peer median. At runtime, monotonic clock drives the timestamp — wall clock is read once per ms and clamped: <code>ts = max(last_ts, now)</code>. If <code>now &lt; last_ts</code> by &gt; 5 ms, return error and let upstream fail-fast.</p>
+<h3>8.2 Worker-id leasing</h3>
+<p>ZooKeeper SEQUENTIAL+EPHEMERAL ensures unique IDs without manual config. On session expiry, ID is reclaimable after a 30 s TTL safety wait (longer than the 41-bit ms granularity allows the prior owner to drift).</p>
+<h3>8.3 Batch issue</h3>
+<p>Sidecar serves <code>NextID(count=100)</code> in one RPC: pre-allocate a 100-wide seq range under the same ms (or roll over). Slashes RPC overhead 100× for bulk inserters (Kafka producers, ETL).</p>
+<h3>8.4 Alternatives</h3>
+<p>UUIDv7 (RFC 9562) is essentially Snowflake without the worker bits — relies on entropy for uniqueness. Sonyflake uses 39-bit ts/sec for longer life; MongoDB ObjectId uses 96 bits with machine + counter. Choose based on whether you control all generators.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Sequence exhaustion in 1 ms:</b> rare in practice; busy-wait is cheap. Go beyond 4096/ms by widening seq bits at the cost of ts range.</li>
+  <li><b>ZooKeeper as SPOF:</b> 5-node ensemble in each region; in-process clients cache the lease — ZK can be down for hours and existing workers keep issuing.</li>
+  <li><b>Cross-region monotonicity:</b> not guaranteed — only per-worker. Documented contract; consumers do not assume global ordering.</li>
+  <li><b>Leap seconds:</b> use <code>CLOCK_TAI</code> or smear (Google-style) so wall clock never goes backward.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Snowflake 64-bit</td><td>Fits in BIGINT, k-sortable, fast</td><td>Worker-id coordination needed</td></tr>
+<tr><td>UUIDv4</td><td>Zero coordination</td><td>Random — kills B-tree locality</td></tr>
+<tr><td>ULID 128-bit</td><td>No coordination, sortable</td><td>2× storage, string handling</td></tr>
+<tr><td>DB-ticket server (Flickr)</td><td>Trivial impl</td><td>SPOF, write hot spot</td></tr>
+<tr><td>In-process lib</td><td>0 RPC latency</td><td>Hard to upgrade fleet-wide</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage Engines — why monotonic keys matter for B-trees.</li>
+  <li>Ch. 6 Partitioning — partitioning by ID hash vs range; Snowflake worker bits enable per-shard routing.</li>
+  <li>Ch. 8 Trouble with Distributed Systems — clocks, NTP, leap seconds, "Spanner's TrueTime" for the truly paranoid.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd default to Snowflake-64 because every storage engine we use stores BIGINT efficiently; ULID is an opt-in for systems that already speak text-keys."</li>
+  <li>"The single most overlooked failure is clocks — I'd spend explicit slide time on TAI vs UTC, leap-second smearing, and what happens when a VM is migrated and jumps 30 ms backward."</li>
+  <li>"I'd never use a centralized ticket server for this — Twitter killed theirs in 2010 for exactly the reasons we'd hit at any unicorn-scale platform."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Snowflake 64-bit layout</td><td>1 sign + 41 ts-ms + 10 worker + 12 seq fits in BIGINT, k-sortable for B-tree locality, and 4 K IDs/ms × 1024 workers gives 4.1 B/sec/region — exactly the platform-write spine we need without per-call coordination.</td><td>UUIDv4 (random, kills btree); UUIDv7 (no worker bits, harder to debug).</td></tr>
+    <tr><td>ULID (128-bit variant)</td><td>For systems that already use string PKs, 26-char Crockford-base32 stays lexically sortable while requiring zero coordination — the 80 random bits make collision impossible at the 4 B/sec target.</td><td>UUIDv4 (random sort-order); KSUID (only 27 chars but Segment-specific layout).</td></tr>
+    <tr><td>ZooKeeper (worker-id lease)</td><td>Sequential+Ephemeral znodes give us "1024 unique worker IDs without manual config" with strong consistency; ZK can be down for hours and the 30 s session-expiry safety wait still prevents dup IDs.</td><td>etcd (fine but team uses ZK fleetwide); Consul (gossip is weaker for unique-counter semantics).</td></tr>
+    <tr><td>Crockford base32 (ULID encoding)</td><td>Excludes I/L/O/U to avoid human read errors; 26 chars stays under URL-segment limits and is case-insensitive — important when ULIDs are shared verbally or across logs.</td><td>Standard base32 (case-sensitive, ambiguous); base64 (longer, URL-unsafe chars).</td></tr>
+    <tr><td>NTP + chrony</td><td>Hot path requires wall-clock sanity; chrony's slew + step modes keep offset under the 50 ms boot threshold and emit metrics so we can alert before clock-jump duplicates can occur.</td><td>ntpd (slower convergence); time.windows.com (untrusted upstream).</td></tr>
+    <tr><td>PTP (rack-local)</td><td>Within a rack, PTP gives ±100 µs sync — needed when two workers in the same DC issue IDs in the same ms, so clock-jump-backward is mathematically rare and detectable.</td><td>NTP-only (5–10 ms drift); GPS clock per host (too costly at 10 K hosts).</td></tr>
+    <tr><td>Monotonic clock (Linux CLOCK_MONOTONIC)</td><td>Wall clock can step backward on VM migration; monotonic drives the timestamp internally and we clamp <code>ts = max(last_ts, now)</code>, so a 30 ms backward VM jump is absorbed transparently.</td><td>CLOCK_REALTIME (jumps on NTP step); CLOCK_TAI (no leap-second handling on older kernels).</td></tr>
+    <tr><td>gRPC sidecar (NextID RPC)</td><td>Languages without an in-process lib (PHP, Ruby) hit a sidecar over Unix socket; HTTP/2 multiplexing keeps the &lt; 1 ms p99 SLO, and BatchReq{count=100} amortizes the RPC over bulk inserts.</td><td>HTTP/1.1 (head-of-line blocking); REST (no streaming, higher overhead).</td></tr>
+    <tr><td>BLS / HMAC tag (optional)</td><td>For tamper-resistant IDs (e.g. payment refs), append a 4-byte HMAC over <code>ts||worker||seq</code> using a per-region key — verifiable downstream without revealing the secret.</td><td>Plain ID (forgeable); RSA sig (32× longer, kills BIGINT fit).</td></tr>
+    <tr><td>C/Rust libsf.so</td><td>In-process &lt; 200 ns latency requires no GC and inlinable atomics; libsf compiled to Rust+cdylib gives Java/Go/Python a single shared object with bounded P99 across language ecosystems.</td><td>Pure Java/Go libs (per-language re-impl risk); kernel module (overkill).</td></tr>
+    <tr><td>Prometheus + Grafana</td><td>Hot-path service at 99.999% requires per-worker metrics on clock skew, seq exhaustion rate, and ZK lease health — Prom's pull model with 10 s scrape catches the rare seq-overflow busy-wait before it impacts upstream.</td><td>Statsd (push model, lossier); CloudWatch (cost-prohibitive at 1024-worker cardinality).</td></tr>
+    <tr><td>Leap-second smearing (Google)</td><td>Spreading the leap second over 24 h keeps wall clock monotonic — critical because a 1 s jump backward at midnight UTC would dup-ID for an entire second of issuance.</td><td>Step at midnight (causes dup IDs); CLOCK_TAI (clients expect UTC).</td></tr>
+  </tbody>
+</table>

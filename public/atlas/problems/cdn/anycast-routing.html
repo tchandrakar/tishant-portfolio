@@ -1,0 +1,136 @@
+<h1>Design Anycast Routing for global CDN (BGP, geo-DNS, latency-based)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">cdn</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design how a global CDN steers each user to the "best" POP. The naive answer — "GeoDNS sends users to the nearest country" — falls apart on real internet topology where AS-paths, peering, and congestion dominate latency. Real CDNs combine BGP anycast, GeoDNS, and RUM-based latency steering. This problem covers the routing layer end-to-end.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Route users to a POP that minimizes RTT, subject to capacity and policy.</li>
+  <li>Failover: a dead POP must be removed from rotation in &lt; 30 s.</li>
+  <li>Honor compliance: EU users must terminate in EU POPs.</li>
+  <li>Support TCP/HTTP and UDP/QUIC equally — no L4 stickiness assumptions.</li>
+  <li>A/B traffic shifting (canary 1% to a new POP).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency overhead:</b> routing decision adds &lt; 5 ms; DNS resolution &lt; 30 ms p99.</li>
+  <li><b>Scale:</b> 50 M req/s steered globally; 300 POPs, 1000+ peering sessions.</li>
+  <li><b>Availability:</b> 99.999% routing-plane (anycast survives single POP loss with no DNS change).</li>
+  <li><b>Stickiness:</b> p99 mid-session POP flap rate &lt; 0.1% of connections.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>BGP sessions: 300 POPs × 30 transit/peer per POP ≈ 9,000 active sessions.</li>
+  <li>DNS QPS: 5 M/s authoritative queries (lookups dominated by short TTLs).</li>
+  <li>RUM beacons: 1 in 10,000 page loads, 50 M/s page loads → 5 k/s beacons globally feeding the latency map.</li>
+  <li>Latency map size: ~16 M /24 IPv4 prefixes × 300 POPs × 4 B = ~20 GB; gz to ~2 GB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Authoritative DNS
+QUERY  www.foo.com.cdn.net  A   client_subnet=203.0.113.0/24
+       → A 198.51.100.10  (anycast VIP for tier-1 zone, picked by latency map)
+
+// Internal control
+POST /api/v1/steering/policy   { zoneId, geofence, capacityPct, sticky }
+GET  /api/v1/steering/latencyMap?cidr=...   → {pop_id, est_rtt_ms}
+POST /api/v1/bgp/withdraw      { popId, prefix }   → 200</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]
+   │  ① DNS query (with EDNS client-subnet)
+   ▼
+[Authoritative DNS] ── lookup ──► [Latency Map / Geo DB]
+   │  ② returns anycast VIP
+   ▼
+[BGP cloud] ── shortest AS path ──► [Nearest POP advertising VIP]
+   │  ③ TCP/QUIC handshake
+   ▼
+[Edge POP L4 LB (Maglev)] ──► [L7 proxy] ──► cache / origin
+   ▲
+   └── ④ RUM beacon feeds back real RTT → updates Latency Map
+</div>
+<p>Layer 1 is BGP anycast: one IP advertised from every POP. Layer 2 is GeoDNS, which picks <i>which</i> anycast pool to return (e.g., EU-only pool for GDPR zones). Layer 3 is RUM-driven steering, which adjusts the DNS answer based on measured RTTs from real users in the same /24.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Latency map</h3>
+<pre>// keyed by client /24 (IPv4) or /48 (IPv6)
+prefix_to_pop_rtt:
+  "203.0.113.0/24" → [{pop:"sfo", rtt_ms:18}, {pop:"sea", rtt_ms:32}, ...]
+  -- updated every 60s from RUM + active probes
+</pre>
+<h3>7.2 Capacity / health table</h3>
+<pre>pop_state:
+  pop_id, healthy(bool), bps_in, bps_capacity, cpu_pct, withdrawn(bool)</pre>
+<p>Stored in a globally-replicated KV (DDIA Ch. 5 leader-based async replication, edge reads bounded-stale by ~1 s). DNS resolvers cache the latency map locally and refresh every 30 s.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 BGP anycast</h3>
+<p>Every POP advertises the same /24 to its transits. Internet routers pick the shortest AS-path; ties broken by MED, local-pref, IGP cost. Failover is automatic: a withdrawn prefix is reconverged across the global table in 30–120 s. We add BFD on transit links for sub-second link-failure detection inside the POP.</p>
+<h3>8.2 GeoDNS</h3>
+<p>Authoritative DNS uses EDNS Client Subnet (RFC 7871) to see the resolver's /24 instead of the resolver IP. Returns one of N anycast VIPs based on country/policy. TTL is short (30–60 s) to enable fast steering changes. We never use TTL=0 — that breaks resolver caching and 10×s our QPS.</p>
+<h3>8.3 RUM-based steering</h3>
+<p>Browsers post tiny beacons with timing data. A streaming pipeline (Flink/Kafka) aggregates RTTs per (client /24, POP) tuple and updates the latency map. When the empirical RTT to POP B is &gt;20% better than POP A for a /24, DNS starts answering with B for that prefix.</p>
+<h3>8.4 Capacity-aware steering</h3>
+<p>If a POP exceeds 80% utilization, the steering controller reduces its weight. At 95%, the POP is removed from DNS for new flows but existing anycast sessions continue. This avoids the BGP-flap stampede that withdrawal would cause.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Mid-session flap:</b> BGP reconvergence mid-TCP kills the flow. Use anycast only at the L4 LB, then pin the 5-tuple via Maglev consistent hashing inside the POP. For long-lived flows (QUIC), connection-id allows resumption at any anycast POP — DDIA Ch. 8 partial-failure handling.</li>
+  <li><b>DNS resolver caching:</b> ISPs ignore TTLs &lt;5 min. Solution: keep anycast as the steady state and use DNS only for policy.</li>
+  <li><b>Latency map staleness:</b> /24 with no recent RUM falls back to GeoIP heuristics.</li>
+  <li><b>Route hijack risk:</b> RPKI-sign all prefixes, monitor for unauthorized announcements.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>BGP anycast as primary</td><td>Sub-second failover for stateless reqs; no DNS dependency</td><td>Mid-flow flaps; no per-tenant policy</td></tr>
+<tr><td>GeoDNS overlay</td><td>Policy / geofencing / tenant-specific routing</td><td>TTL stickiness; resolver lies</td></tr>
+<tr><td>RUM-based steering</td><td>Reflects real internet, not geography</td><td>Stale for low-traffic prefixes</td></tr>
+<tr><td>Capacity-aware DNS</td><td>Smooth load shedding</td><td>Can never react faster than DNS TTL</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — global latency map as a leader-based replicated KV with bounded-staleness reads at every DNS PoP.</li>
+  <li>Ch. 8 Distributed Systems — unreliable networks, partial failure, BGP convergence timing, why we cannot rely on synchronous global state for routing.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — DNS is intentionally <i>not</i> linearizable; we trade consistency for availability and partition tolerance.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Anycast handles 99% of failover for free; DNS is for policy, not for speed of failover."</li>
+  <li>"GeoIP is a lie at the AS level — RUM is the only honest signal. I'd build the system around RUM from day one."</li>
+  <li>"The subtle bug is mid-session BGP flap on long-lived connections. QUIC's connection-id is the cleanest fix; for legacy TCP we lean on consistent-hashing the L4 LB."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>BGP anycast (one VIP per zone)</td><td>Steers 50 M req/s without a per-request DNS lookup, and provides 99.999% routing-plane availability through automatic prefix withdrawal. Internet routers pick shortest AS-path, giving us "free" failover that no DNS-based system can match in speed.</td><td>Unicast IP per POP (DNS table explosion); pure GeoDNS (resolver TTL stickiness).</td></tr>
+<tr><td>RPKI prefix signing</td><td>Route hijacks (e.g., AS7007-style) would redirect a customer's anycast IP to an attacker. RPKI cryptographically binds prefix-to-AS, and major transits drop unsigned routes. Mandatory at our scale of 9,000 BGP sessions across 1,000+ peers.</td><td>RPKI-unsigned (hijack-vulnerable); IRR-only filtering (weaker validation).</td></tr>
+<tr><td>BFD (Bidirectional Forwarding Detection)</td><td>BGP keepalives detect link failure in 30–120 s; BFD detects in &lt;1 s. With 30 transit/peer sessions per POP, sub-second detection is the difference between 30 s and 5 ms of black-holed traffic when a transit fails.</td><td>BGP keepalive only (slow detection); ICMP probes (no path-aware).</td></tr>
+<tr><td>EDNS Client Subnet (RFC 7871)</td><td>Without ECS, we see only the resolver IP (often Google 8.8.8.8) instead of the user's /24, breaking GeoDNS for the 30%+ of users behind public resolvers. ECS lets us steer the right /24 to the right POP for the 5 M/s authoritative QPS.</td><td>Resolver-IP-only GeoDNS (wrong POP for public resolvers); HTTP-level redirect (extra RTT).</td></tr>
+<tr><td>Authoritative DNS with 30–60 s TTLs</td><td>TTL=0 multiplies our 5 M/s authoritative QPS by 10×. 30–60 s is the sweet spot: short enough to enable steering changes and capacity-aware shedding, long enough to absorb resolver caching for the bulk of users.</td><td>TTL=0 (10× DNS load); TTL=300+ (steering paralysis).</td></tr>
+<tr><td>RUM beacons + Flink/Kafka pipeline</td><td>1-in-10,000 sampling at 50 M page loads/s gives 5k beacons/s — enough to update the 16 M IPv4 /24-prefix latency map every 60 s. Flink's stateful aggregation per (prefix, POP) tuple computes empirical RTT in real time, replacing geographic guesswork.</td><td>Active probing only (no real-user signal); GeoIP database (lies at AS level).</td></tr>
+<tr><td>Quicksilver-style replicated KV (latency map)</td><td>20 GB latency map (gz to 2 GB) needs to be replicated to every authoritative DNS POP with bounded staleness. Leader-based async (DDIA Ch. 5) gives ~1 s convergence, fine because path quality changes slowly.</td><td>etcd (size limit at 8 GB); per-POP gossip (convergence too slow).</td></tr>
+<tr><td>Maglev consistent-hash L4 LB</td><td>Mid-session BGP flap can land a TCP flow on a different POP, killing the connection. Maglev hashing within a POP keeps the 5-tuple pinned across L7 proxy churn; combined with ECMP-stable BGP, the &lt;0.1% mid-session flap target holds.</td><td>IPVS round-robin (no stickiness); per-conn state replication (cost).</td></tr>
+<tr><td>QUIC connection-id (RFC 9000)</td><td>For long-lived UDP/QUIC flows, the server-issued connection-id allows resumption at any anycast POP after a path change. Solves the "BGP flap kills my video stream" problem natively at L4 — DDIA Ch. 8 partial-failure handling.</td><td>TCP only (flap-fragile); custom session-resumption (reinventing QUIC).</td></tr>
+<tr><td>Capacity-aware DNS steering controller</td><td>At 80% POP utilization we reduce DNS weight; at 95% we stop adding new flows. This avoids the BGP-withdraw stampede that would dump all in-flight traffic on neighbors. Steering happens at DNS granularity (30 s) — fast enough to absorb most surges.</td><td>BGP withdraw at saturation (existing flows die); no shedding (cascading overload).</td></tr>
+<tr><td>Hysteresis on path/POP switching</td><td>Without hysteresis, RUM noise causes minute-level POP flapping for low-traffic prefixes. Requiring 20% sustained RTT improvement before switching keeps the &lt;0.1% mid-session flap rate while still tracking real network changes.</td><td>Switch on any improvement (chatter); manual override only (defeats automation).</td></tr>
+<tr><td>GeoIP database fallback (MaxMind)</td><td>Low-traffic /24s lack RUM data. MaxMind gives a country-level fallback for the long tail of prefixes where we don't have measured RTTs. Combined with RUM, covers 100% of incoming queries.</td><td>RUM-only (cold-start /24s have no data); GeoIP-only (lies at AS level).</td></tr>
+<tr><td>Cross-region external DNS probers</td><td>Self-monitoring would let a sick region claim health. Probers in other regions check authoritative DNS health independently, feeding the steering controller's "withdraw this POP from rotation" decision.</td><td>Self-probing (sick-self-certifies); customer beacons only (slow signal).</td></tr>
+</tbody>
+</table>
+

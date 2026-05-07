@@ -1,0 +1,60 @@
+<h1>CAP theorem and PACELC</h1>
+<div class="meta-row">
+  <span class="tag diff-Easy">Easy</span>
+  <span class="tag">cap</span>
+  <span class="tag">pacelc</span>
+  <span class="tag">consistency</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>CAP says: in a distributed system that experiences a network <b>P</b>artition, you must choose between <b>C</b>onsistency (every read sees the latest write) and <b>A</b>vailability (every request gets a non-error response). PACELC adds the part everyone forgets — even when there's <em>no</em> partition (E for "else"), you still trade <b>L</b>atency against <b>C</b>onsistency. So a real system has two stances: how it behaves under partition, and how it behaves on a sunny day.</p>
+
+<h2>Why it matters</h2>
+<p>Vendors love to claim "highly available and strongly consistent". CAP forces you to ask the awkward follow-up: what happens during a network split? PACELC forces the next one: what does normal-day latency cost in consistency? Together they give you a vocabulary to compare DynamoDB, Spanner, MongoDB, Cassandra, and your home-grown service honestly.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>DynamoDB:</b> PA/EL — sacrifices consistency under partition <em>and</em> on the happy path for low latency (eventually consistent reads by default).</li>
+  <li><b>Spanner:</b> PC/EC — refuses writes during partition rather than diverge, and pays latency on every write for strong consistency.</li>
+  <li><b>MongoDB (default):</b> PA/EC — primary stays available; reads from primary are consistent on the happy path.</li>
+  <li><b>Cassandra:</b> PA/EL — tunable, but defaults favor availability and low latency over strong reads.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">              IF partition?
+                  |
+        +---------+----------+
+        |                    |
+       YES (P)              NO  (E - "else")
+        |                    |
+   pick C or A          pick L or C
+        |                    |
+   CP: refuse writes    EL: low-latency, weak read
+   AP: serve, diverge   EC: strong read, more RTTs
+</div>
+<p>Read PACELC as a two-letter label: <b>PA/EL</b> means "AP under partition, prefer Latency in normal operation." The first letter is the partition stance, the third is the no-partition stance. Most "NoSQL" systems are PA/EL; most "NewSQL" systems (Spanner, CockroachDB) are PC/EC.</p>
+
+<h2>The nuance CAP gets wrong</h2>
+<p>CAP is a coarse pop-science framing. In reality, "consistency" means linearizability (a very strong property), and "availability" means <em>every</em> non-failing node responds — a stricter definition than the SLA you actually care about. Most systems live on a spectrum: bounded staleness, read-your-writes, monotonic reads. Use CAP to start the conversation, not to end it.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Thinking you can pick "all three" — under a real partition, you genuinely can't.</li>
+  <li>Confusing "available" (responds at all) with "low latency" — they're different axes; that's why PACELC exists.</li>
+  <li>Calling a system "CA" — partitions <em>will</em> happen; you don't get to opt out of P.</li>
+  <li>Treating consistency as a single dial; per-operation tuning (DynamoDB strong reads, Cassandra QUORUM) is the norm.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're designing a global shopping cart. A network partition splits EU and US data centers. Do you allow writes on both sides (and merge later) or block one?
+  <br/>
+  <b>Hint:</b> Think about what's worse for users — losing edits or showing stale state. The answer can differ for the cart vs. the checkout step.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-dynamodb">Design DynamoDB</a> — leaderless quorum, classic PA/EL.</li>
+  <li><a href="#problem/design-spanner-style">Design a Spanner-style DB</a> — PC/EC with TrueTime.</li>
+  <li><a href="#problem/design-shopping-cart">Design a global shopping cart</a> — picking your stance per operation.</li>
+</ul>

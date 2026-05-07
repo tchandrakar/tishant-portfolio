@@ -1,0 +1,199 @@
+<h1>Design Distributed Rate Limiter (token bucket / leaky bucket, multi-region)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a globally consistent rate limiter for an API gateway with 100k+ tenants, enforcing per-key, per-route, per-region quotas. Limits range from 5 req/min (auth code) to 1M req/sec (bulk ingest). Decisions must add &lt; 1 ms p99 to request latency, work across regions, and degrade gracefully if the central store is unreachable.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Configurable algorithms: token bucket, leaky bucket, fixed window, sliding window log, sliding window counter.</li>
+  <li>Composite keys: tenantId + apiKey + endpoint + ip.</li>
+  <li>Tiered limits with burst allowance (e.g., 100 rps + burst 500).</li>
+  <li>Soft (warn) + hard (429) limits; expose Retry-After.</li>
+  <li>Per-route override; canary tenants get higher limits.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency overhead:</b> p50 100 us, p99 1 ms.</li>
+  <li><b>Availability:</b> 99.99% — limiter outage must not block traffic; fail-open or fail-closed configurable.</li>
+  <li><b>Accuracy:</b> ±1% on global limits, exact within a region.</li>
+  <li><b>Scale:</b> 1M decisions/sec/gateway pod; 1000 pods cluster-wide = 1B/s.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>1B decisions/sec * 50 B counter state = 50 GB cluster state at peak.</li>
+  <li>Per-key footprint: 32 B key + 8 B count + 8 B reset_ts = 48 B; 100M keys = 4.8 GB in Redis.</li>
+  <li>Sliding window log worst-case: 1000-rps key * 60s window = 60k entries * 16 B = 1 MB/key — too costly; use sliding window counter instead.</li>
+  <li>Cross-region replication: 10k limit-state changes/s * 100 B = 1 MB/s, fits async link.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/check  {keys:[...], cost:1}        → {allowed:true, remaining, resetMs}
+GET  /v1/quota?key=...                       → {limit, remaining, refillRate}
+PUT  /v1/policy  {tenant, route, algo, limit, burst}
+                                              → 200 (admin only)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">      ┌─────────────────────────────┐
+      │  API Gateway pod            │
+      │   ├─ in-proc bucket (L1)    │  ← refilled from L2 every 100 ms
+      │   └─ admission decision     │
+      └────────────┬────────────────┘
+                   │ async incr
+                   ▼
+        ┌──────────────────────┐  Lua script: atomic CAS+INCR+TTL
+        │  Redis cell (per-AZ) │  ◄── per-shard, 16 shards/region
+        └──────────┬───────────┘
+                   │ change-log
+                   ▼
+        ┌──────────────────────┐ multi-master CRDT counters
+        │  Cross-region sync   │ (1-2s lag)
+        └──────────────────────┘
+</div>
+<p>Two-tier design: each gateway pod owns a local "lease" of N tokens fetched from Redis. Decisions are made locally; a low-frequency reconcile call to Redis renews/returns leftover tokens. Cross-region truth converges via CRDT-style PN counters.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Redis state</h3>
+<pre>HSET rl:{key} tokens 95 lastRefill 1714900000 limit 100 refill 100/s
+PEXPIRE rl:{key} 60000
+// Sliding window counter
+ZADD swc:{key} &lt;ts&gt; &lt;eventId&gt;     # capped per window
+ZREMRANGEBYSCORE swc:{key} 0 (now-window)</pre>
+<h3>7.2 Why Redis</h3>
+<p>Single-threaded Lua atomicity → race-free token bucket math. Sub-ms latency. Cluster mode with hash-slots (DDIA Ch.6). For multi-region we run one Redis cell per region and sync counters as CRDTs (DDIA Ch.5 — convergent replicated data types).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Token bucket Lua script</h3>
+<pre>-- KEYS[1]=rl key, ARGV={now, cost, refill, capacity}
+local b = redis.call('HMGET', KEYS[1], 'tokens','last')
+local tokens, last = tonumber(b[1]) or ARGV[4], tonumber(b[2]) or ARGV[1]
+tokens = math.min(ARGV[4], tokens + (ARGV[1]-last)*ARGV[3])
+if tokens &gt;= ARGV[2] then
+  tokens = tokens - ARGV[2]
+  redis.call('HMSET', KEYS[1], 'tokens', tokens, 'last', ARGV[1])
+  return 1
+else return 0 end</pre>
+<h3>8.2 Two-tier (lease) optimization</h3>
+<p>Pod requests a lease of L tokens (e.g., L=100) via single Redis call; serves L locally; renews when 20% remain. Reduces Redis QPS by Lx (50-100x). Trade-off: short bursts can over-deliver up to (L * #pods) tokens during partition.</p>
+<h3>8.3 Sliding window counter</h3>
+<p>Hybrid of fixed window + linear interpolation: <code>count = current_window * elapsed_fraction + previous_window * (1-fraction)</code>. Constant memory (2 ints) and ±1% accuracy vs sliding-log.</p>
+<h3>8.4 Multi-region semantics</h3>
+<p>For "global 1000 rps" enforce per-region budget = 1000/N + 10% headroom; sync excess via async CRDT. Hard global limits use a single-leader Redis with cross-region reads (higher tail latency but exact). Strict global limits → DDIA Ch.9 linearizability cost: at least one cross-region RTT.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Redis hot key:</b> a single tenant's bucket at 1M rps is a hot shard; mitigate via tier-1 leases or split key into <code>rl:{tenant}:{N}</code> with each shard owning capacity/N.</li>
+  <li><b>Clock skew across pods:</b> use Redis-side <code>now</code> (TIME command) to compute refill, not pod clocks.</li>
+  <li><b>429 storms:</b> add jittered Retry-After (1-5s) and per-tenant circuit breaker.</li>
+  <li><b>Failure mode:</b> Redis outage → fail open with local lease for 30s; alarm and decay capacity to 50% to prevent abuse.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Token bucket vs leaky bucket</td><td>Allows bursts up to capacity</td><td>Less smooth; spikes hit downstream</td></tr>
+<tr><td>Lease (two-tier)</td><td>Massive QPS reduction</td><td>Up to L tokens over-served per partition</td></tr>
+<tr><td>Sliding-window counter</td><td>Constant memory, ~1% error</td><td>Not exact at sub-second resolution</td></tr>
+<tr><td>Per-region budgets vs global single-leader</td><td>Low latency, AP</td><td>Possible global over-shoot during DC failover</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch.5 Replication — CRDT PN-counters for multi-master convergence; eventual consistency of counters.</li>
+  <li>Ch.6 Partitioning — sharding hot keys via key-suffix; consistent hashing on Redis Cluster.</li>
+  <li>Ch.7 Transactions — atomic CAS via single-threaded Redis Lua (analog of single-shard tx).</li>
+  <li>Ch.8 Trouble — clock skew, network partitions, fail-open vs fail-closed semantics.</li>
+  <li>Ch.9 Consistency — linearizable global limits require cross-region coordination cost.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I default to token bucket + two-tier lease — it's the right balance of strictness and overhead at internet scale."</li>
+  <li>"Truly global limits cost a cross-region RTT; for SaaS billing limits I prefer per-region budgets reconciled hourly."</li>
+  <li>"The most critical decision is fail-mode: APIs serving payments fail closed; public read APIs fail open with degraded capacity."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Redis (cluster mode, 16 shards/region)</td>
+      <td>Single-threaded Lua atomicity makes token-bucket math race-free in one round-trip — the only way to hit p99 1 ms at 1M decisions/sec without distributed locks. 48 B/key * 100M keys = 4.8 GB fits 1 shard, sharding is for QPS not memory (DDIA Ch.6).</td>
+      <td>Cassandra counters (eventual, no atomic CAS); Postgres advisory locks (10x latency).</td>
+    </tr>
+    <tr>
+      <td>Lua scripting for token bucket</td>
+      <td>HMGET + math + HMSET in one atomic script eliminates the get-modify-set race that classic CAS would loop on. Single round-trip preserves the 1 ms budget; Lua runs in the Redis event loop so no lock acquisition cost (DDIA Ch.7).</td>
+      <td>WATCH/MULTI/EXEC (retry storms under contention); app-side mutex (cross-pod doesn't work).</td>
+    </tr>
+    <tr>
+      <td>Two-tier lease optimization</td>
+      <td>Pod fetches L=100 tokens locally, makes 100 admission decisions before next Redis call → reduces Redis QPS by ~50-100x. Critical at 1B decisions/s cluster-wide; without it Redis hot shards hit ceiling. Trade: up to L*pods over-serve during partition.</td>
+      <td>Per-decision Redis call (200x QPS pressure); fully local (no cross-pod budget enforcement).</td>
+    </tr>
+    <tr>
+      <td>Sliding window counter algorithm</td>
+      <td>Hybrid of fixed window + linear interpolation needs only 2 ints per key (16 B) vs sliding-log's 60k entries * 16 B = 1 MB/key at 1000 rps. Hits ±1% accuracy SLA without exploding memory — the right point on the precision/cost curve.</td>
+      <td>Sliding log (memory blows up at scale); fixed window (boundary burst 2x limit).</td>
+    </tr>
+    <tr>
+      <td>Token bucket as default algorithm</td>
+      <td>Allows bursts up to capacity (good UX for retry-with-jitter clients) while enforcing sustained rate. Math is constant memory and constant time. Most APIs in production accept burstiness gracefully — leaky bucket is too strict for typical traffic.</td>
+      <td>Leaky bucket (no burst tolerance); fixed window (boundary issues).</td>
+    </tr>
+    <tr>
+      <td>CRDT PN-counter for cross-region sync</td>
+      <td>Independent regional Redis cells converge on global truth via PN-counter merge (DDIA Ch.5 CRDTs) without a leader hop. 10k changes/s * 100 B = 1 MB/s async replication is trivial. Sacrifices strict global limit for AP — acceptable for soft quotas.</td>
+      <td>Single global leader (cross-region RTT every check); manual reconciliation (drift).</td>
+    </tr>
+    <tr>
+      <td>In-process L1 token cache (per gateway pod)</td>
+      <td>Refilled from Redis every 100 ms; serves admission locally at p50 100us — Redis call alone would be 200-500us. The L1+L2 design is what makes the &lt;1 ms p99 budget achievable at 1M decisions/s/pod.</td>
+      <td>Pure remote (latency budget gone); pure local (no global enforcement).</td>
+    </tr>
+    <tr>
+      <td>Redis TIME command for refill clock</td>
+      <td>Pod clocks drift up to 100 ms even with NTP, which would cause refill miscalculation (DDIA Ch.8 unreliable clocks). Using Redis-side TIME inside Lua makes refill math deterministic across all callers; the script reads server clock once.</td>
+      <td>Pod local clock (skew gives wrong refill); chrony-strict NTP (still ms-level drift).</td>
+    </tr>
+    <tr>
+      <td>Per-cell sharding (16 shards/region)</td>
+      <td>Hash-slot routing on Redis Cluster spreads 1B decisions/s across shards so no single Redis hits its 100k ops/s ceiling. Tenant key suffix <code>rl:{tenant}:{N}</code> further splits hot tenants — adaptive split when shard QPS &gt;80%.</td>
+      <td>Single Redis instance (CPU-bound); proxy-based routing (extra hop).</td>
+    </tr>
+    <tr>
+      <td>Configurable fail-open / fail-closed</td>
+      <td>Payment APIs fail closed (refuse on Redis outage) — security critical; public read APIs fail open with 30s local lease + decay to 50% capacity to prevent abuse during outage. The single most important policy decision per route.</td>
+      <td>Always fail open (abuse risk); always fail closed (false outages).</td>
+    </tr>
+    <tr>
+      <td>Jittered Retry-After (1-5s)</td>
+      <td>Without jitter, 429 storms cause synchronized retry waves that re-trigger limit at the next second boundary — classic thundering herd. Random jitter spreads retries; per-tenant circuit breaker prevents repeat offenders from poisoning the limiter shard.</td>
+      <td>Fixed Retry-After (synchronized retries); no Retry-After (clients don't back off).</td>
+    </tr>
+    <tr>
+      <td>Weighted DRF for tenant fairness</td>
+      <td>When Redis shard is contended, dominant resource fairness across tenants prevents one noisy tenant from starving others — works correctly even with heterogeneous request costs (CPU vs memory). Token bucket alone allows greedy tenants to hog capacity.</td>
+      <td>FIFO (head-of-line); strict priority queue (starvation risk).</td>
+    </tr>
+    <tr>
+      <td>Composite key (tenant + apiKey + endpoint + ip)</td>
+      <td>Hierarchical limits at multiple granularities catch abuse missed by any single dimension (tenant-level limit ok, but a single IP DDoSing one endpoint). Composite hash is 32 B; cost is 4x key count which still fits in 4.8 GB.</td>
+      <td>Single-dim key (gameable); per-attempt deep introspection (latency cost).</td>
+    </tr>
+    <tr>
+      <td>HSET + PEXPIRE for state TTL</td>
+      <td>Hash structure groups tokens, lastRefill, limit, refill in one Redis op; PEXPIRE 60s auto-cleans dormant tenants without a sweep job. Memory footprint stays bounded as tenants churn — critical for the 100M-key quota at steady state.</td>
+      <td>Separate keys per field (3x ops); no TTL (memory growth unbounded).</td>
+    </tr>
+  </tbody>
+</table>

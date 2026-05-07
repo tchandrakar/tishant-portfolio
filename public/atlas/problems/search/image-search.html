@@ -1,0 +1,140 @@
+<h1>Design Image / Visual Search (embeddings + ANN: FAISS / HNSW)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">search</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a visual search service: given a query image (uploaded photo or a doc-id), return the visually most similar images from a catalog of ~1 B items in &lt; 200 ms. Use cases: reverse image search, "shop the look", duplicate detection. The core is approximate nearest neighbor (ANN) search over high-dimensional embeddings produced by a vision model.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Index 1 B catalog images with metadata (source, owner, category).</li>
+  <li>Search by image upload, image URL, or existing doc-id.</li>
+  <li>Filter results by category, marketplace, language, safety flags.</li>
+  <li>Continuous ingestion: 10 M new images/day indexed within 1 hour.</li>
+  <li>Visual + text hybrid query ("red running shoes" + image).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 &lt; 200 ms including embedding inference and ANN search.</li>
+  <li><b>Scale:</b> 1 B vectors of 512 dims × 4 B = 2 TB raw; with PQ → ~64 GB; 10 K QPS peak.</li>
+  <li><b>Recall:</b> ≥ 95 % recall@10 vs exact nearest neighbor.</li>
+  <li><b>Availability:</b> 99.95%; safe-content filters always on.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Embedding inference: 1 B × 50 ms on GPU = 50 M GPU-sec ≈ 580 GPU-days per full re-embed; in practice incremental, so ~500 GPUs sustained.</li>
+  <li>ANN index: 1 B × 64 B (PQ-compressed 512-dim) = 64 GB → fits in RAM of 4–8 nodes; with replication = 16–32 nodes.</li>
+  <li>Online query: 1 GPU inference (~30 ms) + ANN lookup (~10 ms) + rerank (~30 ms) ≈ 70 ms internal.</li>
+  <li>Storage: original images on S3, ~500 KB avg → 500 TB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/visual-search
+   multipart: image OR { docId | imageUrl }, filters, k=20
+   → { results: [{docId, score, thumbnail, metadata}] }
+POST /v1/index/image  (internal)  {docId, imageBytes, metadata}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]
+   |
+   v
+[API GW] -> [Query Embedder (GPU)] -> [Vector Router]
+                                         |
+                                         v
+                       [ANN Shards (FAISS IVF-PQ / HNSW)]  x N
+                                         |
+                                         v
+                              [Reranker (full-precision dot)]
+                                         |
+                                         v
+                              [Filter / Safety / Hydrator (S3 thumbs)]
+
+[Image Ingest] -> Kafka -> [GPU Embedder Workers] -> [Vector Writer]
+                                                       |
+                                                       v
+                                           [Online ANN Shard (mutable)]
+                                                       |
+                                            nightly merge into IVF-PQ
+</div>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Vector record</h3>
+<pre>doc_id (u64) | embedding (f32[512])  -- mmap'd flat file per shard
+codes        : pq_codes (u8[64])      -- product-quantized for ANN
+metadata DB  : Cassandra row keyed by doc_id (category, owner, safety, ts)</pre>
+<h3>7.2 ANN structures</h3>
+<p><b>FAISS IVF-PQ</b> for billion-scale: vectors clustered into K=65 K coarse cells (IVF), each vector stored as a 64-byte product-quantized code. Query visits <code>nprobe</code> nearest cells (e.g., 32). Memory ~64 B/vec; recall tunable via <code>nprobe</code>. <b>HNSW</b> for &lt; 100 M vectors: hierarchical small-world graph, &lt; 5 ms query, but ~200 B/vec — too expensive past a few hundred million.</p>
+<h3>7.3 Sharding</h3>
+<p>Random doc-id-hash partitioning across N shards; each shard runs its own IVF-PQ. Coordinator scatter-gathers, merges top-K. (Avoid clustering by category — it concentrates load.)</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Embedding model</h3>
+<p>Vision tower (e.g., a ViT or CNN) produces a 512-dim L2-normalized embedding. Trained with contrastive loss on (anchor, positive, hard-negative) image triplets, or jointly with a text tower (CLIP-style) for hybrid queries. Distilled student model used at serving time for latency.</p>
+<h3>8.2 Indexing pipeline</h3>
+<p>Ingest events → embed in batches on GPU → append to a mutable HNSW shard kept in RAM. Nightly Spark job pulls all new vectors, retrains coarse centroids if drift exceeds a threshold, rebuilds the IVF-PQ artifact, and hot-swaps. (DDIA Ch. 10 — bulk derived dataset; Ch. 11 — stream feeds the mutable tier.)</p>
+<h3>8.3 Query path</h3>
+<p>Embed query image (or look up cached vector for known doc-id) → scatter to all ANN shards → each returns top-K candidate ids with PQ-approximate distances → coordinator merges → reranker pulls full-precision vectors for top 200 and recomputes exact distance → filter (category, safety, ownership) → hydrate thumbnails from S3 via CDN.</p>
+<h3>8.4 Hybrid text+image queries</h3>
+<p>Compute text embedding from a shared CLIP-style space, weighted-sum with image embedding (e.g., 0.6·image + 0.4·text), then ANN as usual. Linear in vector ops, no extra index needed.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Embedding GPU cost:</b> dominant cost — distill model, batch aggressively (32–64), serve on dedicated GPU pool with admission control.</li>
+  <li><b>PQ recall cliff:</b> at very high QPS, drop <code>nprobe</code> dynamically; recover lost recall via the full-precision rerank stage.</li>
+  <li><b>Drift:</b> as the catalog grows, IVF centroids drift; retrain weekly or on KL-divergence trigger.</li>
+  <li><b>Hot updates:</b> mutable HNSW tier handles new vectors; queries hit both tiers and merge.</li>
+  <li><b>Safety:</b> NSFW classifier runs at index time; safety flag enforced as a hard post-filter.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>IVF-PQ at billion scale</td><td>~64 B/vec, fits in RAM, fast</td><td>Recall loss; needs rerank</td></tr>
+<tr><td>HNSW for fresh tier</td><td>Mutable, very high recall, &lt; 5 ms</td><td>Expensive memory; doesn't scale to 1 B</td></tr>
+<tr><td>Two-tier (mutable + immutable)</td><td>NRT freshness + cheap bulk</td><td>Two indexes to query and merge</td></tr>
+<tr><td>Distilled embedder</td><td>Cuts inference cost ~5×</td><td>Small recall regression vs teacher</td></tr>
+<tr><td>Random sharding</td><td>Even load</td><td>Every query fans out to all shards</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage and Retrieval — vectors as immutable, mmap'd column files; analogous to SSTables but for ANN.</li>
+  <li>Ch. 6 Partitioning — random sharding of vectors and the scatter-gather query pattern.</li>
+  <li>Ch. 10 Batch Processing — nightly IVF-PQ rebuild as a derived dataset.</li>
+  <li>Ch. 11 Stream Processing — Kafka-driven ingestion into the mutable HNSW tier.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"At a billion vectors the only realistic option is IVF-PQ; HNSW is a second-tier trick for the freshness window."</li>
+  <li>"Always rerank with full precision after PQ — it recovers most of the recall lost to compression."</li>
+  <li>"Embedding cost typically dwarfs ANN cost; spend optimization budget on the model, not the index."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>FAISS IVF-PQ (billion-scale ANN)</td><td>1 B vectors × 512 dims raw = 2 TB; IVF-PQ with 64-byte codes compresses to 64 GB so the entire index fits across 4–8 RAM-backed nodes, and nprobe=32 keeps recall at &gt;90 % with &lt;10 ms search per shard.</td><td>HNSW (~200 B/vec × 1 B = 200 GB → 5–10× more RAM); Annoy (slower at billion scale, weaker tuning knobs); ScaNN (similar quality, smaller community when this design was made).</td></tr>
+    <tr><td>HNSW (mutable fresh tier)</td><td>10 M new images/day must be searchable in &lt;1 h; HNSW supports incremental insertion and gives &lt;5 ms queries with very high recall on the &lt;100 M-vector mutable tier, before nightly merge into IVF-PQ.</td><td>Mutable IVF-PQ (centroid drift on every insert); brute-force on fresh tier (O(N) per query, blows latency).</td></tr>
+    <tr><td>Product Quantization (PQ codes)</td><td>Reduces 2 KB float32 vectors to 64 B codes (32× compression) at ~5 % recall loss, recovered by full-precision rerank on top 200; without PQ the 64 GB→2 TB blow-up forces SSD-backed indexes, killing the &lt;200 ms p99 latency.</td><td>Scalar quantization (only 4× compression); OPQ (marginal improvement, more complex training); no compression (RAM cost prohibitive).</td></tr>
+    <tr><td>CLIP-style dual encoder (vision+text)</td><td>Hybrid text+image queries need a shared embedding space; a CLIP-style trained tower lets us weighted-sum 0.6·image + 0.4·text vectors and ANN as usual, without a separate text index.</td><td>Separate vision + text indexes with late fusion (2× index cost, harder ranking); single modality only (loses hybrid use case).</td></tr>
+    <tr><td>Distilled student ViT</td><td>50 ms full-precision teacher is 5× too slow on the GPU at 10 K QPS; the distilled 6-layer student runs at ~30 ms with ~2 % recall regression, cutting GPU fleet from ~2500 to ~500.</td><td>Quantization-only (smaller win); pruning (less stable on attention).</td></tr>
+    <tr><td>Apache Kafka (image ingest)</td><td>10 M images/day with bursty uploads buffer through Kafka; the durable log decouples ingest spikes from GPU embedder workers, supports replay for re-embedding when the model changes, and provides backpressure when the GPU pool saturates.</td><td>SQS (no replay); direct S3-event triggers (no buffering, GPU thrash).</td></tr>
+    <tr><td>GPU pool (embedder workers)</td><td>Embedding inference is the dominant cost (50 M GPU-sec for full re-embed); a dedicated pool with batch=32–64 and admission control keeps GPU utilization &gt;70 % — CPU inference would need 100× more nodes.</td><td>CPU inference (10–100× cost); shared inference cluster (head-of-line blocking from other workloads).</td></tr>
+    <tr><td>Apache Spark (nightly IVF-PQ rebuild)</td><td>Retraining 65 K coarse centroids over 1 B vectors needs distributed k-means; Spark MLlib finishes in ~4 h on a 100-node cluster and produces a single immutable artifact for atomic swap.</td><td>FAISS native trainer (single-node, OOM at 1 B); custom MPI (no fault tolerance).</td></tr>
+    <tr><td>S3 + CDN (image storage / hydration)</td><td>500 TB of original images at 500 KB/each needs cheap, durable storage; S3 + CloudFront caches thumbnails at edge with &lt;50 ms hydration, letting the result page render fast even when the result list spans cold images.</td><td>HDFS (no edge caching); per-region NAS (operational overhead, no global CDN).</td></tr>
+    <tr><td>Cassandra (image metadata)</td><td>1 B doc_id → metadata rows with 200 K writes/s on ingest; Cassandra's wide-row model and tunable consistency give &lt;5 ms p99 reads keyed by doc_id with multi-region replication for safety flag enforcement.</td><td>Postgres (sharding pain at 1 B rows); DynamoDB (vendor lock-in, higher cost at this scale).</td></tr>
+    <tr><td>FlatBuffers (vector + metadata records)</td><td>Per-shard mmap'd flat files of doc_id + embedding allow zero-copy reads at &gt;1 GB/s for the rerank stage where we pull full-precision vectors for top 200 — Protobuf parse cost would dominate the 30 ms rerank budget.</td><td>Protobuf (parse cost); raw struct arrays (no schema evolution).</td></tr>
+    <tr><td>NSFW classifier (index-time)</td><td>Safety must be hard-enforced; running a small NSFW CNN at index time tags each image once and stores a flag in metadata, letting the query path apply a cheap post-filter rather than re-running the classifier per query.</td><td>Query-time NSFW (10× cost at QPS); manual moderation (won't scale to 10 M/day).</td></tr>
+    <tr><td>L2-normalized embeddings + dot-product</td><td>Normalizing to unit length lets dot product = cosine similarity, which FAISS implements with the fastest SIMD kernel; saves ~20 % of distance-computation cost vs L2 distance and matches what the contrastive loss optimized.</td><td>Raw L2 (slower kernels); learned distance metric (training complexity).</td></tr>
+  </tbody>
+</table>

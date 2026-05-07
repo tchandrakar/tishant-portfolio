@@ -1,0 +1,188 @@
+<h1>Design Code Execution Sandbox (Docker + cgroups + seccomp, multi-language)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">misc</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a multi-tenant remote code execution service that other products (interview platforms, IDEs, AI agents, online judges) call to compile and run untrusted user code in 20+ languages with strict CPU/memory/time/network limits. Returns stdout, stderr, exit code, runtime, peak memory. Must withstand fork bombs, kernel exploits, network exfiltration, and noisy neighbors.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Synchronous run: POST source + stdin → response with stdout/stderr/exit/timing.</li>
+  <li>Streaming run: WebSocket REPL session, bidirectional stdin/stdout.</li>
+  <li>Asynchronous batch: queue N jobs with priority, deliver via webhook.</li>
+  <li>Per-tenant quotas: CPU-seconds/day, concurrent slots, memory ceiling.</li>
+  <li>Pluggable language runtimes via versioned base images.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 cold start &lt; 200 ms, warm start &lt; 30 ms; total p99 sync &lt; 3 s.</li>
+  <li><b>Scale:</b> 10 K rps sustained, 50 K burst; 1 B executions/month.</li>
+  <li><b>Isolation:</b> no host kernel CVE escape (assume best-effort), no cross-tenant leakage of fs/network/CPU cache.</li>
+  <li><b>Cost:</b> &lt; $0.0002/execution at steady state.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>10 K rps × avg 800 ms wall = 8 K concurrent slots; with 1 slot per vCPU, ~8 K vCPU = 100 × 80-vCPU bare-metal hosts.</li>
+  <li>Storage: 1 B execs × 4 KB stored output = 4 TB/month (S3 lifecycle to glacier after 30d).</li>
+  <li>Image registry: 20 langs × 5 versions × 600 MB = 60 GB; cached on every host.</li>
+  <li>Egress per execution capped at 1 MB; aggregate 10 K × 1 MB = 10 GB/s peak (egress-disabled by default).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/exec        {lang, source, stdin, timeoutMs, memoryMb}  → {stdout, stderr, exit, runMs, peakKb}
+POST /v1/exec/async  {...}                                       → executionId
+GET  /v1/exec/{id}                                               → status + result
+WS   /v1/exec/stream {lang, source}                              → frames {type:"stdout"|"stderr"|"exit", data}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──HTTPS──►[API GW]──►[Scheduler]──┬──►[Warm Pool: gVisor pods]
+                                          │      │
+                                          │      ▼
+                                          │  [Sandbox Runner]──►[cgroup v2 + seccomp + netns]
+                                          ▼
+                                   [Quota Service]──►[Redis]
+                                          │
+                                          ▼
+                                   [Kafka: exec-events]──►[Billing/Audit]
+</div>
+<p>Scheduler picks a warm pod from a same-language pool, mounts the source via tmpfs, kicks off run via gRPC to in-pod runner, streams output back. Pod is killed after one execution (or N for warm reuse with strict reset).</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Execution record (Cassandra)</h3>
+<pre>CREATE TABLE executions (
+  tenant_id text, exec_id timeuuid,
+  lang text, source_hash text,
+  exit int, run_ms int, peak_kb int,
+  output_s3 text, created_at timestamp,
+  PRIMARY KEY ((tenant_id), exec_id)
+) WITH CLUSTERING ORDER BY (exec_id DESC);</pre>
+<h3>7.2 Quotas (Redis)</h3>
+<p>Hash per tenant: <code>HINCRBY quota:{tenant} cpu_ms 850</code>; sliding window via Redis Streams. Hard caps short-circuit at API GW.</p>
+<h3>7.3 Output blobs</h3>
+<p>stdout/stderr larger than 4 KB pushed to S3; small outputs inline in Cassandra row to skip S3 round trip.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Sandbox layers</h3>
+<p>(1) gVisor (user-space kernel) intercepts syscalls — first line. (2) seccomp-bpf allowlist further strips dangerous syscalls (ptrace, kexec, bpf, userfaultfd). (3) cgroups v2 caps: <code>cpu.max=100000 100000</code>, <code>memory.max=256M</code>, <code>pids.max=64</code>, <code>io.max</code> on tmpfs only. (4) network namespace with no veth (no internet). (5) read-only rootfs; per-exec ephemeral tmpfs at <code>/work</code>. (6) AppArmor profile blocks mount/ptrace.</p>
+<h3>8.2 Warm pool &amp; pod recycling</h3>
+<p>Per language, pre-baked Kubernetes pods sit idle with the runtime loaded (JVM warmed via CRaC, Python interpreter pre-imported). After each exec, pod state is reset by truncating tmpfs and signaling runner; after 100 execs the pod is destroyed to bound any state leak.</p>
+<h3>8.3 Streaming runner</h3>
+<p>gRPC server inside the pod exposes <code>Run(stream)</code>; backpressure via gRPC flow control. stdout is line-chunked, base64-frame over WS to client, throttled to 1 MB/s.</p>
+<h3>8.4 Multi-tenant fairness</h3>
+<p>Weighted fair queueing on the scheduler: each tenant has a virtual clock advanced by CPU-ms consumed; lowest virtual clock dequeued next. Prevents one tenant exhausting the warm pool.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Image pull storm:</b> p2p image distribution (Dragonfly/Spegel) on cluster bootstrap.</li>
+  <li><b>JVM cold start:</b> CRaC/CDS snapshots cut Java first-exec from 600 ms to 80 ms.</li>
+  <li><b>Kernel CVE blast radius:</b> per-tenant node pools for high-paying customers; co-tenancy disabled on demand.</li>
+  <li><b>Forkbomb:</b> <code>pids.max=64</code> + 30 s wall timer SIGKILL.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>gVisor over runc</td><td>Strong syscall isolation</td><td>~10% syscall overhead, no GPU</td></tr>
+<tr><td>Warm pool reuse</td><td>30 ms warm start vs 200 ms cold</td><td>Risk of state leak; capped reuse</td></tr>
+<tr><td>No network by default</td><td>Stops exfiltration</td><td>Breaks code that fetches deps; opt-in proxy</td></tr>
+<tr><td>tmpfs-only writes</td><td>Fast, no persistence leak</td><td>Bounded by RAM</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — exec-events Kafka topic for billing, fraud, and post-hoc replay; exactly-once via idempotent keys (<code>tenant:exec_id</code>).</li>
+  <li>Ch. 8 Trouble with Distributed Systems — wall-clock timeouts must use monotonic clocks; NTP skew between scheduler and worker can mis-bill CPU-ms.</li>
+  <li>Ch. 6 Partitioning — per-tenant Cassandra partitions are bounded by lifecycle TTL to avoid wide partitions for whales.</li>
+  <li>Sketch data structures — HyperLogLog for unique-source-hash counts per tenant (cheap dedupe metric).</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd run gVisor by default and offer Firecracker as a premium isolation tier; the cost gap is real and most code doesn't justify the RAM."</li>
+  <li>"The thing that bites in prod isn't sandbox escape — it's noisy neighbors burning CPU cache. CPU pinning + L3 cache partitioning (Intel CAT) is a Phase-2 lever."</li>
+  <li>"For the agentic AI use case I'd add a stateful filesystem mode with copy-on-write overlays so an agent can iterate over multiple steps without re-uploading 50 MB each call."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Docker (OCI runtime)</td>
+      <td>Standardised image format for the 20 langs × 5 versions × 600 MB = 60 GB registry; layer caching means base+toolchain only pulled once per host, then per-version diffs stay under 50 MB for fast warm-pool refresh across 100 hosts.</td>
+      <td>LXC (rejected: less ecosystem), Podman (rejected: minor delta, weaker K8s integration).</td>
+    </tr>
+    <tr>
+      <td>gVisor (runsc)</td>
+      <td>User-space kernel intercepts every syscall — first defence at 10 K rps where Linux kernel CVEs are the real risk; ~10% syscall overhead is acceptable since we're CPU-bound, not syscall-bound, for typical 800 ms execs.</td>
+      <td>runc (rejected: shared kernel = direct CVE blast radius), Kata (rejected: 600 ms boot blows the 200 ms cold-start SLA).</td>
+    </tr>
+    <tr>
+      <td>cgroups v2</td>
+      <td>Unified hierarchy enforces <code>cpu.max=100000 100000</code>, <code>memory.max=256M</code>, <code>pids.max=64</code>, <code>io.max</code> on tmpfs — single source of truth that survives runtime upgrades and gives accurate CPU-ms billing per tenant.</td>
+      <td>cgroups v1 (rejected: split controllers, race conditions), rlimits only (rejected: no IO/PID caps).</td>
+    </tr>
+    <tr>
+      <td>seccomp-bpf</td>
+      <td>Allowlist strips ptrace, kexec, bpf, userfaultfd — the syscalls behind most kernel-escape CVEs; runs in-kernel at near-zero overhead, layered atop gVisor for defence-in-depth at the 1 B exec/month volume.</td>
+      <td>SELinux (rejected: distro-specific), no seccomp (rejected: gVisor alone leaves attack surface).</td>
+    </tr>
+    <tr>
+      <td>Kubernetes warm pods</td>
+      <td>Per-language pre-baked pods sit idle with the runtime loaded; warm start is 30 ms vs 200 ms cold — critical for the &lt;3 s p99 sync SLA. Pod recycling after 100 execs bounds state leak without paying full cold cost every time.</td>
+      <td>Lambda/Firecracker pool (rejected: no language-runtime warm), VM pool (rejected: 10× RAM).</td>
+    </tr>
+    <tr>
+      <td>Apache Cassandra</td>
+      <td>1 B execs/month = ~400 writes/s sustained, append-only with TTL — Cassandra's LSM tree is ideal; partition by tenant_id with timeuuid clustering keeps recent execs in fewer SSTables, and per-tenant TTL prevents wide partitions for whales.</td>
+      <td>Postgres (rejected: vacuum overhead at this volume), DynamoDB (rejected: cost at 4 TB/month).</td>
+    </tr>
+    <tr>
+      <td>Redis (quotas)</td>
+      <td>HINCRBY on <code>quota:{tenant} cpu_ms</code> at 10 K rps with sub-ms latency; sliding-window via Redis Streams gives accurate per-second rate limits without flushing to disk for every check at API gateway.</td>
+      <td>Postgres counters (rejected: 100× slower per HINCRBY), in-memory leaky bucket (rejected: not multi-region).</td>
+    </tr>
+    <tr>
+      <td>S3 + Cassandra inline blobs</td>
+      <td>Outputs &gt;4 KB go to S3 (4 TB/month, lifecycle to Glacier at 30d); &lt;4 KB inline in Cassandra row to skip the S3 round-trip — important since 60% of execs produce trivial output and hit the &lt;3 s p99 budget.</td>
+      <td>S3-only (rejected: extra hop hurts p99), Cassandra-only (rejected: blob bloat at 4 TB).</td>
+    </tr>
+    <tr>
+      <td>tmpfs (per-exec scratch)</td>
+      <td>Bounded RAM-backed FS at <code>/work</code> destroyed with the pod — zero persistence leak, sub-ms write latency vs disk; the 256 MB cap prevents one exec from starving the warm pool through page-cache pressure.</td>
+      <td>overlayfs on disk (rejected: persistence cleanup race), bind mount (rejected: cross-tenant leakage).</td>
+    </tr>
+    <tr>
+      <td>gRPC + flow control</td>
+      <td>In-pod runner exposes <code>Run(stream)</code>; gRPC's HTTP/2 backpressure cleanly throttles a chatty exec producing 100 MB/s stdout down to the 1 MB/s WS frame budget without buffering it all in pod memory.</td>
+      <td>Plain TCP (rejected: backpressure DIY), HTTP/1.1 streaming (rejected: head-of-line blocking).</td>
+    </tr>
+    <tr>
+      <td>CRaC / CDS snapshots</td>
+      <td>JVM cold start drops from 600 ms to 80 ms by deserialising a pre-warmed heap — direct hit on the &lt;200 ms cold SLA for Java, which is 30% of submitted languages and otherwise dominates p99.</td>
+      <td>Plain JVM (rejected: 600 ms blows SLA), GraalVM native-image (rejected: lang-feature regressions).</td>
+    </tr>
+    <tr>
+      <td>Dragonfly / Spegel (p2p image distribution)</td>
+      <td>Cluster bootstrap of 100 hosts × 60 GB images = 6 TB cold pull; p2p amortises that across hosts, avoiding the registry storm that would otherwise rate-limit deploys at 10 Gbps egress per registry node.</td>
+      <td>Single registry (rejected: bottleneck at scale), pre-baked AMIs (rejected: 5 min update lag).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka (exec-events)</td>
+      <td>Idempotent producer keyed on <code>tenant:exec_id</code> gives effectively-once delivery to the billing/audit pipelines off the 10 K rps hot path; replayable for fraud investigation without re-running execs.</td>
+      <td>SQS (rejected: no replay), in-process pub/sub (rejected: lost on crash).</td>
+    </tr>
+    <tr>
+      <td>AppArmor profiles</td>
+      <td>Blocks mount, ptrace, raw filesystem ops at the LSM layer — a third deny-list pass after gVisor and seccomp; cheap to enforce and catches profile-violating syscalls that slip past userspace kernel emulation.</td>
+      <td>SELinux (rejected: policy authoring overhead), no MAC (rejected: weaker isolation).</td>
+    </tr>
+  </tbody>
+</table>

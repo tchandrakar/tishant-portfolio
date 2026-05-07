@@ -1,0 +1,131 @@
+<h1>Design Ad Auction Engine (second-price / VCG, reserve pricing)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ad-tech</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the core auction engine that, given a list of N candidate ads with bids, predicted CTRs, and quality scores, selects K winners for K slots and computes the price each winner pays. Support GSP (generalized second-price), VCG (Vickrey–Clarke–Groves), reserve prices, deal-ID priority, and squashing. The engine is invoked inline by the ad server with a strict 5 ms compute budget per request.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Rank N candidates (typically 50–500) into K slots (1–10).</li>
+  <li>Apply hard filters: brand safety, frequency cap, advertiser block lists.</li>
+  <li>Compute clearing price under GSP or VCG depending on tenant config.</li>
+  <li>Honor reserve prices (per slot, per advertiser tier).</li>
+  <li>Emit a deterministic auction record (auctionId, ranked candidates, prices, reasons).</li>
+  <li>Support A/B traffic splitting on auction logic itself.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 &lt; 5 ms for N=200, K=3 on a single core.</li>
+  <li><b>Throughput:</b> 1.2 M auctions/sec across the fleet.</li>
+  <li><b>Determinism:</b> same input → same output (auditable for billing disputes).</li>
+  <li><b>Auditability:</b> every auction record retained 13 months.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 1.2 M × avg 100 candidates = 120 M candidate scorings/s.</li>
+  <li>Audit log: 1.2 M × 1 KB = 1.2 GB/s, 100 TB/day.</li>
+  <li>Memory: stateless engine; per-tenant config ~10 MB total in-process.</li>
+  <li>CPU: ~5 µs per candidate including filter chain → 1 ms for N=200.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/auction/run
+  body: { auctionId, slots:K, reserves:[..], candidates:[
+            {adId, advertiserId, bid, pCTR, qualityScore, dealId?, categories:[..]}
+          ], rules:{type:"GSP"|"VCG", squash:1.0} }
+  response: { winners:[{slot, adId, price, reason}], allowed:[..], filtered:[..] }</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Ad Server] ──► [Auction Engine (in-process library)]
+                          │
+                          ├─► [Filter Chain] (brand-safety, freq-cap, blocklist)
+                          │
+                          ├─► [Scorer]  score = (bid × pCTR)^squash × QS
+                          │
+                          ├─► [Top-K Selector]  (partial sort / quickselect)
+                          │
+                          ├─► [Pricing Module]  GSP | VCG | first-price
+                          │
+                          └─► [Audit Emitter] → Kafka → S3 (Parquet)
+</div>
+<p>The engine is a library linked into the ad server, not a remote service: an RPC hop costs more than the entire compute budget. Tenant rules are loaded from a versioned config service and hot-swapped atomically.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Auction record (Parquet on S3 via Kafka)</h3>
+<pre>message AuctionRecord {
+  string auction_id = 1;
+  int64  ts_micros  = 2;
+  repeated Candidate candidates = 3; // ranked, with score &amp; price
+  string rules_version = 4;
+  int32  k = 5;
+}</pre>
+<h3>7.2 Tenant config (Spanner + in-memory cache)</h3>
+<p>Auction type, squash factor, reserve prices, blocklists. Versioned; engine reloads on a 30 s tick or push notification.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 GSP pricing</h3>
+<p>Sort by score = bid × pCTR (or Quality Score). Winner of slot <i>i</i> pays the price that would have made score equal score of <i>i+1</i>: <code>price_i = score_{i+1} / pCTR_i + $0.01</code>, floored by reserve. Below reserve → no fill.</p>
+<h3>8.2 VCG pricing</h3>
+<p>Each winner pays the externality they impose on others: sum over j ≠ i of (score_j_without_i − score_j_with_i), divided by their pCTR. More truthful than GSP but harder to explain to advertisers and sensitive to pCTR calibration.</p>
+<h3>8.3 Squashing</h3>
+<p>score = bid<sup>α</sup> × pCTR (α &lt; 1) reduces the influence of high bids on poor-quality ads, improving long-term marketplace health (Yahoo / Lahaie 2008).</p>
+<h3>8.4 Determinism &amp; replay</h3>
+<p>Inputs are captured before randomization. Tie-breaking uses a hash of (auctionId, adId) — same input produces same output for replay tools used in billing disputes.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Sort cost:</b> use std::nth_element / partial_sort — O(N log K), not O(N log N).</li>
+  <li><b>Filter chain order:</b> cheap filters first; advertiser blocklist as a Bloom filter.</li>
+  <li><b>Audit log bandwidth:</b> Snappy compression, batched flushes; Kafka producer with linger 5 ms.</li>
+  <li><b>Config reload:</b> RCU pattern to avoid locks on the hot path.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>GSP</td><td>Simple, well-understood</td><td>Not strategy-proof</td></tr>
+<tr><td>VCG</td><td>Truth-telling dominant strategy</td><td>Complex, revenue can be lower, sensitive to pCTR error</td></tr>
+<tr><td>In-process library</td><td>5 ms achievable</td><td>Deploy coupled with ad server</td></tr>
+<tr><td>Squashing α=0.85</td><td>Quality-tilted ranking</td><td>Bid less influential — advertisers may complain</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 7 Transactions — billing reconciliation against the immutable auction log.</li>
+  <li>Ch. 11 Stream Processing — Kafka audit log as system of record; derived views in ClickHouse / BigQuery.</li>
+  <li>Ch. 12 Future of Data Systems — event-sourced auctions enable replays, what-ifs, and revenue simulation.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I treat the auction record as the source of truth — billing and dashboards derive from it, never the reverse."</li>
+  <li>"GSP vs VCG is a business call. I'd ship GSP first because it's explainable; VCG is a 6-month follow-up with calibration work."</li>
+  <li>"The 5 ms budget is what forces in-process design. RPC alone would burn it."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>In-process C++/Rust library</td><td>The 5 ms p99 budget for N=200 candidates leaves no room for network hops; a same-process call costs ~50 ns vs ~500 µs for the cheapest RPC, so the engine ships as a linked library inside every ad-server binary across the 1.2 M QPS fleet.</td><td>gRPC microservice (rejected: RPC overhead alone exceeds budget); JNI shim (GC pauses unacceptable at p99).</td></tr>
+<tr><td>std::nth_element / quickselect</td><td>For Top-K selection where K=3 and N=200, partial sort is O(N log K) ≈ 200 ops vs full sort O(N log N) ≈ 1500 ops; over 1.2 M QPS this saves CPU equivalent to ~50 cores and tightens p99 by ~1 ms.</td><td>std::sort (rejected: wasted work); heap-based Top-K (similar perf, more code).</td></tr>
+<tr><td>Bloom filter (advertiser blocklist)</td><td>Per-tenant blocklists can have millions of entries but blocklist checks happen N times per auction; a 16 MB Bloom filter at 0.1% FPR rejects 99.9% of blocked candidates in &lt;100 ns each, with the rare false positive verified via exact lookup.</td><td>Hash set (rejected: cache-unfriendly at this size); cuckoo filter (similar, Bloom simpler).</td></tr>
+<tr><td>RCU config reload pattern</td><td>Tenant rules (squash factor, reserves) reload every 30 s without locking the 1.2 M QPS hot path; readers atomically dereference an immutable config pointer and writers swap atomically — zero contention, zero stalls.</td><td>RWLock (rejected: cache-line bouncing at this QPS); event-loop reload (delays config propagation).</td></tr>
+<tr><td>Apache Kafka (audit log emit)</td><td>1.2 GB/s of auction records must be durable for 13-month billing audit; Kafka's batched producer with 5 ms linger absorbs this without blocking the 5 ms compute, and snappy compression cuts the wire by 60%.</td><td>Direct S3 writes (rejected: per-request latency); Kinesis (shard limits at 1.2 GB/s).</td></tr>
+<tr><td>S3 + Parquet (auction archive)</td><td>13 months × 100 TB/day = 40 PB cold storage with column pruning for billing replays; Parquet's predicate pushdown lets a billing dispute scan one campaign's records without reading the full day's 100 TB.</td><td>HDFS (operational cost at 40 PB); Avro on S3 (no column pruning).</td></tr>
+<tr><td>Spanner (tenant config)</td><td>Auction rules per tenant need ACID updates with global readers; Spanner's external consistency lets advertiser console writes be visible to all engine replicas within seconds, and versioned rules enable rollback on a bad squash deploy.</td><td>etcd (rejected: write throughput at 10 M tenants); MySQL (no global ACID).</td></tr>
+<tr><td>GSP pricing (default)</td><td>price_i = score_{i+1}/pCTR_i + ε is computable in 4 floating-point ops per slot — well under the 5 ms budget; near-truthful in practice and explainable to advertisers, reducing billing-dispute volume.</td><td>VCG (rejected for v1: more ops, harder to explain, sensitive to pCTR error); first-price (forces bid-shading externally).</td></tr>
+<tr><td>VCG pricing (opt-in)</td><td>For tenants prioritizing strict truth-telling, VCG offers dominant-strategy bidding; cost is O(K·N) externality computation, still &lt;5 ms for N=200 K=3 because cached score totals make removals O(1).</td><td>Ironclad VCG with pricing curves (overkill); first-price (different incentive model).</td></tr>
+<tr><td>Squashing α=0.85</td><td>score = bid^α × pCTR dampens bid relative to quality; empirically (Lahaie 2008) improves marketplace health by ~5-15% revenue on quality-tilted slots, configurable per tenant for A/B testing.</td><td>α=1 pure bid (rejected: degrades user experience); α=0 ignore bid (rejected: ignores advertiser value signal).</td></tr>
+<tr><td>Deterministic hash tie-break</td><td>Tie-breaking by hash(auctionId, adId) yields same output for same input — required for replay tools used in billing disputes 13 months later; alternative random tie-breaks would make replays inconsistent.</td><td>Random tie-break (rejected: non-deterministic); first-seen (depends on candidate order, not stable).</td></tr>
+<tr><td>Snappy compression (audit)</td><td>1.2 GB/s raw → ~480 MB/s wire with snappy at ~3 GB/s decompression; faster than gzip (~150 MB/s decompress) which matters when Flink replays 13 months for a billing dispute.</td><td>gzip (rejected: slow decompress); zstd (close, snappy chosen for stability).</td></tr>
+</tbody>
+</table>

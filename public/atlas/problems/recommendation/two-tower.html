@@ -1,0 +1,178 @@
+<h1>Design Two-tower Recommender System (user/item embeddings, ANN serving)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a two-tower recommendation system that powers personalized feeds for a TikTok-scale platform. The user tower encodes user features (history, demographics, context) into a 128-dim embedding; the item tower encodes content features (creator, topic, audio, visual). At serving time, given a user vector, retrieve top-K candidate items via Approximate Nearest Neighbor (ANN) search in under 30 ms, feeding a downstream ranker. Must handle 1B users, 500M items, sub-100ms end-to-end recommendation latency.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Train user/item towers offline on (user, item, label) interaction logs with sampled-softmax or in-batch negatives.</li>
+  <li>Materialize all item embeddings nightly; refresh hot items every 15 minutes.</li>
+  <li>Compute user embedding online from latest features (last 50 watches, search queries, dwell signals).</li>
+  <li>Serve top-1000 ANN candidates per user request.</li>
+  <li>Support multiple recommendation surfaces (For You, Following, Search re-rank).</li>
+  <li>A/B test new tower architectures without full re-index.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> ANN lookup p99 under 30 ms; user-tower inference p99 under 20 ms.</li>
+  <li><b>Scale:</b> 1B MAU, 200M DAU, peak 500K rec QPS, 500M item index.</li>
+  <li><b>Freshness:</b> new items discoverable within 15 minutes of upload.</li>
+  <li><b>Availability:</b> 99.95% with graceful fallback to popularity-based recs.</li>
+  <li><b>Recall@1000:</b> at least 0.85 vs brute-force ground truth.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 200M DAU * 50 sessions/day * 5 reqs/session / 86400 ≈ 580K QPS peak.</li>
+  <li>Item index: 500M items * 128 floats * 4 bytes = 256 GB raw; PQ-compressed to ~32 GB.</li>
+  <li>Embedding storage: user emb cache 1B * 128 * 2 (fp16) = 256 GB in Redis cluster.</li>
+  <li>Training data: 200M DAU * 200 events/day * 200 bytes ≈ 8 TB/day to feature store.</li>
+  <li>GPU: 8 A100 nodes for nightly index build (90 min for 500M vectors).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/recs/candidates    {userId, context, k=1000}    -> [itemId, score][]
+GET   /v1/embeddings/user/{userId}                         -> {vector[128], version}
+POST  /v1/embeddings/item/batch  {itemIds[]}               -> {itemId: vector[128]}
+POST  /v1/index/rebuild      {modelVersion}                -> jobId  (admin)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] -> [API GW] -> [Rec Orchestrator]
+                              |
+                              +-> [User Tower Svc] <- [Feature Store (Redis+S3)]
+                              |        |
+                              |        v 128-d user vec
+                              +-> [ANN Index Shards (FAISS/ScaNN)] -> top-1000
+                              |
+                              +-> [Ranker Svc] -> top-50 -> client
+
+Offline:
+[Kafka events] -> [Flink ETL] -> [TFRecord on S3] -> [TPU/GPU Trainer]
+                                                          |
+                                       item tower -> [Index Builder] -> shards
+                                       user tower -> [TF-Serving]
+</div>
+<p>Walk-through: client request hits orchestrator, which fetches user features, runs the user tower, queries ANN shards in parallel via scatter-gather, merges top-K, then forwards to the ranker.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Embedding store (Redis Cluster + S3)</h3>
+<pre>KEY  emb:user:{userId}:v{modelVersion}   VALUE 256-byte fp16 blob   TTL 24h
+KEY  emb:item:{itemId}:v{modelVersion}   VALUE 256-byte fp16 blob   TTL none
+S3   s3://embeddings/v{ver}/items.parquet  (cold, full snapshot)</pre>
+<h3>7.2 Why this split?</h3>
+<p>User embeddings change as the user interacts; cache with TTL and lazy recompute. Item embeddings are stable; bake into the FAISS shard at build time and keep S3 as source of truth for re-indexing.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 User tower</h3>
+<p>MLP with 3 hidden layers (512-256-128). Inputs: 64-dim recent-watch sequence avg-pool, 32-dim profile, 32-dim context. Trained with softmax over in-batch negatives + 1000 sampled negatives. Served via TF-Serving on T4 GPUs, 5ms p50.</p>
+<h3>8.2 Item tower &amp; ANN index</h3>
+<p>FAISS IVF-PQ: 16384 inverted lists, PQ16x8 (16 sub-vectors, 8 bits each). nprobe=32 at query time. Index sharded by item_id mod 64 across 64 shards; each shard ~8M vectors, fits in 512 MB RAM. ScaNN is an alternative with better recall/latency Pareto.</p>
+<h3>8.3 Training pipeline</h3>
+<p>Daily batch on Spark+TF: 30 days of impressions, label = positive if dwell&gt;3s or like. Negative sampling: 80% in-batch, 20% hard negatives mined from prior model. Loss: sampled-softmax with frequency-correction (log Q correction).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>ANN tail latency:</b> nprobe spikes hurt p99; use deadline-aware nprobe (start 32, drop to 16 if elapsed&gt;15ms).</li>
+  <li><b>Hot users:</b> celebrities with millions of similar followers thrash cache; pre-compute and pin user embeddings.</li>
+  <li><b>Index rebuild storm:</b> 90-min nightly job; do rolling shard swap, never full cutover.</li>
+  <li><b>Model drift:</b> dual-write user/item embeddings during version transitions for 24h.</li>
+  <li><b>Cold items:</b> items &lt;1h old bypass FAISS, served from a separate "fresh" index on Redis with brute-force scan.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>FAISS IVF-PQ</td><td>32 GB index, sub-ms search</td><td>Recall ~0.88 vs brute-force</td></tr>
+<tr><td>HNSW</td><td>Recall &gt;0.95, no train step</td><td>3x memory; slower build</td></tr>
+<tr><td>Online user tower</td><td>Captures session intent</td><td>20ms inference + GPU cost</td></tr>
+<tr><td>Cached user emb</td><td>Cheap, &lt;1ms</td><td>Stale by minutes</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 10 Batch Processing — nightly Spark/MapReduce-style training and index build.</li>
+  <li>Ch. 11 Stream Processing — Kafka + Flink event ETL for feature store.</li>
+  <li>Ch. 6 Partitioning — sharding ANN index by hash of item_id for parallel scatter-gather.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with cached user embeddings + nightly item index. Online user tower is iteration 2 once we have GPU capacity."</li>
+  <li>"The hardest part is freshness vs recall: a 15-minute-old item must be discoverable, but rebuilding a 500M FAISS index that often is infeasible. My mitigation is the dual-index pattern."</li>
+  <li>"For evaluation, I'd track recall@1000 offline and CTR-on-impressions online; ANN recall is necessary but not sufficient."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>FAISS IVF-PQ</td>
+      <td>Compresses 500M 128-d vectors from 256 GB raw down to ~32 GB via PQ16x8, fitting one shard (8M vectors) in 512 MB RAM. With 16384 inverted lists and nprobe=32 we hit sub-30ms p99 ANN at 580K QPS while staying within budget on commodity boxes.</td>
+      <td>Brute force (256 GB scan, 100x too slow); Annoy (worse recall/latency Pareto at this scale).</td>
+    </tr>
+    <tr>
+      <td>HNSW</td>
+      <td>Used as fallback for the high-recall (&gt;0.95) source where memory is acceptable. No training step means we can rebuild a 500M shard set incrementally, which matters when index drift forces re-embed during model upgrades.</td>
+      <td>IVF-PQ alone (recall caps at 0.88); ScaNN (similar Pareto, less mature ops tooling internally).</td>
+    </tr>
+    <tr>
+      <td>ScaNN</td>
+      <td>Listed as the alternative ANN with a better recall/latency Pareto for the 500M corpus when GPU-class CPUs are available. Anisotropic quantization beats PQ on Recall@1000 at the same ~30ms budget.</td>
+      <td>FAISS (chosen first for ecosystem); HNSW (3x memory cost on a 256 GB raw corpus).</td>
+    </tr>
+    <tr>
+      <td>TensorFlow Serving on T4 GPUs</td>
+      <td>User tower MLP (512-256-128) needs sub-20ms p99 inference at 580K QPS; T4 batching at 32 amortizes kernel launches and hits 5ms p50. TF-Serving's model versioning lets us A/B new towers without re-indexing items.</td>
+      <td>TorchServe (weaker batching primitives); ONNX Runtime CPU (cannot meet 20ms at peak QPS).</td>
+    </tr>
+    <tr>
+      <td>Redis Cluster (embedding cache)</td>
+      <td>1B users * 128 fp16 = 256 GB user-embedding cache; Redis sharded gives sub-1ms GET so the cached path never violates the 100ms end-to-end budget. TTL 24h matches the user-tower drift window.</td>
+      <td>Memcached (no native cluster mode for 256 GB); DynamoDB (10ms tail kills the budget).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka</td>
+      <td>Carries the raw interaction events feeding the 8 TB/day training pipeline; partitioned by user_id so Flink ETL keeps user-feature ordering. Replay capability is mandatory for re-training new tower architectures on historic data.</td>
+      <td>AWS Kinesis (lower retention); RabbitMQ (not designed for 8 TB/day throughput).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink</td>
+      <td>Streams Kafka events into the feature store with sub-minute lag so user-tower inputs (last 50 watches) are fresh; exactly-once via Kafka transactional sinks prevents double-counting impressions in the training set.</td>
+      <td>Spark Structured Streaming (higher tail latency); Kafka Streams (no native exactly-once cross-topic joins at this scale).</td>
+    </tr>
+    <tr>
+      <td>Apache Spark</td>
+      <td>Daily 30-day training-data assembly over impression logs (8 TB/day * 30 = 240 TB) is a textbook batch problem; Spark's Catalyst optimizer and shuffle handle the join between user features and item content efficiently.</td>
+      <td>Beam on Dataflow (locked to GCP); Hadoop MapReduce (worse iterative joins).</td>
+    </tr>
+    <tr>
+      <td>S3 (item embedding snapshot)</td>
+      <td>500M item embeddings * 256 bytes = 128 GB Parquet snapshots per model version; S3 is the durable source-of-truth that ANN shards bulk-load at boot, enabling rolling shard swap rather than a 90-min full cutover.</td>
+      <td>HDFS (operational overhead); EBS (not multi-attach across 64 shards).</td>
+    </tr>
+    <tr>
+      <td>NVIDIA A100 GPUs (training)</td>
+      <td>Nightly index build embeds 500M items in 90 minutes on 8 A100 nodes; A100's HBM bandwidth and sampled-softmax-friendly tensor cores cut training time roughly 3x vs V100, keeping the daily window achievable.</td>
+      <td>TPU v4 (vendor-locked); V100 (would push training to 4+ hours and miss the daily refresh).</td>
+    </tr>
+    <tr>
+      <td>gRPC + protobuf</td>
+      <td>Scatter-gather to 64 ANN shards for top-1000 candidates needs binary serialization with HTTP/2 multiplexing; protobuf vectors are 4x smaller than JSON, halving wire time inside the 30ms ANN budget.</td>
+      <td>REST/JSON (too verbose); Thrift (smaller ecosystem for ML serving).</td>
+    </tr>
+    <tr>
+      <td>Sampled-softmax with log-Q correction</td>
+      <td>Full softmax over 500M items is intractable; in-batch + 1000 sampled negatives with log-Q debiasing gives unbiased gradient estimates and is the empirically dominant choice for two-tower retrieval at this corpus size.</td>
+      <td>Full softmax (compute-prohibitive); triplet loss (worse Recall@1000 in published benchmarks).</td>
+    </tr>
+  </tbody>
+</table>

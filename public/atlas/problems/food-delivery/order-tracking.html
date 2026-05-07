@@ -1,0 +1,149 @@
+<h1>Design Real-time Order Tracking (driver location → customer in &lt;2s)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">food-delivery</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the live-tracking subsystem that takes a courier's GPS pings and projects them onto every active customer's order screen with end-to-end latency under 2 s. Also surfaces order state transitions (placed → accepted → preparing → picked → delivered), recomputed ETA, and notifications. Must work on flaky mobile networks and scale to millions of concurrent open orders during peak hours.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Courier app pushes location at 1 Hz with status (en-route to pickup, with order, dropped).</li>
+  <li>Customer app subscribes to its order's location channel and receives updates &lt; 2 s after the ping.</li>
+  <li>Show order state machine transitions live; show ETA refreshed every 10 s.</li>
+  <li>Allow customer ↔ courier voice/chat (masked numbers) tied to the order.</li>
+  <li>Replay last 5 minutes for late-joining clients.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> ping → customer screen p99 &lt; 2 s.</li>
+  <li><b>Scale:</b> 5 M concurrent open orders peak; 600 K courier pings/s.</li>
+  <li><b>Availability:</b> 99.99% — degraded mode allows polling at 5 s if WS layer fails.</li>
+  <li><b>Bandwidth:</b> bound mobile traffic to ~10 KB/min/customer on cellular.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Pings: 600 K/s × 200 B = 120 MB/s ingress.</li>
+  <li>Fanout: typical 1 customer + 1 ops dashboard subscriber per order ≈ 1.2x amplification → 720 K msg/s egress.</li>
+  <li>WS connections: 5 M concurrent → ~50 GB RAM across gateway fleet (10 KB/conn).</li>
+  <li>Replay buffer: 5 M orders × 300 pings × 200 B ≈ 300 GB in Redis (sharded).</li>
+  <li>Push notifications: ~50 M/day at peak (state transitions + ETA breaches).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>WS  /v1/track?orderId=&amp;token=          → {seq, courierLat, courierLng, etaSec, state}
+GET /v1/track/{orderId}/snapshot       → last known state (REST fallback)
+POST /v1/courier/ping                  {courierId, lat, lng, accuracy, ts, status}
+POST /v1/orders/{id}/state             {state}      (internal, from Order Svc)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Courier]→[Geo Ingest API]→Kafka(courier.pings)→[Flink job]
+                                                    │
+                            ┌───────────────────────┤
+                            ↓                       ↓
+                  [Active-Order Joiner]      [Geo index Redis]
+                    (joins ping → orderId)
+                            ↓
+                  Kafka(order.tracking.{shard})
+                            ↓
+              [WS Gateway fleet (Go/Netty)]──→ [Customer]
+                    (sticky by orderId)
+                            ↓
+                  [Replay buffer: Redis Streams]
+[Order Svc]───→ Kafka(order.events) ──→ [WS Gateway] (state transitions)
+[FCM/APNs]  ←── [Notif Svc] ←── [Flink ETA-breach detector]
+</div>
+<p>The crucial join is "which order is this courier on right now?" — done in Flink with keyed state on courier_id, fed by assignment events. Output topic is sharded by orderId hash so a WS gateway only consumes the partitions for connections it owns.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Tracking message (protobuf)</h3>
+<pre>message Track {
+  fixed64 order_id = 1;
+  sfixed32 lat_e7  = 2;   // 4 bytes
+  sfixed32 lng_e7  = 3;
+  uint32   eta_sec = 4;
+  uint32   seq     = 5;
+  State    state   = 6;
+}</pre>
+<p>~25 B on the wire vs ~200 B for JSON.</p>
+<h3>7.2 Replay buffer (Redis Streams)</h3>
+<p><code>XADD track:{orderId} MAXLEN ~ 600 ...</code> — ~5 minutes at 1 Hz. Customer reconnect sends <code>last-seq</code>; gateway replays from there.</p>
+<h3>7.3 Cold archive (Cassandra/S3)</h3>
+<p>Trails downsampled to 1 ping / 5 s for compliance + ML training; partitioned by <code>courier_id+date</code>.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 WS gateway</h3>
+<p>Go service, single process handles ~100 K WS conns, sticky by <code>orderId</code> via consistent hashing in the LB. Each gateway pod consumes a slice of <code>order.tracking.*</code> partitions matching its connection set; rebalances on scale events.</p>
+<h3>8.2 Ping → order join (Flink)</h3>
+<p>Keyed by <code>courier_id</code>; state holds current assignment(s). Inputs: <code>courier.pings</code>, <code>assign.events</code>. Output: per-order <code>Track</code> messages. p99 processing time &lt; 100 ms.</p>
+<h3>8.3 Bandwidth optimisation</h3>
+<p>Send delta-encoded protobuf: only changed fields. Throttle to max 1 update / 3 s on cellular when courier is &gt; 1 km away. Polyline-snap to road graph client-side for smooth animation.</p>
+<h3>8.4 Reconnect &amp; degraded modes</h3>
+<p>On WS drop, exponential backoff up to 30 s; if 3 attempts fail, fall back to <code>GET /snapshot</code> every 5 s. Server stores last-seq in JWT-style resume token so replay is stateless on gateway.</p>
+<h3>8.5 Notifications</h3>
+<p>Flink job watches ETA breaches (current ETA &gt; promise+2 min), state transitions, and emits push messages via FCM/APNs through a notification service.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Connection storms (post-app-update):</b> rate-limit re-handshake at LB; spread reconnects via jitter.</li>
+  <li><b>Hot orderId partition:</b> not really a thing here — orders are naturally well-distributed.</li>
+  <li><b>Cellular dead zones:</b> client buffers last-known and animates; server keeps Redis stream alive.</li>
+  <li><b>WS gateway memory:</b> shed idle connections after 60 s no activity in delivered state.</li>
+  <li><b>Cross-region:</b> co-locate gateway with the order's origin region; rare cross-region order goes via global LB.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>WebSockets vs polling</td><td>2 s push, low overhead</td><td>Connection state at gateway, harder ops</td></tr>
+<tr><td>Flink stream join</td><td>Exactly-once, rich state</td><td>Operational complexity vs simple Kafka Streams</td></tr>
+<tr><td>Protobuf delta</td><td>4–8x bandwidth saving</td><td>Schema discipline, harder to debug</td></tr>
+<tr><td>Redis Streams replay</td><td>Cheap, fast, capped</td><td>Lost on Redis failover unless AOF</td></tr>
+<tr><td>1 Hz ping rate</td><td>Smooth UX</td><td>Heavy ingress; throttle when idle</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 4 Encoding — protobuf vs JSON for low-overhead mobile messages.</li>
+  <li>Ch. 6 Partitioning — orderId-keyed Kafka topics; gateway partition affinity.</li>
+  <li>Ch. 11 Stream Processing — Flink keyed-state join (courier_id → assignment).</li>
+  <li>Ch. 12 Future of Data Systems — replayable derived stream of tracking updates.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I treat ping ingestion and customer fanout as separate concerns connected by Kafka — gateways scale independently of solvers."</li>
+  <li>"The hardest part isn't the happy path; it's reconnect semantics. A stateless resume token keyed by last-seq makes failovers invisible."</li>
+  <li>"On flaky cellular, I prefer a slightly lower update rate over jittery UX; client-side smoothing buys back perceived freshness."</li>
+  <li>"For privacy, courier locations are masked to ±100 m once the order is delivered; raw trails are accessible only to ops with audit."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>WebSocket gateway (Go / Netty)</td><td>5 M concurrent open orders with p99 &lt; 2 s push latency; Go's goroutine model handles ~100 K conns/process with low RAM (~10 KB/conn = 50 GB across fleet). Sticky-by-orderId routing keeps Kafka partition affinity local.</td><td>SSE (one-way insufficient for client status); MQTT (extra broker hop at 720 K msg/s egress); HTTP long-poll (10x server cost at 5 M conns).</td></tr>
+<tr><td>Apache Kafka (sharded topics)</td><td>720 K msg/s egress fan-out from 600 K pings/s ingress needs partitioned log sharded by orderId; gateway pods consume only their assigned partitions, scaling linearly. Replay critical for late-joining clients via last-seq.</td><td>Kinesis (24 hr retention, vendor lock); Pulsar (smaller community); RabbitMQ (no replay; struggles at 720 K/s).</td></tr>
+<tr><td>Apache Flink (courier→order join)</td><td>Joining 600 K pings/s with assignment events keyed by courier_id requires &lt;100 ms p99 stateful processing; Flink's keyed state with checkpointing gives exactly-once delivery semantics — critical because duplicate "delivered" events would trigger duplicate notifications.</td><td>Kafka Streams (state recovery slow at this volume); Spark Streaming (microbatch latency breaks 2 s SLA); Storm (deprecated).</td></tr>
+<tr><td>Redis Streams (replay buffer)</td><td>5 minutes × 5 M orders × 1 Hz × 200 B = 300 GB replay window; <code>XADD MAXLEN ~ 600</code> auto-trims to fixed cost. Reconnect with last-seq is sub-ms — essential for the 2 s SLA on resume.</td><td>Kafka (overkill for 5 min window per order; partition explosion); in-memory ring buffer (lost on pod restart); DynamoDB (slow tail reads).</td></tr>
+<tr><td>Protocol Buffers (delta-encoded)</td><td>~25 B on wire vs ~200 B JSON × 720 K msg/s = 14 MB/s saved bandwidth; mobile cellular budget of 10 KB/min/customer is only achievable with protobuf + delta encoding. Schema discipline catches breaking changes.</td><td>JSON (3-4x bigger; breaks cellular budget); FlatBuffers (less mature mobile tooling); MessagePack (no schema evolution).</td></tr>
+<tr><td>FCM / APNs (push notif)</td><td>50 M push notifications/day at peak (state transitions + ETA breaches) needs platform-native delivery for background reliability and battery efficiency; in-app WS push fails when app is backgrounded.</td><td>Self-hosted push (iOS background delivery requires APNs); SMS (cost at 50 M/day); email (latency too high).</td></tr>
+<tr><td>Cassandra (cold trail)</td><td>Downsampled 1 ping / 5 s × 600 K couriers × 24 hr ≈ 10 B rows/year; partition by <code>courier_id+date</code> serves payouts and ML training without taxing the live tracking path. 7-yr compliance retention cheap on TWCS.</td><td>S3 + Parquet (slow point-lookups for disputes); HBase (heavier ops); ScyllaDB (good fit; smaller ecosystem).</td></tr>
+<tr><td>Redis Geo (live courier index)</td><td>Geo Ingest writes 600 K pings/s into geohash buckets; consumed by both dispatch and tracking subsystems for nearest-courier queries at sub-ms latency. RAM-resident is acceptable since Kafka replays on failover.</td><td>PostGIS (slow at 600 K writes/s); MongoDB geo (poorer p99 tail); custom in-memory (re-implementing Redis).</td></tr>
+<tr><td>Consistent-hash LB (sticky-by-orderId)</td><td>WebSocket conns must land on the gateway pod consuming the matching Kafka partition; consistent hashing minimises reshuffling on scale events so the 5 M live conns don't all reconnect when one pod is added.</td><td>Random LB (constant cross-partition fetches); session affinity by IP (NAT breaks); zk-based assignment (extra hop on every conn).</td></tr>
+<tr><td>JWT-style resume token</td><td>Stateless gateway resume on reconnect — token contains last-seq and orderId so any gateway pod can replay from Redis Streams without consulting a session DB. Critical because reconnect storms post-app-update can hit 100 K/s.</td><td>Server-side session table (Redis lookup per conn breaks at 100 K/s storm); cookie session (not WS-friendly); fresh subscribe (loses recent updates).</td></tr>
+<tr><td>Polyline-snap client smoothing</td><td>1 ping/sec produces jittery animation; client snapping to OSM road graph between updates gives smooth UX without forcing 5 Hz pings (which would 5x ingress to 3 M pings/s — infeasible).</td><td>Server-side snapping (extra CPU at 600 K pings/s); higher ping rate (5x cost); raw plotting (poor UX).</td></tr>
+<tr><td>Exponential backoff + 5s polling fallback</td><td>WS conn drops on flaky cellular need graceful degradation; jitter-spread reconnects avoid thundering herd, and REST snapshot polling keeps customers informed during gateway outages — meeting 99.99% availability SLA.</td><td>Aggressive immediate retry (storm risk); silent failure (poor UX); SSE-only fallback (still needs WS infra).</td></tr>
+<tr><td>Geo Ingest API (Go)</td><td>120 MB/s ingress at 600 K pings/s needs a thin, garbage-collected-friendly service that writes to Kafka without back-pressure; Go's lightweight HTTP/gRPC handlers keep p99 ingest latency &lt;20 ms.</td><td>Java/Spring (GC pauses at this rate); Node.js (single-threaded bottleneck); Rust (longer dev cycle for similar perf gain here).</td></tr>
+<tr><td>Audit log + ±100 m masking</td><td>Privacy: raw trails accessed only by ops with audit, customer-visible locations masked post-delivery to ±100 m grid; meets data minimisation regulatory requirements while preserving dispute resolution capability.</td><td>Full retention everywhere (privacy/regulatory risk); aggressive deletion (loses dispute resolution trail); user-controlled (ops complexity).</td></tr>
+</tbody>
+</table>
+

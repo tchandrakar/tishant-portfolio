@@ -1,0 +1,59 @@
+<h1>Why scalability matters: vertical vs horizontal scaling</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Easy</span>
+  <span class="tag">scalability</span>
+  <span class="tag">capacity</span>
+  <span class="tag">fundamentals</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Scalability is the ability of a system to keep serving more users, more data, or more requests without falling over or rewriting itself from scratch. You get there in two ways: <b>vertical scaling</b> (give one machine more CPU, RAM, or disk) or <b>horizontal scaling</b> (add more machines and spread the work across them). Vertical is simple but hits a hard ceiling — at some point you can't buy a bigger box. Horizontal is harder to design but, in theory, has no ceiling: you just add another node.</p>
+
+<h2>Why it matters</h2>
+<p>Almost every interview question — "Design Twitter", "Design Uber", "Design Netflix" — boils down to: <i>what happens when 10x more traffic shows up tomorrow?</i> If your design only works on one machine, you've already failed. Real services live and die by their ability to spread load across hundreds or thousands of servers. Knowing when to scale up versus scale out is the first real engineering decision in any high-level design.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Stack Overflow:</b> famously scales <i>vertically</i> — a handful of beefy SQL Server boxes serve billions of requests. Works because their workload is read-heavy and cache-friendly.</li>
+  <li><b>Netflix:</b> scales <i>horizontally</i> across thousands of stateless microservices on AWS. New traffic = more EC2 instances behind a load balancer.</li>
+  <li><b>Postgres primary:</b> typically vertical (bigger CPU/RAM) with horizontal read replicas for fan-out reads.</li>
+  <li><b>Cassandra / DynamoDB:</b> horizontal by design — every node holds a slice of the data; growth means adding nodes.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  Vertical scaling (scale up)        Horizontal scaling (scale out)
+
+       +-----------+                  +----+  +----+  +----+  +----+
+       |           |                  |srv |  |srv |  |srv |  |srv |
+       |  BIGGER   |                  +----+  +----+  +----+  +----+
+       |  SERVER   |                       \    |     |    /
+       |           |                        \   |     |   /
+       +-----------+                         +--+-----+--+
+            |                                | Load Bal. |
+         clients                             +-----------+
+                                                   |
+                                                clients
+</div>
+<p>Vertical: one node does more work. Horizontal: many nodes share the work, fronted by a load balancer that routes each request. Horizontal forces you to confront state — sessions, caches, locks — because no single node is "the" node anymore.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Assuming horizontal is always better. For low-traffic services, a single big box is cheaper, simpler, and faster to debug.</li>
+  <li>Ignoring shared state. The moment you horizontally scale a stateful app without externalizing sessions/locks, you get bizarre, hard-to-reproduce bugs.</li>
+  <li>Confusing "scalable" with "fast". A latency-bound system doesn't get faster by adding more machines — it just handles more concurrent users.</li>
+  <li>Forgetting the database. App servers scale easily; the database is usually the bottleneck and needs replication, sharding, or a different engine.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Your single-node web app handles 1,000 RPS at 80% CPU. Tomorrow, marketing announces a campaign that will push traffic to 10,000 RPS. You have 24 hours. Do you scale vertically (rent a 10x bigger machine) or horizontally (add 9 more identical machines behind a load balancer)? What hidden problems will the horizontal path force you to solve first?
+  <br/>
+  <b>Hint:</b> Where do user sessions live? What about uploaded files? Which choice is reversible if it fails?
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-netflix">Design Netflix</a> — stateless microservices scaled horizontally on demand.</li>
+  <li><a href="#problem/design-amazon">Design Amazon</a> — mixed strategy: vertical for the OLTP core, horizontal for everything else.</li>
+  <li><a href="#problem/design-uber">Design Uber</a> — geosharded horizontal scaling driven by region.</li>
+</ul>

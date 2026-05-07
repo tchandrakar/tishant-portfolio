@@ -1,0 +1,143 @@
+<h1>Design Lyft (multi-modal: rideshare + bikes + scooters)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">maps-location</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a multi-modal mobility platform: classic rideshare (car + driver), shared rides (Line/Pool), and dockless micromobility (bikes, e-bikes, scooters). A single rider session must seamlessly compare modes, reserve a vehicle, navigate to it, and complete the trip — with one wallet, one map, one trip history. Internationally rolled out, with strict per-city regulatory zones (geofences) for micromobility.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Unified trip planning: show car, shared, bike, scooter options with price + ETA + walking distance.</li>
+  <li>Reserve a bike/scooter for 10 minutes; unlock via QR/BLE; lock at trip end.</li>
+  <li>Driver-based rideshare: request, match, track, pay (Uber-like flow).</li>
+  <li>Geofence enforcement: speed-throttle scooters in pedestrian zones, prevent end-trip outside service area.</li>
+  <li>Single wallet across modes, ride credits, business profiles.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> map of nearby vehicles loads p99 &lt; 500 ms; unlock command p99 &lt; 1.5s end-to-end (server → IoT modem → vehicle).</li>
+  <li><b>Scale:</b> ~2 M rideshare rides/day, ~1 M micromobility trips/day across 200 cities; 200 K active vehicles.</li>
+  <li><b>Availability:</b> 99.95% for trip planning; 99.99% for unlock (a stuck rider is a support nightmare).</li>
+  <li><b>Reliability:</b> IoT command idempotent; offline scooter must reconcile state on reconnect.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Vehicle telemetry every 30s for 200 K vehicles → 6.7 K writes/sec; 60 B/event → 25 GB/day.</li>
+  <li>Search-nearby QPS: 50 K/sec peak (every map pan triggers one).</li>
+  <li>Trip records: 3 M/day × 1.5 KB ≈ 4.5 GB/day; 1.6 TB/year.</li>
+  <li>Unlock commands: 1 M/day, must round-trip in &lt;1.5s — sized for 100 RPS sustained, 1 K RPS peak.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET  /v1/nearby?lat=..&amp;lng=..&amp;modes=car,bike,scooter   → [{vehicleId, mode, eta, price, lat, lng}]
+POST /v1/trips/plan   {origin, dest, modes}             → planId, options[]
+POST /v1/trips/reserve{planId, optionId}                → trip, holdExpiresAt
+POST /v1/vehicles/{id}/unlock {tripId, deviceId}        → 200 (idempotency-key required)
+POST /v1/vehicles/{id}/end    {endLoc, photoUrl}        → fare
+POST /v1/drivers/location     {driverId, lat, lng}      → 200</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Rider App] -> [API GW] -> [Trip Planner] -> [Mode Routers]
+                                              |    |    |
+                              +---------------+    |    +---------------+
+                              v                    v                    v
+                       [Rideshare Svc]      [Bike Svc]            [Scooter Svc]
+                              |                    |                    |
+                              v                    v                    v
+                       [Dispatch + S2 idx]  [Geo Index (H3)]      [Geofence Svc]
+                              |                    |                    |
+                              +--------+-----------+--------+-----------+
+                                       v                    v
+                                [Kafka: events]    [IoT Gateway / MQTT]
+                                       |                    |
+                                       v                    v
+                              [Wallet/Payments]    [Vehicle (modem)]
+</div>
+<p>Trip Planner is the orchestrator. It calls each mode service in parallel, merges results, and returns a unified option list. Per-mode services own their geo index and lifecycle. The IoT Gateway terminates MQTT/AMQP from physical vehicles and translates to internal RPC.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Vehicle (DynamoDB)</h3>
+<pre>PK: vehicle_id   (string)
+SK: -            (single-row)
+attrs: mode, status (IDLE|RESERVED|INUSE|OOS),
+       last_lat, last_lng, last_seen, battery_pct,
+       firmware_v, geofence_region
+GSI1: status + h3_cell  (for nearby queries)</pre>
+<h3>7.2 Trip (Postgres, partitioned by month)</h3>
+<pre>CREATE TABLE trips (
+  trip_id UUID PRIMARY KEY,
+  user_id BIGINT, mode TEXT, vehicle_id TEXT,
+  start_loc GEOGRAPHY, end_loc GEOGRAPHY,
+  fare_cents INT, started_at TIMESTAMPTZ, ended_at TIMESTAMPTZ
+) PARTITION BY RANGE (started_at);</pre>
+<h3>7.3 Geofences (PostGIS)</h3>
+<p>Polygons stored with GiST spatial index; lookups in &lt;10 ms. Versioned so regulatory changes don't break in-flight trips.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Trip planner</h3>
+<p>Fan-out to mode services with a 250 ms hard timeout. Merges results, applies user preferences, sorts by composite (price, eta, mode_pref). Caches per-(origin-cell, time-bucket) for 30s.</p>
+<h3>8.2 Geofence service</h3>
+<p>Hot polygons loaded into memory as an R-tree; uses point-in-polygon tests on every telemetry ping. Emits Kafka events on zone enter/exit. Scooter firmware receives a speed-cap command via downlink within 2s.</p>
+<h3>8.3 IoT gateway &amp; unlock</h3>
+<p>MQTT broker (EMQX) with persistent sessions. Unlock command is idempotent: server stores (trip_id, command_id) and dedups. If MQTT downlink fails, fallback to LTE-direct via vehicle modem; if both fail, surface "manual unlock code" within 8s.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Map-pan storms:</b> CDN-cache the nearby endpoint at coarse H3 resolution; precompute per-cell vehicle snapshots every 5s.</li>
+  <li><b>Hot geofence polygons:</b> bloom filter on cell membership before doing the expensive PIP test.</li>
+  <li><b>Vehicle clock skew:</b> server stamps every event; never trust client time for billing.</li>
+  <li><b>Battery-driven supply collapse:</b> rebalance ops surfaces low-battery clusters; predictive charging dispatch.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>One unified trip table</td><td>Single wallet/history</td><td>Schema must abstract very different modes</td></tr>
+<tr><td>H3 hex grid</td><td>Uniform neighbor distance</td><td>More cells than S2 for same area</td></tr>
+<tr><td>MQTT for IoT</td><td>Battery-friendly, persistent sessions</td><td>Broker is critical infra</td></tr>
+<tr><td>Per-mode microservice</td><td>Independent deploys, blast radius</td><td>Cross-mode features need orchestration</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — Dynamo-style partition for vehicle KV; range-partition Postgres trips by time.</li>
+  <li>Ch. 8 Distributed troubles — clock skew between vehicle modem and server.</li>
+  <li>Ch. 11 Stream Processing — Kafka events drive geofence and surge.</li>
+  <li>Ch. 12 Future of data systems — multi-source materialized views (vehicle status).</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd push the planner to be stateless and per-mode services to own their index — that decoupling lets us add a new mode (mopeds) without touching rideshare."</li>
+  <li>"The unlock path is the trickiest because it bridges cloud and a flaky LTE modem; idempotency + dual-channel commands are non-negotiable."</li>
+  <li>"Geofencing is a regulatory product, not a feature — I'd version polygons and replay them in a staging zone before rolling out."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>H3 (resolution 8–9)</td><td>200 K active vehicles plus 50 K nearby-search QPS need uniform hex neighbors so a single map-pan covers the same area regardless of latitude — important when Lyft operates in 200 cities from Toronto to São Paulo.</td><td>Geohash → rectangular cells skew badly at high latitudes; S2 → uniform-ish but neighbor distance still varies on the cube projection.</td></tr>
+    <tr><td>S2 (rideshare path)</td><td>Per-mode rideshare service inherits the Uber-style dispatch loop; S2's 1D Hilbert key is faster for cell range scans during the 250 ms trip-planner fan-out budget.</td><td>H3 only → fine but no native 1D ordering for sorted-set scans.</td></tr>
+    <tr><td>DynamoDB (vehicle KV)</td><td>200 K vehicle rows updated every 30s = 6.7 K wps with single-digit ms p99; GSI on (status, h3_cell) handles the nearby query without a separate cache; auto-scales across 200-city footprint.</td><td>Cassandra → equally fine but more ops; Postgres → no managed multi-region active-active.</td></tr>
+    <tr><td>PostGIS (geofences)</td><td>Polygon point-in-polygon for regulatory zones (NYC pedestrian-only blocks, Paris no-park areas) needs GiST spatial indexing for &lt;10 ms lookups on every telemetry ping; SQL JOINs let us version polygons.</td><td>Pure H3 cells → can't represent arbitrary regulator-drawn polygons exactly; Mongo geospatial → weaker polygon ops.</td></tr>
+    <tr><td>Postgres (trips, partitioned by month)</td><td>3 M trips/day × 1.5 KB = 4.5 GB/day; range partition by started_at keeps the hot month small and lets us drop old partitions cheaply for the 1.6 TB/year retention.</td><td>MySQL → fine; Cassandra → no JOINs for support/billing queries.</td></tr>
+    <tr><td>EMQX (MQTT broker)</td><td>1 M unlock commands/day with 100 RPS sustained, 1 K RPS peak need persistent sessions and QoS 1 for idempotent delivery; the 1.5s end-to-end unlock budget cannot tolerate handshake on every command.</td><td>Mosquitto → single-node only; HiveMQ → fine, EMQX is cheaper at scale.</td></tr>
+    <tr><td>Kafka (mode events)</td><td>Decouples Trip Planner from Wallet, Surge, and Geofence; replayable log lets us reprocess a regulatory polygon change against the last 24 h of telemetry without disrupting live traffic.</td><td>SQS → no replay; Pulsar → smaller Flink connector ecosystem.</td></tr>
+    <tr><td>R-tree (in-memory geofences)</td><td>Hot polygons loaded into the Geofence Service's process memory: a point-in-polygon test on every 30s telemetry ping × 200 K vehicles = 6.7 K PIP/sec, but bloom-filter pre-check + R-tree keeps the median &lt;1 ms.</td><td>PostGIS for hot path → 10 ms × 6.7 K = 67 K rps load on Postgres, too expensive.</td></tr>
+    <tr><td>gRPC (internal)</td><td>Trip Planner fan-out to 3 mode services within a 250 ms hard timeout; protobuf keeps payloads small enough to parallelize without exhausting the budget.</td><td>REST → JSON parsing eats 30–50 ms of the budget; Thrift → smaller polyglot ecosystem.</td></tr>
+    <tr><td>QUIC + LTE fallback</td><td>Vehicle modems on flaky carrier networks get 0-RTT resumption; if the MQTT downlink fails the same payload is retried over LTE-direct so the rider never sees an unlock failure beyond 8s.</td><td>TCP-only → reconnects after every cell handoff break the unlock SLA.</td></tr>
+    <tr><td>CDN (nearby endpoint)</td><td>Map-pan storms generate 50 K QPS of geographically-clusterable reads; caching at coarse H3 cell for 5s collapses 90%+ of traffic into edge hits.</td><td>Origin-only → would 10× backend cost; client-only cache → no benefit on cross-user pans.</td></tr>
+    <tr><td>Redis (planner cache)</td><td>Per-(origin-cell, time-bucket) trip-plan cache for 30s absorbs the bursty user behavior of comparing modes 3–5 times before reserving; sub-ms read keeps the planner under 250 ms.</td><td>Memcached → no TTL-on-element granularity; in-process cache → no cross-pod hit.</td></tr>
+    <tr><td>Spark (rebalance jobs)</td><td>Nightly low-battery cluster prediction joins 25 GB/day telemetry with charging operations data; batch is fine here because rebalance ops act on hourly cadence.</td><td>Flink batch → less mature for ML pipelines; Trino → no Python ML libs.</td></tr>
+  </tbody>
+</table>
+

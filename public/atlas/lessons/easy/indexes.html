@@ -1,0 +1,63 @@
+<h1>Indexes: B-tree, hash, inverted, secondary</h1>
+<div class="meta-row">
+  <span class="tag diff-Easy">Easy</span>
+  <span class="tag">indexes</span>
+  <span class="tag">storage</span>
+  <span class="tag">databases</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>An index is a side data structure that maps a value (a name, an ID, a word) to where the matching rows live. Without one, the database has to scan every row; with one, it goes straight to the answer. Different access patterns demand different index shapes — range scans want B-trees, exact lookups love hash maps, full-text search needs inverted lists, and "the same row by a non-primary column" is what secondary indexes are for.</p>
+
+<h2>Why it matters</h2>
+<p>Most "the database is slow" problems are really "the index is missing or wrong." Choosing the right index turns a 10-second sequential scan into a 1-millisecond seek; choosing too many indexes turns every write into a maintenance tax. Knowing the four common shapes lets you reason about query plans, sharding keys, and storage cost without ever opening a profiler.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>B-tree:</b> Postgres, MySQL InnoDB, SQL Server — the default index in every relational database.</li>
+  <li><b>Hash:</b> Redis hash sets, Postgres HASH index, in-memory caches, partitioning hash for sharding.</li>
+  <li><b>Inverted:</b> Elasticsearch, Lucene, Solr — every search bar you've ever typed into.</li>
+  <li><b>Secondary:</b> DynamoDB GSI/LSI, Cassandra materialized views, MongoDB compound indexes.</li>
+</ul>
+
+<h2>The four shapes at a glance</h2>
+<div class="ascii-diagram">  B-TREE                HASH               INVERTED            SECONDARY
+  ------                ----               --------            ---------
+       [50]            h(k) -&gt; bucket     "fast" -&gt; [3,7,9]   email-&gt;rowID
+      /    \           "alice"-&gt; #4       "boat" -&gt; [2,9]     name -&gt;rowID
+   [25]    [75]        "bob"  -&gt; #11      "cat"  -&gt; [1,8]     points to
+   /  \    /  \                                               primary key
+ [10][30][60][90]
+  range scans OK       exact lookup       text / multi-term   alt access path
+  O(log n)             O(1)               token postings      same row, new key
+</div>
+<p>A B-tree keeps keys sorted in a shallow tree, so range queries (<code>WHERE date BETWEEN ...</code>) and ORDER BY are cheap. A hash index hashes the key into a bucket — O(1) for equality, useless for ranges. An inverted index lists, for each term, every document that contains it; intersect a few lists and you have search. A secondary index is just any of the above built on a non-primary column, pointing back at the primary row.</p>
+
+<h2>Cost: every index taxes writes</h2>
+<p>Every <code>INSERT</code>, <code>UPDATE</code>, or <code>DELETE</code> must update <em>every</em> index on the table. Five indexes means roughly six writes per row change. So the rule is: index what you query often, not what you might query someday. In NoSQL especially, secondary indexes are async and eventually consistent — your "read by email" can lag behind "read by user_id".</p>
+
+<h2>Composite indexes &amp; the leftmost-prefix rule</h2>
+<p>An index on <code>(country, city, age)</code> can serve queries on <code>country</code>, <code>(country, city)</code>, or <code>(country, city, age)</code> — but <em>not</em> a query on <code>city</code> alone. The columns are concatenated left-to-right in the tree. Order them most-selective-first, and put equality columns before range columns.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Indexing every column "just in case" — write amplification eats throughput.</li>
+  <li>Using a hash index when you need range scans (now <code>WHERE age &gt; 30</code> falls back to a full scan).</li>
+  <li>Forgetting that <code>LIKE '%foo'</code> can't use a B-tree — use trigram or inverted indexes for substring search.</li>
+  <li>Trusting that DynamoDB GSIs are immediately consistent — they're not.</li>
+  <li>Over-relying on covering indexes; they save reads but bloat write paths.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Your orders table is queried three ways: by <code>order_id</code> (exact), by <code>(customer_id, created_at DESC)</code> (timeline), and by free-text on <code>description</code>. Which indexes would you build, and which would you <em>not</em>?
+  <br/>
+  <b>Hint:</b> Pick a different shape per pattern. Think about what's "hot" enough to be worth the write tax.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-search-engine">Design a search engine</a> — inverted index at scale.</li>
+  <li><a href="#problem/design-dynamodb">Design DynamoDB</a> — GSIs, LSIs, and the cost of secondary access patterns.</li>
+  <li><a href="#problem/design-newsfeed">Design a news feed</a> — composite indexes for timeline queries.</li>
+</ul>

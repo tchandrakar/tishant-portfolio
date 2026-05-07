@@ -1,0 +1,146 @@
+<h1>Design Telegram (cloud-stored chats + channels at hundreds of M)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design Telegram: cloud-first messenger where regular chats and groups are server-stored (not E2E by default), supplemented by E2E "secret chats". Channels broadcast to up to 200k+ subscribers; supergroups support 200k members. Telegram serves ~900M MAU with ~70B messages/day. Unlike WhatsApp, the server holds the user's entire history and any device can sync the full archive.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>1:1 cloud chats, supergroups (200k members), channels (unlimited subs).</li>
+  <li>Messages: text, media, polls, stickers, voice/video notes; edits within 48h; pinning.</li>
+  <li>Server-side full history sync to any logged-in device.</li>
+  <li>Optional E2E "secret chats" tied to one device-pair only.</li>
+  <li>Bots, inline queries, channel admins, scheduled messages.</li>
+  <li>Search across the user's entire cloud history.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 send-to-deliver under 300 ms in-region.</li>
+  <li><b>Scale:</b> 900M MAU, ~70B msgs/day, peak 1M msgs/sec.</li>
+  <li><b>Durability:</b> permanent server-side history; no message loss.</li>
+  <li><b>Availability:</b> 99.99% chat plane.</li>
+  <li><b>Geo:</b> users pinned to a "home DC" near them; resilient to regional failures.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 70B/day / 86400 ≈ 810k/sec avg, peak 2.5M/sec.</li>
+  <li>Concurrent sockets: 900M MAU * 30% ≈ 270M; 1M sockets/box ⇒ 300 edges.</li>
+  <li>Storage: 70B msgs * 1KB = 70 TB/day raw; with media ~500 TB/day. ~180 PB/year hot + cold.</li>
+  <li>Channel fan-out: a 10M-sub channel posting once = 10M deliveries; mitigated via pull model.</li>
+  <li>Bandwidth: 1KB * 2.5M/sec = 20 Gbps for text; media dominates at hundreds of Gbps.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// MTProto (custom binary, TCP/UDP/HTTP transports)
+auth.sendCode {phone}                          → phoneCodeHash
+messages.sendMessage {peer, message, randomId} → updates
+messages.getHistory  {peer, offsetId, limit}   → messages[]
+updates.getDifference {pts, date, qts}         → diff
+channels.createChannel {title, broadcast}      → channelId
+messages.search       {peer, q, filter}        → results
+
+// Push channel via long-poll or persistent socket:
+updateNewMessage / updateDeleteMessages / updateChannelTooLong</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──MTProto──[Frontend (CDN edge)]──[DC Router]
+                                              │
+                          ┌───────────────────┴──────────────┐
+                          ▼                                  ▼
+                    [Home DC: User]                   [Home DC: Channel]
+                     │   │   │                          │      │
+                  [Auth][Msg][File]                 [Channel][Index]
+                          │                                  │
+                       [PostgreSQL/Custom KV]           [Inverted index]
+</div>
+<p>Walk-through: every user is assigned a home DC (DC2 Amsterdam, DC4 Miami, etc.) at signup. Reads/writes for that user route to that DC. Each chat lives in the DC of one of its participants; cross-DC chats use replication. Channels (broadcast) live in their own DC sharded by channel id. Clients see one logical service via the front-end edge, which proxies to the right DC.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Messages (custom storage / sharded Postgres)</h3>
+<pre>CREATE TABLE messages (
+  dialog_id   BIGINT,        -- (user, peer) or channel id
+  message_id  BIGINT,         -- monotonic per dialog
+  author_id   BIGINT,
+  body        BYTEA,
+  ts          TIMESTAMPTZ,
+  edit_ts     TIMESTAMPTZ NULL,
+  PRIMARY KEY (dialog_id, message_id)
+);</pre>
+<h3>7.2 Why custom?</h3>
+<p>Telegram famously runs a hand-rolled storage layer in C++ on top of Linux raw block devices, with PostgreSQL for some metadata. The shape — append-mostly per dialog, range-scan for history — fits an LSM-style log per dialog. Per-dialog message ids are monotonically increasing integers, doubling as cursors and pagination tokens.</p>
+<h3>7.3 Update sequence (pts/qts)</h3>
+<p>Every user has a personal update counter (<code>pts</code>); every channel has its own (<code>qts</code> in the user's view, channel <code>pts</code> in storage). Clients store the last seen value; on reconnect they call <code>getDifference</code> to fetch missed updates incrementally.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Home DC routing</h3>
+<p>On login, server returns a redirect to the user's home DC. All subsequent reads/writes for that user pin to it. Cross-DC messaging: when A (DC2) messages B (DC4), A's DC writes to A's outbox, replicates to B's DC inbox; B reads from DC4. Each side has a self-consistent view, with eventual cross-DC convergence.</p>
+<h3>8.2 Channels (broadcast)</h3>
+<p>Channels use a pull model: the channel writes once to its own append log; subscribers fetch via <code>getDifference</code> using their last <code>pts</code>. This makes a 10M-sub channel post O(1) on write, O(N) on read but spread across reconnects. Live "new post" notifications come via small fan-out updates that just say "channel X advanced to pts Y" — fat content stays in the log.</p>
+<h3>8.3 Supergroups (200k members)</h3>
+<p>Hybrid: write to a single per-group log, fan out lightweight notifications, members pull bodies on demand. Mentions and replies are surfaced via per-user mention index so a member doesn't miss them in a huge group.</p>
+<h3>8.4 Secret chats (E2E)</h3>
+<p>Per-device-pair MTProto E2E using DH key exchange and AES-256-IGE. No server-side history; messages drop after delivery. Tied to the originating device — secret chat does not sync across devices, by design.</p>
+<h3>8.5 Search</h3>
+<p>Per-user inverted index in the user's home DC indexes all cloud chats and channels they're in. Channel-side index for public channels. Sharded by user_id for personal index, by channel_id for channel index.</p>
+<h3>8.6 Media</h3>
+<p>Files chunked at 512 KB, deduplicated by content hash, stored in a custom file store with CDN edges. Reuse across forwards is free — forwarding a 1 GB video copies a reference, not bytes.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Cross-DC latency:</b> A messaging B in another continent needs replication; mitigate with regional pairs and async replication, surface "delivered" only after target DC ACK.</li>
+  <li><b>Mega-channel posts:</b> a viral channel with 50M subs; pull model keeps write cost O(1), but reconnect storms can hammer indexes — rate-limit getDifference per user.</li>
+  <li><b>Hot dialog partitions:</b> a celebrity DM gets 100k messages from fans; per-dialog log must shard by message_id range.</li>
+  <li><b>Edit/delete amplification:</b> editing an old message requires updating index docs; bounded by 48h edit window.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Cloud chats not E2E by default</td><td>Multi-device sync, search</td><td>Server compromise = read history</td></tr>
+<tr><td>Pull-based channels</td><td>O(1) write, scales to 50M subs</td><td>Real-time push only via metadata</td></tr>
+<tr><td>Custom MTProto + storage</td><td>Tight, efficient, controlled</td><td>Crypto under non-standard scrutiny</td></tr>
+<tr><td>Home-DC routing</td><td>Simple consistency model</td><td>Cross-DC chats add latency</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — async multi-leader replication across DCs.</li>
+  <li>Ch. 6 Partitioning — partition by user_id and channel_id; hot-partition handling.</li>
+  <li>Ch. 9 Consistency — pts/qts as a per-tenant logical clock for resume.</li>
+  <li>Ch. 11 Stream processing — channel update streams as the unit of fan-out.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Pull-model channels are the key insight: you can't push to 50M subs in real time, so you push the metadata and let clients pull the body."</li>
+  <li>"Home-DC routing is the simplest correct multi-region model — it trades cross-region latency for a strongly consistent local view."</li>
+  <li>"Cloud chats vs secret chats is a deliberate UX/security trade — the platform is honest about it instead of pretending E2E everywhere."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>MTProto (custom binary protocol)</td><td>Multi-transport (TCP/UDP/HTTP) lets clients survive aggressive censorship and broken middleboxes that vanilla TLS/HTTPS can't. Compact framing keeps text bandwidth at 20 Gbps for 2.5M peak msgs/sec; built-in pts/qts sequence numbers enable resumable sync.</td><td>XMPP (verbose, no censorship-resistant transports), Matrix (HTTP-only at the time), gRPC (no UDP / obfuscated transport)</td></tr>
+    <tr><td>Custom C++ storage on raw block devices</td><td>An LSM-style append-only log per dialog matches the access pattern (append, range-scan history) better than any general-purpose DB at 70 TB/day raw + 500 TB/day with media. Hand-tuned for sequential writes hits the 300 ms p99 with predictable latency.</td><td>Cassandra (extra abstraction layers), RocksDB (close, but Telegram needed deeper control over compaction), Postgres (poor at this write rate)</td></tr>
+    <tr><td>PostgreSQL (metadata)</td><td>Account info, channel admin lists, and other low-volume relational data benefit from ACID and joins; volume is far below the 70B/day message firehose so a SQL DB is the right tool. Schema flexibility for evolving feature flags.</td><td>MySQL (similar fit; Postgres chosen for type system), Cassandra (overkill, no joins), DynamoDB (vendor lock-in)</td></tr>
+    <tr><td>Home-DC routing</td><td>Pinning each user to one of DC2 (Amsterdam), DC4 (Miami), etc., gives a strongly consistent per-user view without distributed transactions across continents — keeps the 300 ms p99 in-region NFR honest. The 270M concurrent sockets land near their data.</td><td>Globally replicated primary (cross-ocean RTT blows latency), Spanner-style consensus (cost), client-side DC selection (auth complexity)</td></tr>
+    <tr><td>Per-dialog monotonic message_id</td><td>A simple BIGINT per (dialog) doubles as primary key, sort key, and pagination cursor — no UUIDs needed. The pts/qts logical clock built on top supports resumable getDifference, the foundation of multi-device sync to "any logged-in device."</td><td>Snowflake IDs (unnecessary global ordering), UUID (random writes hurt LSM), wall-clock timestamps (clock skew across DCs)</td></tr>
+    <tr><td>Pull-model broadcast channels</td><td>A 50M-subscriber channel post is O(1) on write and O(N) spread across reconnects — pushing 50M deliveries in real time is impossible at this fleet size. Lightweight "channel X advanced to pts Y" updates fan out via small notifications; clients fetch bodies on demand.</td><td>Push to all subscribers (bandwidth blowup), Kafka per-channel topic (too many topics), per-subscriber inbox (storage explosion)</td></tr>
+    <tr><td>Inverted index (per-user / per-channel search)</td><td>Search across the user's entire cloud history is a stated FR, and only an inverted index hits the latency expected from in-app search. Sharded by user_id for personal index, channel_id for public channels, matching the home-DC topology.</td><td>SQL LIKE / trigram (won't scale to 180 PB), Elasticsearch (Telegram preferred custom for tighter ops), per-message scan (impossible)</td></tr>
+    <tr><td>Content-hash deduplicated file store + CDN</td><td>Forwarding a 1 GB video at zero bytes cost is a core UX feature — only content-addressable storage gives O(1) forward. CDN edges absorb the hundreds of Gbps media bandwidth so the chat plane stays small.</td><td>Per-message blob copies (storage explosion at 500 TB/day), S3 without dedup (cost), client-side resharing (loses preview)</td></tr>
+    <tr><td>MTProto E2E (secret chats)</td><td>For "secret chat" FR, a per-device-pair DH session with AES-256-IGE encrypts content end-to-end and ties the chat to the originating device by design — explicitly no multi-device sync. Server stores no plaintext, drops messages after delivery.</td><td>Signal protocol (Telegram chose its own historically), OTR (no async first message), PGP (manual key management)</td></tr>
+    <tr><td>WebSocket / long-poll push channel</td><td>updateNewMessage events need sub-second push to currently-connected clients; a persistent socket is cheaper than HTTP polling at 270M concurrent. Long-poll fallback covers networks that block WS.</td><td>HTTP polling only (battery + latency), Server-Sent Events (one-way), MTProto-only TCP frames (works; WS adds browser reach)</td></tr>
+    <tr><td>per-user mention index</td><td>In a 200k-member supergroup using pull-model bodies, a member would miss any mention if they only fetched on reconnect. A separate mention index, written on send, surfaces "you were @-tagged here" without scanning the group log.</td><td>Client-side scan (impossible at 200k members), full-text search (slow path), no-mention-tracking (breaks UX)</td></tr>
+    <tr><td>Range-sharded per-dialog log</td><td>A celebrity DM with 100k fan messages would create one fat partition; sharding the per-dialog log by message_id range keeps each partition bounded and writes parallel — needed to sustain 1M peak msgs/sec without hot keys.</td><td>Single log per dialog (hot key), hash sharding (kills range scans for history), per-day buckets (similar idea, less granular)</td></tr>
+    <tr><td>CDN frontend / edge proxy</td><td>Clients see "one Telegram" via the edge, which proxies into the right home DC; this lets users move regions without IP-level reconfig and absorbs DDoS at the edge — required for a 99.99% chat-plane SLO under hostile network conditions.</td><td>Direct DC connections (clients leak DC choice), single-region anycast (no DC affinity), pure DNS routing (TTL too coarse)</td></tr>
+  </tbody>
+</table>

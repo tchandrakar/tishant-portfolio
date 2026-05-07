@@ -1,0 +1,205 @@
+<h1>Design Replication: leader-based vs leaderless vs multi-leader</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Replicate state across multiple nodes for durability, availability, and read scaling. The interview wants you to navigate the three families catalogued in DDIA Ch. 5 — <i>single-leader</i> (Postgres, MySQL, MongoDB), <i>multi-leader</i> (Active/Active across regions, BDR, CouchDB), and <i>leaderless</i> (Dynamo/Cassandra/Riak) — and explain when each is correct, what consistency anomalies they expose, how failover works, and how lag manifests to applications.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Tolerate single-node failures with no data loss (RPO=0 ideal, configurable).</li>
+  <li>Reads from any replica with explicit consistency knobs.</li>
+  <li>Online membership change (add/remove replicas).</li>
+  <li>Backfill new replicas without downtime.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Durability:</b> survive loss of any 1 node (3-node cluster) or any 2 (5-node).</li>
+  <li><b>RPO/RTO:</b> sync mode RPO=0; async mode RPO usually &lt; 1 s; failover RTO &lt; 30 s.</li>
+  <li><b>Read latency:</b> closest replica; cross-region &lt; 100 ms.</li>
+  <li><b>Replication lag:</b> p95 &lt; 100 ms intra-DC, &lt; 1 s cross-region.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>1 TB primary -&gt; 1 TB per follower; 3 replicas = 3 TB total.</li>
+  <li>Write fan-out N = number of followers; sync writes wait for max(follower latency).</li>
+  <li>WAL ship rate = primary write rate; size network for 2x peak.</li>
+  <li>Backfill 1 TB at 100 MB/s = ~3 hours.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Client knobs
+write(k, v, {durability: ack|sync|quorum})
+read(k,  {consistency: any|leader|read-your-writes|monotonic|linearizable})
+// Admin
+addReplica(node)        joinReplica(node, snapshotLsn)
+promote(node)           demote(node)
+status() -> {leader, lag[], lsn[]}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">  -------- Single-leader (Postgres / MySQL / MongoDB primary) --------
+           writes
+             |
+   client -> Leader  --(WAL ship)--&gt; Follower1
+             |       --(WAL ship)--&gt; Follower2 (sync)
+             |       --(WAL ship)--&gt; Follower3 (async)
+   reads&lt;----+----------------------- any replica
+
+  -------- Multi-leader (geo Active/Active) --------
+   USR  &lt;-&gt; LeaderA(EU)  &lt;== async repl ==&gt;  LeaderB(US) &lt;-&gt; USR
+                                conflict resolution: LWW / CRDT / app
+
+  -------- Leaderless (Dynamo / Cassandra) --------
+                       client
+                         |
+              coordinator (any node)
+                /        |        \
+           N1 (R)      N2 (R)      N3 (R)
+                W=2, R=2, N=3  -&gt; W+R&gt;N quorum
+                read-repair + hinted handoff + Merkle anti-entropy</div>
+<p>Walk-through: in single-leader, the leader is the sole serializer of writes; followers are passive WAL appliers. In multi-leader, both sides accept writes and replicate asynchronously, so concurrent writes to the same key require conflict resolution. In leaderless, every node can accept reads/writes and consistency emerges from <i>quorums</i> (W+R&gt;N) plus background repair.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Replication log formats</h3>
+<ul>
+  <li><b>Statement-based:</b> ship SQL — broken by NOW(), nondeterministic functions, triggers (DDIA Ch. 5).</li>
+  <li><b>WAL shipping (physical):</b> bytes-of-page-changes; tightly couples versions and engines (Postgres streaming).</li>
+  <li><b>Logical (row-based):</b> per-row before/after images (MySQL ROW binlog, Postgres pgoutput); decouples versions, enables CDC and selective replication.</li>
+  <li><b>Trigger-based:</b> application-managed, slow but flexible.</li>
+</ul>
+<h3>7.2 Conflict resolution metadata</h3>
+<p>Multi-leader and leaderless need extra metadata: vector clocks or version vectors per key, Lamport timestamps for LWW, or CRDT state. Cassandra uses (timestamp, value) per cell with last-write-wins; Riak uses dotted version vectors.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Single-leader replication</h3>
+<p>Followers connect, request "from this LSN," and stream WAL. Three durability modes: <i>async</i> (fastest, possible loss on leader crash), <i>semi-sync</i> (one follower must ack — bounded RPO), <i>sync</i> (all followers ack — slowest, strongest). Failover requires fencing (STONITH) plus a consensus-driven leader election to avoid split-brain. DDIA Ch. 5 "Handling Node Outages" details the failure modes: lost writes, broken auto-increment, ghost writes from the old leader.</p>
+<h3>8.2 Replication lag &amp; consistency reads</h3>
+<ul>
+  <li><b>Read-your-writes:</b> route reads after a write to the leader (or to a replica caught up past the write's LSN).</li>
+  <li><b>Monotonic reads:</b> sticky session pinned to one replica.</li>
+  <li><b>Consistent prefix:</b> required when reads span partitions; provided by causal ordering.</li>
+</ul>
+<h3>8.3 Multi-leader replication</h3>
+<p>Each leader has the full data set. Writes propagate asynchronously; concurrent edits to the same key produce conflicts detected by version vectors. Resolution choices: LWW (lossy), application merge function (CouchDB/PouchDB), CRDT semantics. Topology choices: all-to-all, circular, star — circular has high latency and SPOFs; all-to-all needs loop detection (origin-stripping). Use cases: multi-DC HA, offline-first clients, geo-write-locality.</p>
+<h3>8.4 Leaderless replication</h3>
+<p>Coordinator forwards write to N replicas; ack from W. Read from R replicas; reconcile via timestamps, returning newest. <code>W+R &gt; N</code> guarantees overlap so a read sees at least one node with the latest write — but only if the same N nodes are reachable; sloppy quorums (Dynamo) accept writes on temporary nodes via hinted handoff and forfeit this property. Anti-entropy via Merkle trees compares replicas in O(log n).</p>
+<h3>8.5 Failover &amp; fencing</h3>
+<p>Detect leader failure via gossip/lease. Elect a new leader (raft-style or via an external coordinator like ZooKeeper/etcd). Fence the old leader with epoch numbers checked at every storage write so a zombie leader cannot mutate state. Reset replicas that diverged via point-in-time recovery from a base backup + WAL.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Write fan-out:</b> sync writes scale poorly past 5 followers; chain replication amortizes.</li>
+  <li><b>Lag spikes under load:</b> long transactions on the leader cause replicas to fall behind during apply. Mitigation: parallel apply (MySQL MTS, Postgres logical workers).</li>
+  <li><b>Cross-region cost:</b> 50-150 ms RTT eats sync budgets; switch to semi-sync within region + async cross-region.</li>
+  <li><b>Hot keys in leaderless:</b> a single hot key bottlenecks one replica set; precompute or shard the key.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Topology</th><th>Strengths</th><th>Weaknesses</th></tr></thead>
+<tbody>
+<tr><td>Single-leader sync</td><td>Linearizable; simple model</td><td>Write latency = slowest follower; SPOF on leader</td></tr>
+<tr><td>Single-leader async</td><td>Low write latency</td><td>RPO &gt; 0; lag anomalies</td></tr>
+<tr><td>Multi-leader</td><td>Geo write-locality; offline ops</td><td>Conflict resolution; weakened consistency</td></tr>
+<tr><td>Leaderless (W+R&gt;N)</td><td>No SPOF; flexible; partition-tolerant</td><td>No transactional guarantees; sloppy quorum loopholes</td></tr>
+<tr><td>Chain replication</td><td>Strong consistency, simple</td><td>Tail latency = chain length; reconfiguration tricky</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 "Leaders and Followers" — sync/async/semi-sync, failover gotchas.</li>
+  <li>Ch. 5 "Problems with Replication Lag" — read-your-writes, monotonic reads, consistent prefix.</li>
+  <li>Ch. 5 "Multi-Leader Replication" — topologies and conflict resolution.</li>
+  <li>Ch. 5 "Leaderless Replication" — quorums, sloppy quorums, hinted handoff, Merkle anti-entropy.</li>
+  <li>Ch. 9 "Linearizability" — why it costs a round trip and which topologies offer it.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd default to single-leader sync within a region and async cross-region; that gives RPO=0 locally and bounded lag globally."</li>
+  <li>"For mobile/offline I'd reach for multi-leader with CRDTs because LWW silently drops user edits — the sweet spot is per-field merge."</li>
+  <li>"Leaderless looks symmetric but has subtle failure modes (sloppy quorums, concurrent writes); I'd only choose it when the workload is large, write-heavy, and tolerant of eventual consistency."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Single-leader replication (default within a region)</td>
+      <td>One serializer eliminates concurrent-write conflicts entirely — DDIA Ch. 5's simplest-correct option. With sync replication to one same-DC follower, RPO=0 and the model stays linearizable per partition without consensus on every write.</td>
+      <td>Multi-leader (conflicts on every concurrent edit, requires resolution policy); leaderless (no transactional semantics, sloppy quorum loopholes).</td>
+    </tr>
+    <tr>
+      <td>Logical (row-based) replication log — pgoutput / MySQL ROW binlog</td>
+      <td>Decouples primary and replica versions (different majors can replicate), enables selective table replication, and doubles as a CDC bus per DDIA Ch. 11. Carries before/after row images so it's deterministic regardless of nondeterministic SQL functions.</td>
+      <td>Statement-based (broken by NOW(), triggers, nondeterminism — DDIA Ch. 5); physical WAL shipping (tightly couples engine versions, no per-table filtering); trigger-based (slow, app-managed).</td>
+    </tr>
+    <tr>
+      <td>Semi-synchronous replication (one follower must ack)</td>
+      <td>Bounded RPO without paying for sync to all followers. The sweet spot DDIA flags: tail latency tracks one closest follower, not the slowest, while still surviving leader crash without data loss.</td>
+      <td>Async (RPO &gt; 0 — possible lost writes on failover); sync-all (latency = max follower; one slow replica halts the cluster).</td>
+    </tr>
+    <tr>
+      <td>Async cross-region replication (RPO &lt; 1 s)</td>
+      <td>50-150 ms RTT eats any sync latency budget; async lets writes commit at intra-DC speed while shipping bytes across regions in the background. Bounded lag is acceptable when alternative is a 100 ms+ commit latency floor on every transaction.</td>
+      <td>Sync cross-region (every commit pays inter-region RTT — kills throughput); leaderless multi-region (operational nightmare per DDIA Ch. 5).</td>
+    </tr>
+    <tr>
+      <td>External coordinator for leader election (etcd / ZooKeeper / Raft sidecar)</td>
+      <td>Failover requires consensus on who the new leader is — otherwise split-brain corrupts state. DDIA Ch. 8 hammers this point: fencing tokens from the coordinator must be checked at every storage write to neutralize a zombie old-leader.</td>
+      <td>Manual failover (RTO measured in minutes, error-prone); gossip-only election (no global ordering — split-brain risk); built-in election without fencing (zombie leader corrupts data).</td>
+    </tr>
+    <tr>
+      <td>Fencing tokens (epoch numbers) checked at storage writes</td>
+      <td>The DDIA Ch. 8 prescription: every leader-issued write carries a monotonic epoch; the storage layer rejects writes from a smaller epoch, so a partitioned old leader cannot mutate state even if it doesn't know it lost leadership.</td>
+      <td>Lease-based timeout only (clock skew defeats it); STONITH alone (works for hardware but slow, doesn't help with network partitions).</td>
+    </tr>
+    <tr>
+      <td>Read-your-writes via LSN routing</td>
+      <td>After a write returns LSN L, route subsequent reads from that session either to the leader or to a replica whose applied-LSN ≥ L. Solves the most user-visible replication-lag anomaly DDIA Ch. 5 catalogues without forcing every read to the leader.</td>
+      <td>Sticky-to-leader for N seconds (over-routes; doesn't help across sessions); ignore (users see their own writes disappear — visible bug).</td>
+    </tr>
+    <tr>
+      <td>Monotonic-reads via session pinning</td>
+      <td>Pin a user session to one replica so reads never go backward in time. Cheap, requires no consistency machinery, and addresses the second DDIA-listed lag anomaly (jumping between replicas at different LSNs).</td>
+      <td>Quorum reads (overkill, costs latency); ignore (users see "newer then older" data — undermines trust).</td>
+    </tr>
+    <tr>
+      <td>Parallel apply on replicas (MySQL MTS / Postgres logical workers)</td>
+      <td>A single-threaded apply lags during write spikes; parallel apply by row-key hash or commit timestamp keeps p95 lag &lt; 100 ms. Critical for read-replica freshness DDIA flags as a failure mode of long primary transactions.</td>
+      <td>Single-threaded apply (lag spikes under load); parallel by transaction (loses ordering across rows — breaks consistency).</td>
+    </tr>
+    <tr>
+      <td>Vector clocks / version vectors (multi-leader, leaderless)</td>
+      <td>Detect concurrent edits to the same key without a global clock — a happens-before partial order. Riak's dotted version vectors fix the false-concurrency bug of plain VVs. Required because LWW with wall-clock silently drops one user's edits per DDIA Ch. 5.</td>
+      <td>Last-Write-Wins on wall clock (data loss on clock skew or true concurrency); single Lamport timestamp (no concurrency detection).</td>
+    </tr>
+    <tr>
+      <td>CRDTs for multi-leader application data</td>
+      <td>Per-field merge with mathematical convergence guarantees, no resolution UI required. The right choice for offline-first mobile and collaborative editing where LWW would silently destroy concurrent edits to different fields of the same document.</td>
+      <td>LWW (lossy); operational transform (only practical for sequential text — Google Docs); app-defined merge (every change creates a new bug).</td>
+    </tr>
+    <tr>
+      <td>Quorum reads and writes (W+R &gt; N) for leaderless</td>
+      <td>The Dynamo formula: as long as the same N nodes are reachable, W+R &gt; N guarantees a read sees at least one node with the latest write. The compositional consistency knob DDIA Ch. 5 introduces — tune R and W per call to trade latency vs staleness.</td>
+      <td>R=1, W=N (writes block; one slow node stalls all writes); R=N, W=1 (reads block similarly); arbitrary R+W (no overlap guarantee).</td>
+    </tr>
+    <tr>
+      <td>Hinted handoff + Merkle-tree anti-entropy</td>
+      <td>Hinted handoff captures writes to temporarily down nodes so they can be replayed (sloppy quorum); Merkle trees diff replicas in O(log n) so divergent ranges are repaired without scanning the whole keyspace. Both are Cassandra/Dynamo essentials called out by DDIA Ch. 5.</td>
+      <td>Read-repair only (slow keys never reconciled); full keyspace scan (O(N) per repair — infeasible at TB scale); manual repair (operational burden).</td>
+    </tr>
+    <tr>
+      <td>Streaming base backup + WAL catchup for replica bootstrap</td>
+      <td>Adding a new replica requires a consistent base snapshot plus the WAL since that snapshot — Postgres's pg_basebackup model. Backfilling 1 TB takes hours; doing it without blocking the leader requires snapshot isolation on the source.</td>
+      <td>Stop-the-world dump (downtime — unacceptable); copy individual files (no consistency point); logical dump+restore (10x slower for large data).</td>
+    </tr>
+  </tbody>
+</table>

@@ -18,16 +18,20 @@ import Contact from './components/Contact';
 import Resume from './components/Resume';
 import PortfolioChooser from './components/PortfolioChooser';
 import ClassicPortfolio from './components/classic/ClassicPortfolio';
+import AtlasApp from './components/atlas/AtlasApp';
 
-type PortfolioMode = 'chooser' | 'kali' | 'classic';
+type PortfolioMode = 'chooser' | 'kali' | 'classic' | 'atlas';
+
+function detectMode(): PortfolioMode {
+  const hash = window.location.hash.replace('#', '');
+  if (hash === 'kali') return 'kali';
+  if (hash === 'classic') return 'classic';
+  if (hash === 'atlas' || hash.startsWith('atlas/')) return 'atlas';
+  return 'chooser';
+}
 
 export default function App() {
-  const [mode, setMode] = useState<PortfolioMode>(() => {
-    const hash = window.location.hash.replace('#', '');
-    if (hash === 'kali') return 'kali';
-    if (hash === 'classic') return 'classic';
-    return 'chooser';
-  });
+  const [mode, setMode] = useState<PortfolioMode>(() => detectMode());
   const [screen, setScreen] = useState<AppScreen>('boot');
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
@@ -41,28 +45,26 @@ export default function App() {
     updatePosition,
   } = useWindowManager();
 
-  // Sync hash with mode
+  // Sync hash with mode (preserve sub-route for atlas like #atlas/problem/x)
   useEffect(() => {
     if (mode === 'chooser') {
-      window.location.hash = '';
+      if (window.location.hash) window.location.hash = '';
+    } else if (mode === 'atlas') {
+      // Don't clobber sub-routes like #atlas/problem/foo — only set if not already on a atlas route
+      if (!window.location.hash.startsWith('#atlas')) window.location.hash = 'atlas';
     } else {
-      window.location.hash = mode;
+      if (window.location.hash !== `#${mode}`) window.location.hash = mode;
     }
   }, [mode]);
 
   // Listen for hash changes
   useEffect(() => {
-    const handleHash = () => {
-      const hash = window.location.hash.replace('#', '');
-      if (hash === 'kali') setMode('kali');
-      else if (hash === 'classic') setMode('classic');
-      else setMode('chooser');
-    };
+    const handleHash = () => setMode(detectMode());
     window.addEventListener('hashchange', handleHash);
     return () => window.removeEventListener('hashchange', handleHash);
   }, []);
 
-  const handleChoose = useCallback((chosen: 'kali' | 'classic') => {
+  const handleChoose = useCallback((chosen: 'kali' | 'classic' | 'atlas') => {
     setMode(chosen);
     if (chosen === 'kali') setScreen('boot');
   }, []);
@@ -100,6 +102,8 @@ export default function App() {
         return <Contact />;
       case 'resume':
         return <Resume />;
+      case 'atlas':
+        return <AtlasApp />;
       default:
         return <div className="p-4 text-kali-muted">Application not found</div>;
     }
@@ -118,7 +122,16 @@ export default function App() {
   if (mode === 'classic') {
     return (
       <div className="classic-mode page-transition" key="classic">
-        <ClassicPortfolio onSwitchPortfolio={() => setMode('chooser')} />
+        <ClassicPortfolio onSwitchPortfolio={() => setMode('chooser')} onOpenAtlas={() => setMode('atlas')} />
+      </div>
+    );
+  }
+
+  // --- Atlas (fullscreen) ---
+  if (mode === 'atlas') {
+    return (
+      <div className="page-transition" key="atlas" style={{ width: '100vw', height: '100vh' }}>
+        <AtlasApp syncHash />
       </div>
     );
   }

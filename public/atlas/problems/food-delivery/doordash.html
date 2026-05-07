@@ -1,0 +1,136 @@
+<h1>Design DoorDash (3-sided marketplace at US scale)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">food-delivery</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">maps-location</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build DoorDash: a 3-sided marketplace serving consumers, merchants (restaurants, grocers, convenience), and Dashers (independent contractors) across the US, Canada, Australia, and Japan. The platform must accept orders, hand them to merchants, dispatch a Dasher with strong batching/efficiency, and track delivery in real-time. Peak load is Super Bowl Sunday at ~10 M orders/day with a 90-minute window taking the bulk. Subscriptions (DashPass) and ad inventory add monetisation surfaces.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Consumer: browse merchants, place orders, schedule, tip, track, rate.</li>
+  <li>Merchant: receive orders via tablet/POS, manage menu, mark item ready, throttle inflow.</li>
+  <li>Dasher: go online, accept offers, multi-pickup batches, complete drop, get paid.</li>
+  <li>Marketplace: surge pricing, promised ETAs, refund flows, ad placements, DashPass benefits.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> feed p99 &lt; 300 ms; offer-to-Dasher push &lt; 1 s.</li>
+  <li><b>Scale:</b> peak 10 M orders/day, 600 K active Dashers, 1 M merchants, 30 M MAU.</li>
+  <li><b>Availability:</b> 99.99% order path; degrade ranking before degrading checkout.</li>
+  <li><b>Correctness:</b> exactly-once payment capture; idempotent retries.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 10 M/day → ~115 avg, ~1 K peak orders/s during Super Bowl halftime.</li>
+  <li>Browse:order ratio ~80:1 → 80 K peak browse QPS.</li>
+  <li>Storage: order ~3 KB → 30 GB/day; 7-yr retention ~80 TB hot + cold tier.</li>
+  <li>Dasher pings: 600 K × 1 Hz = 600 K events/s, ~120 MB/s into Kafka.</li>
+  <li>Search index (Elasticsearch): ~1 M merchants × 50 menu items ≈ 50 M docs.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v3/feed?lat=&amp;lng=&amp;tier=dashpass     → ranked merchants
+POST  /v3/checkout    {cartId, addrId, tipCents, payTok} → orderId, etaPromise
+GET   /v3/orders/{id}                       (long-poll/SSE)         → state
+POST  /v3/dasher/offer/{id}/accept                                  → assignmentId
+POST  /v3/dasher/location  {dasherId, lat, lng, accuracy, ts}      → ack
+POST  /v3/merchant/orders/{id}/ready                                → ok</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Mobile] → [Cloudflare] → [Envoy/API GW]
+   ├─→ [Feed Svc] ← [ES] ← [Catalog Svc] ← [CockroachDB]
+   ├─→ [Checkout Svc] → [Order Svc] → [Postgres-shards] → [Kafka order.events]
+   ├─→ [Pricing/Surge] ← [Feature Store (Feast)]
+   └─→ [Tracking Gateway (WS)]
+
+[Kafka] → [Deep Red Dispatcher] → [Assignment DB (Cassandra)]
+                  ↓                       ↑
+           [Routing/ETA] ← [OSRM + ML] ← [Telemetry Lake (S3 + Snowflake)]
+[Dasher app] → [Geo Ingest] → [Kafka dasher.pings] → [Redis Geo]
+</div>
+<p>The Order Service owns the state machine; everything else subscribes via Kafka. Dispatch ("Deep Red") consumes both order and Dasher streams to produce assignments.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Orders (Postgres, hash-sharded by order_id; Vitess-style)</h3>
+<pre>CREATE TABLE orders (
+  order_id   uuid PRIMARY KEY,
+  consumer_id uuid, store_id uuid, dasher_id uuid,
+  state      text, subtotal_cents int, tip_cents int,
+  promise_at timestamptz, created_at timestamptz
+);</pre>
+<h3>7.2 Assignments (Cassandra)</h3>
+<p>Wide partition by <code>region+hour</code> for write-heavy fan-in from dispatch; trailing scans for ops.</p>
+<h3>7.3 Why this mix?</h3>
+<p>Postgres for OLTP money; Cassandra for high-write trails (DDIA Ch. 5 leaderless); CockroachDB for catalog needing multi-region reads with strong consistency.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Deep Red dispatcher</h3>
+<p>Solves a Vehicle Routing Problem with Time Windows (VRPTW) per region every 2–5 s. Inputs: open offers, Dasher locations + capabilities (catering, alcohol), promise times. Builds candidate routes (single, batched 2-3 deliveries), scores by Dasher pay + customer ETA + efficiency. Uses LP relaxation + local search; falls back to greedy nearest-neighbor if SLA breached.</p>
+<h3>8.2 ETA / promise model</h3>
+<p>Promised ETA at checkout = restaurant prep p80 + drive time + buffer. Continuously re-estimated post-order. Model is a quantile gradient-boosted tree retrained nightly on 90-day pings.</p>
+<h3>8.3 Surge / pricing</h3>
+<p>Per-hex (Uber H3 res-8) supply-demand ratio; multiplier published every 60 s to feed and offer engine.</p>
+<h3>8.4 Tracking</h3>
+<p>WS gateway sharded by order_id; client receives differential updates ~every 3 s; bandwidth optimised with delta-encoded protobuf.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Super Bowl spike:</b> capacity-plan 3x; pre-scale Kafka, K8s nodes, ES replicas; brown-out non-essentials (recos).</li>
+  <li><b>Hot store (Chick-fil-A 12 PM):</b> per-store rate limiter; queue-and-stagger menu reads.</li>
+  <li><b>Hot region:</b> H3-cell sub-sharding for the dispatcher; multi-region active-active with Cockroach.</li>
+  <li><b>Hot order_id keys:</b> use UUIDv7 (timestamp-prefixed) for index locality; periodic VACUUM tuned per shard.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Batched VRP every 2–5s</td><td>Globally optimal, supports batching</td><td>Adds offer latency vs greedy</td></tr>
+<tr><td>Cockroach for catalog</td><td>Multi-region strong reads</td><td>Higher write latency, $$</td></tr>
+<tr><td>Promise ETA at checkout</td><td>Customer-friendly contract</td><td>Refund liability when wrong</td></tr>
+<tr><td>Independent-contractor model</td><td>Elastic supply</td><td>Can reject offers; need overhire and incentives</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — leaderless Cassandra for assignment trails.</li>
+  <li>Ch. 6 Partitioning — hash-sharded Postgres; H3-hex partitioning for dispatch.</li>
+  <li>Ch. 9 Consistency — linearizable order state machine inside one shard.</li>
+  <li>Ch. 11 Stream Processing — Kafka-driven dispatch + ML feature pipelines.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I separate the <em>promise</em> ETA (set at checkout, customer-facing SLA) from the <em>predicted</em> ETA (live, ops-facing) — they have different cost functions."</li>
+  <li>"Batching is the single biggest lever on unit economics; I'd quantify the trade-off vs customer freshness via offline simulator."</li>
+  <li>"For multi-region, I'd colocate consumers with a primary region but make catalog and ad inventory global via Cockroach."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>PostgreSQL (Vitess hash-shard)</td><td>10 M orders/day at 30 GB/day demands ACID with horizontal scale; UUIDv7 hash-sharding spreads the 1 K peak orders/s across shards while keeping order-state machine linearizable per shard for exactly-once payment capture.</td><td>MySQL+Vitess (viable but Postgres has richer types); CockroachDB (used elsewhere — too costly for OLTP at this write rate); DynamoDB (no strong cross-row transactions).</td></tr>
+<tr><td>CockroachDB (catalog)</td><td>1 M merchants × 50 menu items = 50 M docs need multi-region strong reads from US/CA/AU/JP — Cockroach's serializable multi-region tables let menu changes propagate consistently without read-your-writes bugs in cross-region traffic.</td><td>Spanner (vendor lock; GCP-only); Aurora Global (eventual reads only); standalone Postgres + replicas (consistency gaps cause checkout errors).</td></tr>
+<tr><td>Cassandra (assignments)</td><td>Dispatch writes 1 K assignments/s with audit trail; <code>region+hour</code> partitioning supports write-heavy fan-in and trailing scans for ops without taxing the OLTP DB. Leaderless tolerates region failover.</td><td>HBase (heavier ops, JVM tuning); ScyllaDB (good fit but smaller US ecosystem); DynamoDB (cost at 1 K/s sustained writes).</td></tr>
+<tr><td>Apache Kafka</td><td>600 K dasher.pings/s = 120 MB/s plus order.events stream; Kafka's partitioned log lets Deep Red, ETA model, and ML feature pipelines consume independently with replayability for nightly model retraining.</td><td>Kinesis (24 hr replay limit); Pulsar (less mature US ops); RabbitMQ (no replay for ML).</td></tr>
+<tr><td>Elasticsearch</td><td>50 M menu-item docs need lexical + filter queries at 80 K peak browse QPS; ES geo + BM25 + aggregations cover ranking facets while replicas absorb the Super Bowl 3x spike.</td><td>OpenSearch (similar; chose ES for plugin maturity); Solr (smaller community); Algolia (cost at 80 K QPS).</td></tr>
+<tr><td>Redis Geo</td><td>600 K Dasher pings/s flow into geohash buckets giving sub-ms nearest-N for the VRP solver — critical for the &lt;1s offer-to-Dasher push SLA. RAM-resident state is acceptable since Kafka replays on failover.</td><td>PostGIS (slow at 600 K writes/s); MongoDB geo (poorer p99 tail); custom in-memory (re-implementing Redis).</td></tr>
+<tr><td>OR-Tools VRPTW solver</td><td>Vehicle Routing with Time Windows handles batched 2-3 deliveries with promise-time constraints; LP relaxation + local search hits the 2-5 s tick budget while improving unit economics ~15% over greedy.</td><td>Greedy nearest (used as fallback only); LKH (slower per tick); commercial Gurobi (license cost at 100s of regions).</td></tr>
+<tr><td>Uber H3 (res-8)</td><td>Hex grid gives uniform supply/demand cell size for surge multipliers published every 60s; res-8 (~0.7 km²) matches typical urban delivery density without over-fragmenting markets.</td><td>S2 cells (Google) (rectangular distortion); geohash (rectangular cells skew lat/lng); custom polygons (operational overhead).</td></tr>
+<tr><td>Quantile GBT (XGBoost) for ETA</td><td>Promise ETA at checkout is a customer-facing SLA — quantile loss directly optimises p80 over-promise rate; nightly retraining on 90-day pings keeps prep-time drift in check across 1 M merchants.</td><td>Linear regression (poor on non-linear interactions); DNN (slower inference, marginal lift); pure heuristic (degrades unit economics).</td></tr>
+<tr><td>Feast feature store</td><td>Surge model and Deep Red consume the same online features (cell supply, demand, weather); Feast guarantees offline/online parity so the model trained at night behaves the same at 1 K orders/s peak.</td><td>Tecton (vendor cost); custom Redis lookups (training-serving skew bugs); Hopsworks (less Python-native).</td></tr>
+<tr><td>Envoy + Cloudflare</td><td>Cloudflare absorbs the 80 K peak browse QPS at edge with DDoS protection; Envoy handles internal mTLS, retries, and circuit-breaking for the 99.99% order-path availability target.</td><td>nginx (less rich xDS); AWS ALB (no per-route circuit breakers); HAProxy (less observable).</td></tr>
+<tr><td>Snowflake (data lake)</td><td>7-yr retention of 80 TB orders + telemetry needs cheap analytical storage with SQL for BI; separation of compute and storage lets ad-hoc Super Bowl analysis run without taxing OLTP.</td><td>Redshift (compute coupled to storage); BigQuery (vendor lock; multi-cloud strategy); Databricks (heavier for SQL-only consumers).</td></tr>
+<tr><td>WebSocket gateway (sharded)</td><td>5 M concurrent open orders need ~3 s differential updates; sharding by order_id gives partition affinity so each pod consumes only its Kafka partitions, scaling linearly with conn count.</td><td>SSE (one-way insufficient for status); MQTT (added broker hop); HTTP polling (10x server cost at 5 M conns).</td></tr>
+</tbody>
+</table>
+

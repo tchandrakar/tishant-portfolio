@@ -1,0 +1,149 @@
+<h1>Design Geo-Indexing with S2 / H3 / Geohash (city quad-trees)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a generic geo-indexing service that supports billions of moving points (drivers, scooters, delivery riders, IoT sensors). It must answer two queries fast: (1) "give me the K nearest entities to this point" and (2) "give me everything inside this polygon," at QPS levels that ride-sharing requires (hundreds of thousands of queries per second).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Insert/Update/Delete a point with TTL.</li>
+  <li>Range query: bounding box / circle / polygon.</li>
+  <li>kNN query for a given lat/lng.</li>
+  <li>Aggregations: count points per cell at a given resolution.</li>
+  <li>Multi-tenant: namespaces per fleet (drivers, scooters, restaurants).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> kNN p99 &lt; 10 ms for K=50; range p99 &lt; 30 ms for cells with up to 10 K points.</li>
+  <li><b>Scale:</b> 10 M live points across all tenants; 1.25 M writes/sec; 200 K reads/sec.</li>
+  <li><b>Freshness:</b> writes visible within 200 ms.</li>
+  <li><b>Durability:</b> live state can be lost (rebuild from stream); historical traces are durable in object storage.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>10 M points × ~120 B = 1.2 GB hot state; replicated 3× across AZ → 3.6 GB. Easily fits in a Redis cluster.</li>
+  <li>Writes: 1.25 M/s × 200 B Kafka envelope = 250 MB/s ingest.</li>
+  <li>Reads: 200 K/s × avg fan-out 9 cells × ~50 entries = 90 M entry reads/sec → must be in-memory.</li>
+  <li>Per-cell density: dense urban cell at S2 level 12 contains 200–5 K points; sparse rural cells &lt; 10.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/geo/{ns}/upsert {id, lat, lng, attrs, ttlSec}    → 200
+GET  /v1/geo/{ns}/knn?lat=..&amp;lng=..&amp;k=50&amp;filter=...      → [{id, distM, attrs}]
+GET  /v1/geo/{ns}/within?bbox=lat1,lng1,lat2,lng2         → [{id, lat, lng}]
+GET  /v1/geo/{ns}/within?h3={cell}                         → [{id, ...}]
+GET  /v1/geo/{ns}/count?cell=...&amp;res=8                    → {count}
+DELETE /v1/geo/{ns}/{id}                                   → 204</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Producers] --> [Kafka: geo_updates] --> [Indexer pods]
+                                            |  (in-mem index per shard)
+                                            v
+                                   [Redis Cluster]
+                                   key = ns:cell -> ZSET(id by ts)
+                                   key = ns:point:id -> hash
+                                            ^
+                                            |
+[Clients] -> [Geo API] -> [Query Planner] --+
+                                |
+                                +--> [PostGIS]  (durable, polygon ops)
+                                +--> [S3 / Parquet] (cold history)
+</div>
+<p>Hot path uses Redis for cell-set storage, fronted by a stateless Geo API that knows the indexing strategy (S2 vs H3 vs Geohash). PostGIS is consulted only for arbitrary polygon queries that don't decompose cleanly to cells. Writes flow through Kafka so the index is rebuildable from the stream.</p>
+
+<h2>7. Comparing the indexing schemes</h2>
+<table>
+<thead><tr><th>Scheme</th><th>Shape</th><th>Hierarchy</th><th>Neighbor distance</th><th>Best for</th></tr></thead>
+<tbody>
+<tr><td>Geohash</td><td>Rectangle</td><td>String prefix (base32)</td><td>Anisotropic (varies by lat)</td><td>Quick prototyping, lex-sortable storage</td></tr>
+<tr><td>S2</td><td>Square (cube projection)</td><td>30 levels, 1D Hilbert curve key</td><td>Fairly uniform</td><td>Google scale, 1D range scans</td></tr>
+<tr><td>H3</td><td>Hexagon</td><td>16 resolutions</td><td>Uniform (single hop = single edge)</td><td>Uber-style fleet ops, even neighborhoods</td></tr>
+</tbody>
+</table>
+
+<h2>8. Data model &amp; storage</h2>
+<h3>8.1 Cell index (Redis)</h3>
+<pre>ZADD geo:{ns}:cell:{cellId}  {score=ts}  {pointId}
+HSET geo:{ns}:point:{id}     lat lng attrs cellId
+EXPIRE geo:{ns}:point:{id}   {ttl}</pre>
+<p>The ZSET orders points by last-update timestamp so we can cheaply expire stale entries and run a windowed scan. The point hash holds full attributes for filtering.</p>
+<h3>8.2 Polygon support (PostGIS)</h3>
+<pre>CREATE TABLE geofences (
+  id UUID PRIMARY KEY, ns TEXT, name TEXT,
+  region GEOGRAPHY(POLYGON, 4326),
+  effective_at TIMESTAMPTZ, expires_at TIMESTAMPTZ
+);
+CREATE INDEX ON geofences USING GIST (region);</pre>
+
+<h2>9. Detailed component design</h2>
+<h3>9.1 kNN algorithm</h3>
+<p>Compute the rider cell at level R. Scan the cell + 8 neighbors. If total candidates &lt; K, expand to ring 2 (24 more cells). Always cap at ring 3 (48 cells) — anything farther is not useful for dispatch. Sort the gathered candidates by haversine and return top-K. Typical: 9 cells × ~80 points = 720 candidates → 50 returned in &lt;5 ms.</p>
+<h3>9.2 Adaptive resolution</h3>
+<p>Use H3 resolution 8 (~0.7 km²) globally. In dense cells (count &gt; 1000), the indexer dynamically also writes the point to the resolution-9 child cell, so dense queries can use the finer index without affecting sparse ones. Reads pick resolution based on observed density per cell.</p>
+<h3>9.3 Writer pipeline</h3>
+<p>Kafka consumer group with one partition per shard. Each writer batches updates per cell (50–200 per batch, 20 ms flush) using Redis pipelining to keep the network round-trips down. Idempotent on (ns, id, ts) — out-of-order pings are dropped.</p>
+<h3>9.4 Polygon query</h3>
+<p>For an arbitrary polygon, decompose to a covering set of H3 cells using <code>polygonToCells</code>; union-fetch from Redis; finally do a precise point-in-polygon filter only for cells that straddle the boundary.</p>
+
+<h2>10. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot cells:</b> a single Redis key holding 5 K members can cause CPU stalls — split via dynamic resolution upgrade.</li>
+  <li><b>Cluster slot skew:</b> use <code>{ns:cell}</code> hash tags so neighbor lookups land on contiguous shards; rebalance using consistent hashing.</li>
+  <li><b>TTL stampedes:</b> stagger TTLs (±10s jitter) so a million keys don't expire together.</li>
+  <li><b>Polygon-to-cells fan-out:</b> a city-sized polygon at res 9 yields ~50 K cells; cap and use coarser res for large polys.</li>
+</ul>
+
+<h2>11. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>In-memory Redis</td><td>&lt;5 ms reads at 200 K QPS</td><td>Rebuild required after total failure</td></tr>
+<tr><td>H3 over S2</td><td>Uniform neighbors, friendlier for ML features</td><td>Less mature tooling than Geohash</td></tr>
+<tr><td>Fixed-resolution by default</td><td>Simple, cache-friendly</td><td>Hot cells need adaptive split</td></tr>
+<tr><td>Kafka-sourced</td><td>Free replay, rebuild after data loss</td><td>One more component to operate</td></tr>
+</tbody>
+</table>
+
+<h2>12. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage and retrieval — secondary indexes; the cell-set is essentially a multi-value secondary index on space.</li>
+  <li>Ch. 6 Partitioning — partition by cell with hash tags; rebalance on hot-spot detection.</li>
+  <li>Ch. 11 Stream processing — geo-index as a materialized view over the location-update topic.</li>
+  <li>Ch. 12 Future of data systems — derive multiple read views (kNN, heatmap, count) from the same stream.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd default to H3 because hex neighbors are equidistant — that single property simplifies kNN expansion and ML feature engineering."</li>
+  <li>"The hardest production issue is hot-cell skew; my mitigation is adaptive resolution and Kafka-driven rebuilds."</li>
+  <li>"Polygon queries are best decomposed to a cell cover plus boundary refinement — that hybrid keeps the hot path purely in Redis."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>H3 (default index, res 8)</td><td>Uniform hex neighbors mean a kNN ring expansion (cell + 6 → +12 → +18) gives equidistant coverage; that single property simplifies the &lt;5 ms kNN budget and feeds clean ML features at 200 K reads/sec.</td><td>Geohash → uneven cells at high latitudes; S2 → fine but neighbor distance varies on cube projection.</td></tr>
+    <tr><td>S2 (alternative for 1D scans)</td><td>Hilbert-curve key supports fast lex range scans when a tenant needs sorted-by-space iteration (e.g., region partitioner); offered as an opt-in scheme alongside H3.</td><td>H3 only → no native 1D ordering; raw quadtree → no compact key encoding.</td></tr>
+    <tr><td>Geohash (legacy/prototyping)</td><td>String-prefix hierarchy makes it trivial to bucket points in a generic KV; useful for quick prototypes and lex-sortable storage even though it's not the production default.</td><td>H3/S2 only → higher integration cost for greenfield prototypes.</td></tr>
+    <tr><td>Redis cluster (cell ZSET + point hash)</td><td>1.25 M wps and 200 K reads/sec require in-memory: 10 M points × 120 B = 1.2 GB hot, 3.6 GB with 3× replication fits comfortably. ZSET ordered by ts gives O(log N) eviction of stale entries.</td><td>Memcached → no sorted set; KeyDB → fine, Redis has wider Lua/CLUSTER tooling.</td></tr>
+    <tr><td>Redis hash tags ({ns:cell})</td><td>Cluster slot skew is fatal at 200 K rps with 9-cell fan-out; hash tags ensure neighbor cells co-locate on the same slot so a kNN expansion is a single-shard pipeline rather than 9 cross-shard hops.</td><td>Naive keying → 9× network amplification; client-side gather → tail-latency disaster.</td></tr>
+    <tr><td>Kafka (geo_updates topic)</td><td>Index is treated as a materialized view: total Redis loss is recoverable by replaying the last N hours; partition-per-shard at 1.25 M wps × 200 B = 250 MB/s rebuilds in &lt;30 min for a city.</td><td>RabbitMQ → no replay; Pulsar → fine but smaller ecosystem for the indexer pods.</td></tr>
+    <tr><td>PostGIS (durable polygons)</td><td>Arbitrary regulator polygons (geofences) don't decompose cleanly to H3 cells; GiST spatial index on GEOGRAPHY(POLYGON, 4326) handles point-in-polygon and polygon-polygon ops in &lt;10 ms.</td><td>Pure H3 covering → boundary refinement still requires PIP; Mongo geospatial → weaker polygon ops; CockroachDB → less mature spatial.</td></tr>
+    <tr><td>S3 + Parquet (cold history)</td><td>Trip traces and historical positions are durable in object storage at &lt;$0.025/GB; columnar Parquet partitioned by day/region serves Spark training jobs without touching the hot path.</td><td>HDFS → no managed multi-region; row-store → poor compression and full-scan cost.</td></tr>
+    <tr><td>Indexer pods (Go/Rust)</td><td>One Kafka partition per shard, per-cell batching (50–200 updates per Redis pipeline, 20 ms flush) keeps round-trips down; idempotent on (ns, id, ts) drops out-of-order pings without client coordination.</td><td>Single big consumer → can't parallelize at 1.25 M wps; per-event Redis call → 5× more network ops.</td></tr>
+    <tr><td>gRPC (Geo API)</td><td>Sub-10 ms p99 kNN target leaves no room for JSON parsing on Geo API → indexer hops; protobuf and HTTP/2 multiplexing keep internal RPCs under 1 ms.</td><td>REST/JSON → too slow at p99; Thrift → smaller polyglot tooling.</td></tr>
+    <tr><td>Bloom filter (membership pre-check)</td><td>Polygon-to-cells decomposition can yield 50 K cells for a city-sized polygon; a per-tenant bloom filter of "cells with any points" lets us skip empty cells before the Redis fetch.</td><td>Naive fetch → 50 K wasted ops on empty cells; full materialized count → memory cost without read benefit.</td></tr>
+    <tr><td>Adaptive resolution (H3 res 8 → 9)</td><td>When a cell density crosses 1 K points the indexer also writes the point into the res-9 child cell; reads dynamically pick the finer index. This contains hot-cell CPU stalls without doubling memory globally.</td><td>Static fine resolution → wastes memory in sparse cells; static coarse → CPU stalls in dense ones.</td></tr>
+    <tr><td>TTL jitter (±10s)</td><td>10 M points expire on schedule; without jitter, a million keys expiring at the same wall-clock second causes a Redis CPU stampede. ±10s jitter spreads the load evenly across 20 seconds.</td><td>Uniform TTL → periodic stalls; manual sweeper → reinventing what Redis already does.</td></tr>
+  </tbody>
+</table>
+

@@ -1,0 +1,132 @@
+<h1>Design Elasticsearch architecture (inverted index, sharded, near-real-time)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">search</span>
+  <span class="tag">storage-cache</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a distributed search and analytics engine in the spirit of Elasticsearch / OpenSearch: a sharded, replicated cluster sitting on top of Lucene that ingests JSON documents, builds inverted indexes (plus doc-values for aggregations), and serves search and aggregation queries with near-real-time visibility (1 s default refresh). Target use cases: log analytics, full-text product search, observability.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Index JSON documents into named indexes; auto-discover or explicitly mapped fields.</li>
+  <li>Search: full-text, term, range, bool, phrase, fuzzy; aggregations (terms, date histogram, percentiles).</li>
+  <li>Near-real-time: documents searchable within ~1 s of indexing.</li>
+  <li>Scale horizontally by adding nodes; rebalance shards automatically.</li>
+  <li>Snapshots and restores to object storage.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> simple term query &lt; 50 ms p99 on a warm shard; aggregations &lt; 1 s on 1 B docs.</li>
+  <li><b>Scale:</b> 1 PB stored, 100 B docs, 200 K index ops/sec, 10 K search QPS.</li>
+  <li><b>Durability:</b> no data loss on single-node failure; RPO ≈ 0 with replicas.</li>
+  <li><b>Availability:</b> 99.95%; cluster tolerates loss of any one zone.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Doc size 1 KB avg → 100 B docs ≈ 100 TB raw; inverted index + doc-values ≈ 1.3× → ~130 TB; with 1 replica → 260 TB; on i3.4xlarge (3.8 TB NVMe) ≈ 70 data nodes.</li>
+  <li>Indexing throughput: 200 K docs/s × 1 KB = 200 MB/s; partitioned over 50 primary shards → 4 K docs/s/shard.</li>
+  <li>Search QPS: 10 K × fan-out 50 shards = 500 K shard-queries/sec; per node ~7 K shard-q/s — well within Lucene budget.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>PUT  /orders                 {settings, mappings}
+POST /orders/_doc            {json}                 → docId, _seq_no
+POST /orders/_search         {query, aggs, size}    → hits, aggregations
+POST /orders/_bulk           ndjson                 → per-op result
+POST /_snapshot/{repo}/{id}                         → snapshot</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] -> [Coordinating Node] --routing--> [Primary Shard] -> [Replica Shard]
+                       |                          |                   |
+                       v                          v                   v
+                 fan-out search           Lucene segments       Lucene segments
+                       |
+              merge top-K + aggs
+
+         [Master-eligible nodes]  -- cluster state, shard allocation --
+         [Data nodes] [Ingest nodes] [Coordinating-only nodes]
+</div>
+<p>Coordinating node hashes <code>_id</code> to a shard, forwards index ops to the primary, which replicates to in-sync replicas before acking. Search is scatter-gather across one copy of each shard.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Lucene segment layout (per shard)</h3>
+<pre>segment_N/
+  .tim/.tip   term dictionary + index (FST)
+  .doc/.pos   postings, positions
+  .dvd        doc-values (column store for sort/agg)
+  .fdt/.fdx   stored fields
+  .liv        soft-delete bitset</pre>
+<h3>7.2 Translog &amp; refresh</h3>
+<p>Every index op is appended to a per-shard translog (fsync per request or per 5 s). A <i>refresh</i> every 1 s flushes the in-memory buffer to a new searchable segment (visibility = NRT). A <i>flush</i> commits segments and truncates the translog. Compaction merges small segments into bigger immutable ones — exactly the LSM pattern from DDIA Ch. 3.</p>
+<h3>7.3 Sharding</h3>
+<p><code>shard = hash(_routing or _id) % num_primary_shards</code>. Primary count is fixed at index creation; resize via <code>_split</code>/<code>_shrink</code> or reindex.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Cluster coordination</h3>
+<p>Master-eligible nodes elect a master via a Raft-like protocol (since 7.x). The master owns cluster state: index metadata, shard allocation table, mappings. Data nodes pull state diffs. Split-brain is avoided by quorum: at least <code>(N/2)+1</code> master-eligible nodes must agree.</p>
+<h3>8.2 Indexing path</h3>
+<p>Coordinating node → primary: append to translog, add to in-memory buffer, replicate to replicas in parallel (<code>wait_for_active_shards</code>). Ack only after all in-sync replicas ack — synchronous replication, leader-based (DDIA Ch. 5).</p>
+<h3>8.3 Search path</h3>
+<p>Two phases: <b>query</b> (each shard returns top-K doc IDs + scores, coordinator merges to global top-K) then <b>fetch</b> (coordinator pulls stored fields for the final K). Aggregations use doc-values column store; partial results merge associatively in the coordinator.</p>
+<h3>8.4 Failure handling</h3>
+<p>If a primary dies, the master promotes an in-sync replica. Translog replays uncommitted ops on recovery. Allocation awareness keeps replicas in different zones.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot shard:</b> caused by skewed routing or oversized index — mitigate with custom routing, ILM rollover, time-based indices (one per day).</li>
+  <li><b>Mapping explosion:</b> dynamic mapping on log fields creates millions of fields → cluster state bloat. Cap with <code>index.mapping.total_fields.limit</code> and use <code>flattened</code> type.</li>
+  <li><b>Deep pagination:</b> <code>from+size</code> is O(shards × from) — use <code>search_after</code> or scroll/PIT.</li>
+  <li><b>GC pauses:</b> heap &gt; 30 GB hits compressed-oops cliff; cap heap, prefer more nodes.</li>
+  <li><b>Refresh storms:</b> for write-heavy workloads, raise <code>refresh_interval</code> to 30 s during bulk loads.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>NRT refresh (1 s)</td><td>Near-live searchability</td><td>Many small segments, merge pressure</td></tr>
+<tr><td>Synchronous replica ack</td><td>Strong durability, no data loss on failover</td><td>Index latency = slowest replica</td></tr>
+<tr><td>Doc-values column store</td><td>Fast aggregations and sorts</td><td>Doubles disk vs postings-only</td></tr>
+<tr><td>Fixed primary shard count</td><td>Simple routing</td><td>Resize requires reindex/split</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage and Retrieval — Lucene segments are textbook LSM with immutable SSTables and background merges; the inverted index is the canonical example of full-text indexing.</li>
+  <li>Ch. 5 Replication — leader-based synchronous replication of shards.</li>
+  <li>Ch. 6 Partitioning — hash partitioning by document key, rebalancing constraints.</li>
+  <li>Ch. 9 Consistency — linearizability of single-shard ops vs eventual consistency of cross-shard reads.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd push back on default 1 s refresh for log workloads — bumping to 30 s alone often doubles ingest throughput."</li>
+  <li>"The mental model I always use: each shard is a Lucene index, period. Everything else is plumbing."</li>
+  <li>"Cluster state is the hidden bottleneck at scale; mapping discipline matters more than CPU sizing."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Apache Lucene (per-shard engine)</td><td>Each of the 50 primary shards is literally a Lucene index storing ~2 B docs at ~1 KB; Lucene's segment-based LSM with .tim/.doc/.dvd files gives sub-50 ms term queries on warm shards and is the only mature engine that bundles inverted index, doc-values, and stored fields with NRT semantics.</td><td>Tantivy (Rust, fast but ecosystem is thin); custom inverted index (years of work to match Lucene's scorer/rerank code paths).</td></tr>
+    <tr><td>FST term dictionary (.tim/.tip)</td><td>For 100 B docs across 50 shards, each shard holds tens of millions of unique terms; the FST encodes them at ~6 B/term and lets the .tip index sit fully in heap, avoiding disk seeks on the hot path that would blow the 50 ms p99 budget.</td><td>Hash-based term dict (memory blow-up); B-tree on disk (extra seek per query).</td></tr>
+    <tr><td>Doc-values (column store .dvd)</td><td>Aggregations on 1 B docs in &lt;1 s require columnar access; doc-values store one value per doc per field in a packed column file, enabling SIMD-style scans at &gt;1 GB/s — postings alone would force 10–100× more random reads.</td><td>Fielddata in heap (OOM at 100 GB+); external columnar store (cross-process latency).</td></tr>
+    <tr><td>Translog + fsync</td><td>RPO ≈ 0 needs a per-shard write-ahead log; translog fsync per request gives durability under node loss, while batched fsync every 5 s is the escape hatch for 200 K ops/s ingest where 5 s is acceptable RPO.</td><td>No WAL (data loss on crash); group commit only (no per-request durability).</td></tr>
+    <tr><td>Raft-like cluster coordination (master-eligible)</td><td>Cluster state (mappings, shard allocation) for thousands of shards must be linearizable; the post-7.x quorum protocol prevents the split-brain that haunted Zen discovery and tolerates single-zone loss.</td><td>ZooKeeper (extra dependency; ES dropped it); gossip-only (no linearizability for shard allocation).</td></tr>
+    <tr><td>Synchronous replica ack (leader-based)</td><td>"No data loss on single-node failure" requires that the primary block until all in-sync replicas ack; this matches DDIA Ch. 5 leader-based sync replication and survives one zone failure when replicas are zone-spread.</td><td>Async replication (data loss window); quorum-based (more complex, harder to reason about consistency).</td></tr>
+    <tr><td>Kafka (upstream ingestion buffer)</td><td>200 K docs/s with bursty producers needs a durable buffer ahead of bulk indexers; Kafka absorbs spikes, enables replay for reindex, and lets bulk consumers pace themselves so refresh storms don't tip nodes into GC.</td><td>RabbitMQ (no rewindable log at 200 K/s); direct HTTP _bulk (no shock absorber for spikes).</td></tr>
+    <tr><td>Roaring bitmaps (filter cache)</td><td>Bool/term filters over billion-doc indices intersect at &gt;1 GB/s with Roaring; cached per shard, this is what makes filtered aggregations sub-second instead of multi-second.</td><td>Plain BitSet (4× RAM at 100 B docs); CRoaring with custom Java bindings (already used internally).</td></tr>
+    <tr><td>S3 / object storage (snapshots)</td><td>1 PB cluster needs cheap, geo-redundant cold storage for snapshots; S3 at $0.023/GB/mo is ~10× cheaper than block storage and the snapshot diff format only ships changed segments.</td><td>Local-disk backups (no DR); HDFS (operational overhead, no native ES integration).</td></tr>
+    <tr><td>i3.4xlarge (NVMe SSD nodes)</td><td>260 TB total storage / 3.8 TB NVMe ≈ 70 nodes; NVMe gives the random-read IOPS Lucene needs for postings and stored fields, where EBS-only would saturate at 16 K IOPS per volume.</td><td>EBS gp3 (lower IOPS, latency cliff); HDD-backed (kills query latency on cold segments).</td></tr>
+    <tr><td>ILM (Index Lifecycle Management)</td><td>Time-based indices with hot→warm→cold→delete phases keep the active write index small (~50 GB primary) so refreshes are cheap, while old data ages onto cheaper hardware — essential for 100 B-doc log workloads.</td><td>Single giant index (hot-shard problem); manual rollover scripts (error-prone at this scale).</td></tr>
+    <tr><td>JVM G1GC, &lt;30 GB heap</td><td>Heap above 30 GB loses compressed-oops, doubling pointer size and GC pressure; capping heap and adding more nodes keeps p99 GC pauses under 200 ms — directly bounded by the &lt;50 ms p99 query goal.</td><td>ZGC (lower pauses but worse throughput at the time of design); larger heap (latency cliff).</td></tr>
+  </tbody>
+</table>

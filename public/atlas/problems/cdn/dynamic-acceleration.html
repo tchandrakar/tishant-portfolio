@@ -1,0 +1,144 @@
+<h1>Design Dynamic Content Acceleration (DSA, edge compute, route optimization)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">cdn</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Static content caches well; APIs and personalized HTML do not. Akamai's DSA (Dynamic Site Accelerator), Cloudflare Argo, AWS Global Accelerator all attack the same problem: how do you speed up <i>uncacheable</i> traffic between user and origin? The levers are TCP/TLS termination at the edge, persistent backbone connections, route optimization on a private overlay, and edge compute (Workers / Lambda@Edge).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Terminate TLS at the edge for every API call, even uncacheable ones.</li>
+  <li>Route the second-leg (edge → origin) over an optimized overlay (private backbone or measured public path).</li>
+  <li>Run JS / WASM at the edge to assemble personalized HTML, do A/B tests, rewrite responses.</li>
+  <li>Allow micro-caching of API responses (1–10 s TTL) where safe.</li>
+  <li>Honor request affinity for stateful APIs (sticky to a region).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency improvement:</b> 25–50% TTFB reduction on uncacheable paths vs raw internet.</li>
+  <li><b>Scale:</b> 5 M dynamic req/s globally; 1 M edge-compute invocations/s.</li>
+  <li><b>Cold start:</b> &lt; 5 ms for V8 isolates (Cloudflare Workers-style).</li>
+  <li><b>Reliability:</b> 99.99%; overlay outage falls back to public internet automatically.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>5 M dynamic req/s × ~3 KB request + 8 KB response ≈ 55 GB/s = 440 Gbps overlay backbone.</li>
+  <li>Edge compute: 1 M invocations/s × 5 ms CPU = 5,000 cores busy → ~150 boxes (32 vCPU each).</li>
+  <li>Persistent connection pools: 300 POPs × 50 origins × 50 conns = 750 k long-lived TCP/H2 streams.</li>
+  <li>Private backbone: ~50 backbone POPs across continents, 100 Gbps inter-POP wavelengths, &lt; 80 ms transcontinental.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Customer config
+POST /api/v1/zones/{z}/dsa        { originPool, stickyKey, microCacheTtl }
+POST /api/v1/workers/{name}       { code: "addEventListener('fetch', ...)" }
+
+// Runtime (transparent to clients)
+ANY  *                            → edge → (worker?) → backbone → origin → response
+GET  /v1/origins/{id}/health                                     → {rtt, errRate}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]
+  │  TLS (sub-10 ms RTT to nearest edge)
+  ▼
+[Edge POP] ── V8 isolate (Worker) ── micro-cache (1–10 s)
+  │
+  │ (uncacheable / cache miss)
+  ▼
+[Edge → Backbone Ingress]
+  │
+  ▼  ⟵ optimized path picker (per-destination, per-time-of-day)
+[Private Backbone POP-1] → [Backbone POP-2] → ... → [Egress POP near origin]
+  │
+  ▼
+[Customer Origin]
+</div>
+<p>The win comes from three places: (1) TLS terminates near the user, eliminating 1–2 RTTs of public-internet handshake; (2) the edge holds a warm, multiplexed HTTP/2 connection to a backbone POP, so there is no TCP slow-start on the long leg; (3) the backbone leg uses an SDN-style optimized path that avoids congested transit.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Path performance map</h3>
+<pre>// per (ingress_pop, egress_pop) measured every 30 s
+path_metrics:
+  ingress, egress, rtt_p50, rtt_p99, loss_pct, jitter_ms, updated_at</pre>
+<h3>7.2 Origin pool config</h3>
+<pre>CREATE TABLE origin_pools (
+  pool_id uuid PK, customer_id uuid,
+  origins jsonb,        -- list of {host, weight, region}
+  sticky_key text,      -- "cookie:sid" or "ip" or "header:X-Tenant"
+  micro_cache_ttl_s int,
+  health_path text
+);</pre>
+<p>Path-metrics live in a fast distributed KV (Redis Enterprise / FoundationDB) with eventual consistency across POPs (DDIA Ch. 5 multi-leader async, bounded staleness ~30 s — fine since paths change slowly).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Edge compute (V8 isolates)</h3>
+<p>Each POP runs a single V8 process hosting thousands of customer scripts as isolates. Cold-start is ~5 ms (vs 100–500 ms for containers/Lambda) because we skip OS process start. Scripts are immutable, signed, and globally distributed via the same control-plane KV used for cache config.</p>
+<h3>8.2 Optimized routing</h3>
+<p>Active probing runs continuously between every backbone POP pair. A path picker (similar to Argo) chooses the lowest-latency multi-hop overlay for each (ingress, egress) pair every 30 s. Paths are encoded as a SR-style label stack carried inside an MPLS or QUIC tunnel header.</p>
+<h3>8.3 Connection reuse</h3>
+<p>Edge → origin connections are pinned, HTTP/2-multiplexed (or HTTP/3), and kept warm. A single TCP slow-start cost is amortized across millions of user requests. If the origin supports HTTP/2 + TLS 1.3, we save 2–3 RTTs per request — at 80 ms per RTT, that's 160–240 ms per call.</p>
+<h3>8.4 Micro-caching</h3>
+<p>For "uncacheable" GET endpoints that are actually identical for thousands of users in a 5-second window (e.g. trending feed), micro-caching at TTL 5 s slashes origin QPS by 100–1000× during a viral moment, with bounded staleness the customer accepts.</p>
+<h3>8.5 Edge worker as response composer</h3>
+<p>A typical pattern: worker fans out to 5 origin services in parallel, assembles HTML, returns in 60 ms instead of 300 ms (each origin fetch from edge is 1 RTT vs from client is 5 RTTs).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Backbone capacity:</b> a viral event saturates a POP-pair; mitigations are weighted ECMP across multiple wavelengths and graceful fallback to public internet when overlay loss &gt; 1%.</li>
+  <li><b>Worker noisy-neighbor:</b> single V8 process means a hot script can stall others; enforce CPU time limits (50 ms hard, 10 ms typical) and memory caps (128 MB).</li>
+  <li><b>Stateful API affinity:</b> if a session must hit one specific region, sticky-key hashing + consistent-hash overlay routing.</li>
+  <li><b>Path-flap during active probing:</b> hysteresis (require sustained 20% improvement before switching).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Private backbone</td><td>Predictable RTT, lower loss</td><td>Capex; finite capacity</td></tr>
+<tr><td>V8 isolates</td><td>5 ms cold-start, dense multi-tenancy</td><td>JS/WASM only; weaker syscall isolation</td></tr>
+<tr><td>Persistent multiplexed conns</td><td>2–3 RTT savings/request</td><td>State at every edge; must handle origin restarts</td></tr>
+<tr><td>Micro-caching dynamic content</td><td>Massive origin offload during virality</td><td>Stale reads up to TTL; requires customer opt-in</td></tr>
+<tr><td>Active probing for path picking</td><td>Reflects real network</td><td>Probing traffic itself costs bandwidth</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-leader async replication of path-metrics and worker code; bounded staleness across POPs.</li>
+  <li>Ch. 8 Distributed Systems — partial failure on the overlay (single backbone POP loss), graceful fallback to public internet, why no synchronous global state can sit on the request hot path.</li>
+  <li>Ch. 11 Stream Processing — probe results streamed into the path-picker via Kafka; aggregations every 30 s.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Dynamic acceleration is unsexy compared to caching, but it's where the modern CDN business is. The cache hit ratio on APIs is zero; the levers are TCP, TLS, and routing."</li>
+  <li>"V8 isolates are the right unit of edge compute. Containers are too heavy; functions on cold infrastructure can't hit single-digit-ms cold-starts."</li>
+  <li>"The most underrated trick is micro-caching: a 5-second TTL on a 'dynamic' endpoint can absorb a viral spike that would otherwise page the origin team."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>V8 isolates (Cloudflare Workers-style)</td><td>1 M edge-compute invocations/s with &lt;5 ms cold-start is impossible with containers (100–500 ms) or Lambda (50+ ms). V8's per-isolate sandbox skips OS process start; one V8 process hosts thousands of customer scripts on each box, hitting 32 vCPU density at the 150-box budget.</td><td>Docker containers (cold-start cliff); Lambda (cold-start, billing model); Wasm runtimes only (less mature tooling).</td></tr>
+<tr><td>WebAssembly (WASM) for non-JS workloads</td><td>Customers writing Rust/Go need a sandbox alongside V8. WASM provides the same isolate model with deterministic execution, fitting the 50 ms hard CPU and 128 MB memory caps without a separate runtime fleet.</td><td>JS-only (locks out Rust/Go customers); Firecracker microVMs (heavier).</td></tr>
+<tr><td>HTTP/2 multiplexed persistent connections (edge → origin)</td><td>750k long-lived TCP streams (300 POPs × 50 origins × 50 conns) eliminate TCP slow-start on the long leg. With 80 ms transcontinental RTT, saving 2–3 RTTs per request is 160–240 ms — the bulk of the 25–50% TTFB improvement target.</td><td>HTTP/1.1 keepalive (head-of-line blocking); per-request TCP (slow-start every time).</td></tr>
+<tr><td>HTTP/3 (QUIC) on the client leg</td><td>0-RTT resumption means returning users skip the TLS handshake entirely. On 5 M dynamic req/s, even 1 saved RTT translates to massive aggregate latency reduction. QUIC's connection migration also survives client network changes (mobile handoffs).</td><td>HTTP/2 (still pays handshake on resume); TCP+TLS 1.3 (no 0-RTT for new conns).</td></tr>
+<tr><td>SDN-style optimized backbone (Argo-style path picker)</td><td>Public internet has unpredictable congestion; a private 50-POP backbone with 100 Gbps wavelengths and active-probed path selection (every 30 s) gives the predictable RTT needed for a 25–50% TTFB win. Without it, dynamic acceleration is just "TLS termination + persistent conns."</td><td>Pure public internet (loss/jitter); MPLS-only (no real-time path picking).</td></tr>
+<tr><td>Active-probed path metrics (p50/p99 RTT, loss, jitter)</td><td>Stored in Redis Enterprise / FoundationDB with bounded-staleness ~30 s replication (DDIA Ch. 5). Path quality changes slowly so eventual consistency is fine, but 30 s update granularity is required to react to congestion shifts on the 50-POP backbone mesh.</td><td>Static routing (ignores congestion); on-demand probing (latency on hot path).</td></tr>
+<tr><td>Segment Routing (SR) / MPLS-style label stack</td><td>Path picker outputs need to be carried in-band without per-hop lookups. SR labels encode the chosen multi-hop overlay path in the packet itself, hitting the 440 Gbps backbone throughput without per-flow state on intermediate routers.</td><td>Per-hop SDN lookups (router state explosion); IP-in-IP tunnels (overhead).</td></tr>
+<tr><td>Micro-caching (1–10 s TTL on "dynamic" endpoints)</td><td>For trending-feed-style endpoints, 100–1000× origin offload during virality with bounded 5 s staleness. The 99.99% reliability target on a 1 M-invocations/s edge fleet would be impossible without this absorbing viral spikes that would otherwise melt origins.</td><td>No micro-cache (origin meltdown on virality); long TTL (correctness violations).</td></tr>
+<tr><td>Per-script CPU/memory limits (50 ms hard / 10 ms typical / 128 MB)</td><td>One V8 process hosting thousands of customer scripts means a hot script can starve neighbors. Hard CPU and memory limits enforced via V8's isolate API prevent noisy-neighbor failures across the multi-tenant fleet.</td><td>Per-script process (loses density); no limits (one bug starves a POP).</td></tr>
+<tr><td>Consistent-hash sticky-key routing (stateful APIs)</td><td>Stateful sessions must hit one specific region. Hashing on cookie:sid or header:X-Tenant gives deterministic region affinity over the 300-POP edge mesh, surviving box failures with minimal session disruption.</td><td>Random routing (session breakage); session-table replication (cost).</td></tr>
+<tr><td>Weighted ECMP across backbone wavelengths</td><td>A viral event saturates a single POP-pair backbone link. ECMP across 100 Gbps wavelengths spreads flow-by-flow, and graceful fallback to public internet kicks in when overlay loss &gt;1% — meeting the 99.99% reliability target.</td><td>Single-path routing (capacity cliff); no fallback (overlay outage = customer outage).</td></tr>
+<tr><td>Hysteresis on path picker (20% sustained improvement)</td><td>Without hysteresis, RTT noise causes 30 s path flapping for every (ingress, egress) pair, breaking persistent connections. Requiring 20% sustained improvement keeps the backbone stable while still tracking real network changes.</td><td>Switch on any improvement (constant flap); manual override (defeats automation).</td></tr>
+<tr><td>Quicksilver-style KV for worker code distribution</td><td>Customer Worker code must propagate to 300 POPs in seconds, signed and immutable. Same control-plane KV as cache config — leader-based replication with bounded-staleness reads at edge means a code push is globally visible within ~1 s.</td><td>S3 + cron pull (staleness); per-POP push (fanout cost).</td></tr>
+<tr><td>Kafka stream for probe aggregation (DDIA Ch. 11)</td><td>Probe results (per-pair RTT/loss/jitter every 30 s) flow into the path picker via Kafka. Stream processing aggregates at scale and supports replay for debugging path-picker decisions — the right primitive for 50×50 = 2,500 backbone-pair metrics updated continuously.</td><td>Direct DB writes (no replay); custom queue (reinventing Kafka).</td></tr>
+</tbody>
+</table>
+

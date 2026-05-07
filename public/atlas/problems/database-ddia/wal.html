@@ -1,0 +1,208 @@
+<h1>Design a Write-ahead Log (durability, replay, group commit)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a write-ahead log: the append-only durability primitive at the heart of every serious database, message broker, file system journal, and consensus log. The contract is simple — "before any in-memory state change is acknowledged to the client, the corresponding log record must be flushed to non-volatile storage" — but the engineering is dense: file layout, fsync semantics, group commit, segment rotation, checksumming against torn writes, replay, truncation, and how the log is consumed (recovery, replication, change-data-capture). DDIA Ch. 3 frames this under "Making B-trees reliable" and "ARIES"; Ch. 5 reuses the same log for replication.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li><code>append(record)</code> -&gt; LSN; durable when fsync returns.</li>
+  <li><code>flush(upto LSN)</code> -&gt; force durability barrier.</li>
+  <li><code>read(fromLSN)</code> -&gt; iterator for recovery and replication followers.</li>
+  <li><code>truncate(beforeLSN)</code> -&gt; reclaim space after checkpoint.</li>
+  <li>Crash-safe replay: idempotent application of records to state machine.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Throughput:</b> &gt; 500 MB/s sequential on NVMe; &gt; 100k ops/s with group commit.</li>
+  <li><b>Sync latency:</b> NVMe ~50-200 us per fsync; cloud EBS gp3 ~1-2 ms.</li>
+  <li><b>Durability:</b> survive process crash, OS crash, and (with stable cache or O_DSYNC + barrier) power loss.</li>
+  <li><b>Recovery:</b> replay 1 GB log in &lt; 30 s.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>50k tx/s * 250 B avg record = 12.5 MB/s; 1 day = 1 TB.</li>
+  <li>Segments of 64 MB -&gt; 16 segments/min.</li>
+  <li>Index of <code>(LSN -&gt; segment, offset)</code>: 16 B per checkpoint entry, in-memory.</li>
+  <li>Buffer for in-flight commits: 8 MB ring buffer per writer thread.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>append(payload, [waitForSync]) -> lsn
+flush(lsn)                     -> blocks until durable
+sync()                         -> fsync()/fdatasync()
+read(fromLsn)                  -> Iterator&lt;Record&gt;
+checkpoint(lsn)                -> persist a fence
+truncate(beforeLsn)            -> drop segments older than fence</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">  writers ---append()---> +-----------------------+
+                          |  In-memory log buffer | (ring, lock-free SP/MC)
+                          +-----------------------+
+                                    |
+                          (writer thread, group commit)
+                                    |
+                                    v
+       +-------+   +-------+   +-------+   +-------+
+       | seg N | + | N+1   | + | N+2   | + | active|     append-only files
+       +-------+   +-------+   +-------+   +-------+
+            ^                                  |
+            |                                  v
+       checkpoints                         fsync()
+            |
+            +---&gt; truncation marker
+
+  Consumers:
+   - recovery (single pass replay from checkpoint)
+   - replication followers (tail the log via offset)
+   - CDC (Debezium/Maxwell-style decoders)</div>
+<p>Walk-through: a writer copies its record into the buffer, gets an LSN, and either spins on a condvar until the leader thread fsyncs past its LSN (synchronous), or returns immediately (asynchronous). The leader batches all pending records into one I/O, calls <code>fsync()</code> once, and notifies all waiters. This is the textbook <i>group commit</i> from Helland/Mohan and is why a database can hit 100k tx/s with sync durability on a single disk.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Record format</h3>
+<pre>+------+--------+-------+----------+--------+--------+
+| len  | type   | LSN   | term/xid | crc32c | bytes..|
++------+--------+-------+----------+--------+--------+
+4 B    1 B      8 B     8 B        4 B
+- LSN is monotonically assigned on append (atomic counter).
+- crc32c covers header+payload to detect torn or partial writes.
+- Records never cross a 4 KB sector boundary (or padding inserted) to make tearing detectable.</pre>
+<h3>7.2 Segment layout</h3>
+<p>Fixed-size segments (e.g., 64 MB) named <code>0000000016AB.wal</code>. Header carries magic, format version, base LSN. Active segment is preallocated and zero-filled to avoid metadata churn during fsync. Closed segments are immutable and may be compressed/archived.</p>
+<h3>7.3 Checkpoints</h3>
+<p>State machine periodically fsyncs its in-memory state and records a checkpoint record <code>(checkpointLsn, dirtyPageTable, activeXacts)</code>. After successful checkpoint, segments below <code>checkpointLsn</code> can be truncated. ARIES three-pass recovery (analysis/redo/undo) starts from the most recent checkpoint.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Group commit protocol</h3>
+<p>One thread is elected leader (lowest LSN). Followers register their commit LSN and sleep on a condvar. Leader writes the buffer, calls <code>fsync()</code>, advances <code>durableLsn</code>, and broadcasts. The waiter wakes when <code>durableLsn &gt;= myLsn</code>. Effective fsyncs/sec drops from N (one per tx) to a small constant.</p>
+<h3>8.2 fsync semantics &amp; failure modes</h3>
+<ul>
+  <li><b>fsync() can fail and not retry:</b> Linux's "fsyncgate" — many DBs now panic on fsync error to avoid silent data loss.</li>
+  <li><b>O_DIRECT</b> bypasses page cache for predictability; requires aligned buffers.</li>
+  <li><b>Disk write cache:</b> if not battery-backed, a sync may lie. Issue <code>FUA</code> or disable volatile cache on critical drives.</li>
+  <li><b>Partial-page tearing:</b> sectors are atomic at 4 KB on NVMe, but file systems may split. CRCs + record-doesn't-cross-sector rules detect tears at replay.</li>
+</ul>
+<h3>8.3 Replay</h3>
+<p>Open the latest valid checkpoint. Read forward; for each record, verify CRC; if CRC fails or LSN regresses, that's the end-of-log marker. Apply records to the state machine using <code>pageLSN &gt;= recordLSN</code> idempotency (ARIES). Truncate the file at the last valid LSN, then accept new appends.</p>
+<h3>8.4 Replication consumers</h3>
+<p>Followers tail the log by LSN. Postgres exposes this as the streaming-replication protocol; MySQL exposes it as the binlog; Kafka <i>is</i> a WAL. The single-source-of-truth principle from DDIA Ch. 11 ("Databases and Streams") means the WAL doubles as a CDC bus.</p>
+<h3>8.5 Truncation &amp; archiving</h3>
+<p>Cannot truncate past the oldest LSN required by (i) the most recent checkpoint, (ii) the slowest replica, (iii) any retained snapshot. Postgres <code>replication_slots</code> hold the LSN floor; oversights here are the most common cause of disk-full incidents.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Single fsync stream:</b> on cloud disks fsync is the limit. Mitigations: group commit, multiple WAL streams (TiKV "raft engine"), commit pipelining.</li>
+  <li><b>Lock contention on append:</b> use a lock-free ring or per-core buffers merged at flush.</li>
+  <li><b>Replication lag:</b> async followers fall behind; use semi-sync to bound RPO.</li>
+  <li><b>Disk full from retained slots:</b> alarm on <code>retained_wal_bytes</code>.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Synchronous fsync per commit</td><td>Strong durability</td><td>Latency floor = disk fsync time</td></tr>
+<tr><td>Group commit</td><td>10-100x throughput</td><td>Slight tail latency for solitary tx</td></tr>
+<tr><td>Async replication</td><td>Low write latency</td><td>Possible RPO &gt; 0</td></tr>
+<tr><td>Doublewrite/FPW</td><td>Survives torn pages</td><td>Doubles WAL bandwidth post-checkpoint</td></tr>
+<tr><td>Pre-allocated segments</td><td>Stable fsync latency</td><td>Wastes disk if traffic drops</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 "Making B-Trees reliable" — write-ahead logging and the redo/undo idea.</li>
+  <li>Ch. 5 "Implementation of Replication Logs" — statement-based vs WAL shipping vs logical (row-based) logs and their failure modes.</li>
+  <li>Ch. 7 "Atomic Commit and Two-Phase Commit" — log records are the substrate of 2PC's prepare/commit.</li>
+  <li>Ch. 11 "Databases and Streams" — change capture from the WAL is the foundation of stream pipelines.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd lead with the contract — append-then-flush before ack — and only then talk about group commit, because all the latency tricks are optimizations of that single rule."</li>
+  <li>"I'd call out fsyncgate explicitly: fsync errors are unrecoverable in many kernels, so the engine must crash-and-recover, not retry."</li>
+  <li>"I'd separate physical (page-image) and logical (row) logs; logical logs power CDC and cross-version replication, but recovery uses physical for speed."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Append-only sequential file layout</td>
+      <td>Sequential writes are 10-100x faster than random on every storage medium — the foundational reason DDIA Ch. 3 introduces logs as a primitive. No seeks, no fragmentation, and replay is a single forward pass that the OS readahead can prefetch.</td>
+      <td>In-place log (random writes destroy throughput); B-tree-indexed log (defeats the point — log doesn't need lookup, only append + scan).</td>
+    </tr>
+    <tr>
+      <td>Group commit (leader/follower pattern)</td>
+      <td>The Helland/Mohan classic: one fsync amortizes hundreds of waiting writes, taking sync throughput from ~1k tps (per-tx fsync) to 100k+ tps. This is the #1 lever DDIA implies whenever it says "synchronous durability is fast on modern disks."</td>
+      <td>Per-tx fsync (caps tps at 1/fsync_latency); async commit (different durability contract — RPO &gt; 0 by design).</td>
+    </tr>
+    <tr>
+      <td>fsync() / fdatasync() with fsyncgate-aware error handling</td>
+      <td>fsync is the only POSIX primitive that crosses the kernel-page-cache to durable storage barrier. Linux's "fsyncgate" means errors are not retryable — most engines now panic on fsync error to avoid silent data loss, exactly as DDIA Ch. 8 warns about unreliable storage primitives.</td>
+      <td>fdatasync alone (skips file metadata — fine if size is preallocated); sync_file_range (advisory, no durability guarantee); msync (only useful with mmap, opaque ordering).</td>
+    </tr>
+    <tr>
+      <td>O_DIRECT + aligned 4 KB buffers</td>
+      <td>Bypasses the OS page cache so latency is predictable (no cache-thrash interference) and writes don't double-buffer through dirty pages. Required for tight tail-latency SLAs on NVMe where fsync ~50-200 us is dominated by software path.</td>
+      <td>Buffered I/O (page cache pollution from log streaming evicts hot user data); mmap (page-fault stalls on write barrier — see DDIA Ch. 3's critique of mmap-based engines).</td>
+    </tr>
+    <tr>
+      <td>Pre-allocated, zero-filled segments</td>
+      <td>Avoid filesystem block-allocation latency spikes during fsync (extending a file forces metadata journal updates). Recycling closed segments by rename is O(1) and keeps fsync latency on the active segment stable.</td>
+      <td>Append to single growing file (each fsync may extend the file — variable latency); per-record file (inode storm).</td>
+    </tr>
+    <tr>
+      <td>CRC32C per record + sector-aligned records</td>
+      <td>Detects torn writes and silent corruption at replay. Records that don't cross 4 KB sector boundaries make tearing detectable: a partial sector write produces a CRC mismatch which is the canonical end-of-log marker. Hardware-accelerated on x86/ARM so cost is near zero.</td>
+      <td>No checksum (silent corruption surfaces months later); SHA-256 (overkill for tear detection, costs 10x); xxHash (faster but ecosystem standardized on CRC32C).</td>
+    </tr>
+    <tr>
+      <td>LSN as monotonic 64-bit counter</td>
+      <td>A single global sequence number ties every log record, page, and replication offset together. ARIES idempotency rule (apply only if pageLSN &lt; recordLSN) and follower tailing both depend on LSN monotonicity — the abstraction that makes DDIA Ch. 5's replication-from-WAL strategy possible.</td>
+      <td>Per-table or per-shard sequences (cross-shard ordering becomes a separate problem); timestamp-based (clock skew breaks monotonicity).</td>
+    </tr>
+    <tr>
+      <td>ARIES three-pass recovery (analysis, redo, undo)</td>
+      <td>Handles partial transactions, crashes during recovery, and fine-grained locking simultaneously. Analysis rebuilds the dirty-page table and active-tx table from the checkpoint forward; redo replays everything; undo rolls back losers using CLRs to make undo idempotent across nested crashes.</td>
+      <td>Redo-only recovery (cannot abort losers, requires force-at-commit which kills throughput); shadow paging (no fine-grained locking).</td>
+    </tr>
+    <tr>
+      <td>Lock-free ring buffer (or per-core buffers) for in-flight records</td>
+      <td>Multi-producer concurrent appends without a global mutex — a single mutex on append becomes the throughput ceiling above ~16 cores. Per-core buffers merged at flush time (TiKV's raft-engine pattern) push the ceiling further.</td>
+      <td>Mutex-protected buffer (lock contention dominates above ~16 cores); pipe/socket (extra copy, no bulk fsync).</td>
+    </tr>
+    <tr>
+      <td>Checkpoints with dirty-page table fence</td>
+      <td>Bound recovery time = log volume since last checkpoint. The checkpoint record carries the dirty-page table and active-tx list so analysis pass starts cheaply, and segments below the checkpoint LSN become safe to truncate.</td>
+      <td>No checkpointing (replay time grows unbounded); fuzzy checkpoint without DPT (analysis must scan entire log).</td>
+    </tr>
+    <tr>
+      <td>Physical (page-image) log for recovery, logical (row-based) for replication/CDC</td>
+      <td>Physical logs are fast to apply (just memcpy a page) so recovery hits its 1 GB / 30 s target. Logical logs (row before/after images, like MySQL ROW binlog or Postgres pgoutput) decouple primary and replica versions and double as a CDC bus — DDIA Ch. 11's "WAL is the change-data feed" insight.</td>
+      <td>Statement-based (broken by NOW(), nondeterministic functions — DDIA Ch. 5); physical-only (couples replicas to primary engine version, no CDC).</td>
+    </tr>
+    <tr>
+      <td>Replication slots / retention floor for followers</td>
+      <td>Truncation must respect the slowest replica's read offset; otherwise a slow follower has to be rebuilt from a base backup. Postgres replication_slots hold the LSN floor exactly for this reason — the DDIA Ch. 5 "replication lag" pattern surfaced as an operational primitive.</td>
+      <td>Truncate by time/age (slow replicas force rebuild — most common cause of disk-full incidents goes the other way); no follower tracking (correctness violation).</td>
+    </tr>
+    <tr>
+      <td>FUA / disabled volatile write cache on critical drives</td>
+      <td>Disk firmware write caches lie about durability on power loss unless they're battery-backed (PLP). FUA (Force Unit Access) bypasses the cache for individual writes; alternatively the cache can be disabled cluster-wide. Without this, fsync gives only "process-crash" durability, not "power-loss" durability.</td>
+      <td>Trust consumer disk caches (silent data loss on power cut); UPS-only (doesn't help if the host kernel panics with cached writes).</td>
+    </tr>
+    <tr>
+      <td>Multiple parallel WAL streams (TiKV raft-engine style)</td>
+      <td>One sequential fsync chain is the global throughput ceiling on cloud block storage where fsync is ~1 ms. Sharding the WAL by Raft group (or hash) and fsyncing in parallel lifts the ceiling linearly with disk bandwidth — the only way to scale a Raft cluster past ~30k ops/s/group as flagged in §9.</td>
+      <td>Single WAL (caps throughput at one disk's fsync rate); WAL on faster disk (helps but doesn't scale past one device).</td>
+    </tr>
+  </tbody>
+</table>

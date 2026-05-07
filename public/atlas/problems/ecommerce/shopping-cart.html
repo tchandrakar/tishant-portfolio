@@ -1,0 +1,145 @@
+<h1>Design Shopping Cart (multi-device, persistence, abandoned-cart)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ecommerce</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a shopping cart service for a global e-commerce site: 200M users, multiple devices per user, guest carts that merge on login, durable persistence across sessions, and an abandoned-cart pipeline that nudges buyers via email/push within minutes of inactivity. The cart is read 10x more than it's written and must feel instant on mobile.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Add, update qty, remove items; apply coupons; estimate totals.</li>
+  <li>Guest cart (cookie-based) merges with user cart on login.</li>
+  <li>Multi-device sync: change on phone visible on desktop within 1 s.</li>
+  <li>Survive across sessions for 90 days.</li>
+  <li>Abandoned-cart detection and notification (15 min, 24 h, 72 h triggers).</li>
+  <li>Real-time price/stock refresh when cart is opened.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> read p99 &lt; 50 ms, write p99 &lt; 100 ms.</li>
+  <li><b>Scale:</b> 200M MAU, 30M DAU, 500k cart writes/s peak, 5M reads/s peak.</li>
+  <li><b>Durability:</b> never lose an item due to server failure.</li>
+  <li><b>Availability:</b> 99.99% — cart unavailability tanks conversion.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 5M reads/s (cart preview on every page nav), 500k writes/s peak.</li>
+  <li>Storage: 200M users * 2 KB avg cart = 400 GB hot; 90-day TTL ⇒ ~5 TB warm.</li>
+  <li>Abandonment job: 30M DAU * 60% abandon = 18M nudges/day.</li>
+  <li>Network: 100 Gbps internal at peak.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET    /v1/cart                  → {items, totals, coupons}
+POST   /v1/cart/items   {sku, qty}        → cart
+PATCH  /v1/cart/items/{sku}  {qty}        → cart
+DELETE /v1/cart/items/{sku}              → cart
+POST   /v1/cart/merge   {guestCartId}     → cart
+POST   /v1/cart/coupon  {code}            → cart
+WS     /v1/cart/subscribe                 → push updates</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Phone]   [Desktop]   [Tablet]
+   |         |          |
+   +----+----+----+-----+
+        v         v
+     [API GW]  [WS GW] -- multi-device push
+        |         |
+        v         v
+     [Cart Svc] -------- [Pub/Sub: cart-changed]
+        |
+   +----+----+
+   |         |
+[Redis]   [DynamoDB]   [Pricing Svc]   [Stock Svc]
+(cache)   (durable)
+   |
+   v
+[Kafka cart-events] -&gt; [Abandon Detector] -&gt; [Notif]
+                    -&gt; [Analytics]
+</div>
+<p>Cart svc is stateless. DynamoDB is the durable store; Redis is a write-through cache. Pub/Sub broadcasts to other open sessions of the same user.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 DynamoDB cart</h3>
+<pre>PK = userId   (or guestCartId for guests)
+SK = "META"   → {coupon, currency, updatedAt, version}
+SK = "ITEM#{sku}"  → {qty, addedAt, priceSnapshot}
+TTL on guest carts: 7 days; user carts: 90 days.</pre>
+<h3>7.2 Redis cache</h3>
+<pre>cart:{userId} HASH  -- mirror of DDB items
+TTL 1h, refreshed on read; write-through on update.</pre>
+<h3>7.3 Why DynamoDB?</h3>
+<p>Single-key access pattern (always by userId), predictable p99, native TTL for guest cart cleanup, and global tables if we go multi-region. We don't need joins; a relational DB would be over-engineering.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Cart writes</h3>
+<p>Optimistic concurrency: client sends <code>If-Match: version=N</code>. Server does a conditional write on DynamoDB <code>version</code> attribute. On conflict, return 409 with the latest cart so the client merges and retries. Total latency budget: 1 round trip to DDB + cache fill.</p>
+<h3>8.2 Multi-device sync</h3>
+<p>On every successful write, publish <code>{userId, version}</code> to Pub/Sub. WS gateway holds a per-user channel; clients connected on other devices receive an "invalidate" signal and re-fetch. Bandwidth-efficient (no item payload over WS).</p>
+<h3>8.3 Guest-to-user merge</h3>
+<p>On login, server reads guest cart by cookie ID and user cart, then merges by SKU (sum qty, capped by ATP). Conflict resolution: prefer most recent <code>addedAt</code> for non-numeric fields. Atomic via a DDB transaction.</p>
+<h3>8.4 Abandoned cart pipeline</h3>
+<p>Each cart-event in Kafka updates a per-user "last activity" timestamp in Redis. A scheduled job (every 60 s) scans for users idle &gt; 15 min with non-empty carts; emits a notification job. Cooldowns prevent spamming. ML model selects channel and copy.</p>
+<h3>8.5 Price/stock refresh</h3>
+<p>On cart open, async fan-out to Pricing &amp; Stock services for each SKU; cart svc updates price/availability in cache and notifies the client over WS if anything changed (e.g., "price dropped" badge).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot users (test accounts, scrapers):</b> per-key write rate limiter; backoff response.</li>
+  <li><b>Cache stampede on viral SKU:</b> request coalescing in Redis (single-flight); negative caching of "no cart".</li>
+  <li><b>WS connection storms:</b> sticky-by-user routing + connection limits; fall back to long-poll.</li>
+  <li><b>Cross-region carts:</b> DDB global tables; conflict resolved by max(version) + LWW per item.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>DynamoDB durable, Redis cache</td><td>Fast + safe</td><td>Two stores to keep consistent</td></tr>
+<tr><td>Optimistic concurrency</td><td>No locks, scales</td><td>Client must handle 409 retries</td></tr>
+<tr><td>WS push for sync</td><td>1s freshness</td><td>Complex infra; falls back gracefully?</td></tr>
+<tr><td>Async price refresh</td><td>Fast cart open</td><td>Brief stale price window</td></tr>
+<tr><td>Event-driven abandon detection</td><td>Decoupled, easy A/B</td><td>Pipeline lag during incidents</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — DDB global tables; LWW conflict resolution and its hazards.</li>
+  <li>Ch. 7 Transactions — atomic merge on login via DDB transactions; CAS on version.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — when "read your writes" matters for the cart UX.</li>
+  <li>Ch. 11 Stream Processing — Kafka cart-events feeding the abandonment job and analytics.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I treat the cart as a single-key document with optimistic concurrency — it's the simplest correct model and scales linearly."</li>
+  <li>"The trickiest UX is multi-device sync; I push invalidation, not data, to keep the WS layer cheap."</li>
+  <li>"Abandoned-cart is a streaming pipeline, not a cron over a DB scan; it's how you stay real-time and avoid hot-spotting your OLTP store."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>DynamoDB (durable cart)</td><td>Cart is a single-key document accessed by userId — exactly DynamoDB's sweet spot. Predictable single-digit ms p99, native TTL for guest cart cleanup (7 days) and user cart (90 days), and Global Tables for multi-region. 200M users × 2 KB = 400 GB hot fits comfortably without re-sharding.</td><td>Postgres (no joins needed, would be over-engineering at 500k writes/s); Cassandra (more ops overhead for the same shape).</td></tr>
+<tr><td>Redis (write-through cache)</td><td>5M cart reads/s on every page nav cannot hit DynamoDB directly without breaking budget — Redis at sub-ms p99 absorbs this. Write-through to DDB on every update keeps cache and durable store consistent. TTL 1h auto-expires cold carts.</td><td>Memcached (no atomic ops for cart-version CAS); local in-process cache (no cross-pod consistency).</td></tr>
+<tr><td>Optimistic concurrency (version)</td><td>Multi-device sync on the same userId can produce concurrent writes. Conditional writes on the DDB version attribute with If-Match: version=N let us avoid distributed locks; on 409 the client merges and retries. Scales to 500k writes/s without locks.</td><td>Pessimistic locks (kills throughput, adds latency); LWW (loses items on race).</td></tr>
+<tr><td>WebSockets (multi-device sync)</td><td>1-second freshness across phone/desktop/tablet requires push, not poll — polling at 5M MAU would melt the API. WS gateway pushes only an "invalidate {userId, version}" signal (not the cart payload), keeping bandwidth tiny while devices re-fetch fresh state from the cache.</td><td>Long-poll (extra round trips, higher tail latency); SSE (one-way is fine but WS already supports both directions for typing/etc); push payloads (10x bandwidth cost).</td></tr>
+<tr><td>Pub/Sub (per-user channel)</td><td>The WS gateway is horizontally sharded; a write on Pod A must reach a client connected to Pod B. A Pub/Sub topic per userId fans the invalidate signal to whichever gateway holds the user's WS. Stateless gateways scale linearly with users.</td><td>Sticky-by-user load balancer only (rebalances drop connections); direct service-to-service (full mesh, fragile).</td></tr>
+<tr><td>Kafka (cart-events)</td><td>The abandoned-cart pipeline needs every cart change as a stream so we can update last-activity in &lt; 1 s and trigger 15-min/24-h/72-h nudges. 18M nudges/day at 60% abandonment requires partition-by-userId so per-user ordering is preserved through the abandon detector.</td><td>RabbitMQ (no replay for retroactive analytics); cron over DDB scan (kills OLTP, latency hours).</td></tr>
+<tr><td>DynamoDB Transactions (merge)</td><td>Guest-to-user merge on login must atomically read both carts, merge by SKU, write the union, and delete the guest cart. DDB transactions give multi-item atomicity in one call without a distributed coordinator; idempotent on retry by transaction-token.</td><td>Two-phase app-level merge (race window leaves orphan items); Saga (overkill for a single user-action).</td></tr>
+<tr><td>API Gateway + token bucket</td><td>Hot users (test accounts, scrapers, bots) can blow through 500k writes/s budget. Per-key write rate limit at API GW (e.g., 20 writes/s per user) returns 429 cheaply before pods waste DDB capacity. WAF blocks crude bot floods upstream.</td><td>App-layer rate limit (already burned a hop); no rate limit (hot key burns shard capacity).</td></tr>
+<tr><td>DynamoDB TTL</td><td>Guest carts (7 days) and user carts (90 days) auto-expire via DDB native TTL — no scheduled job, no manual cleanup. At 200M users, a sweep job would itself be a SPOF. TTL is async but fine because expiry is a soft contract.</td><td>Custom cleanup cron (operational burden); never expire (storage cost grows linearly).</td></tr>
+<tr><td>DDB Global Tables (multi-region)</td><td>Cross-region carts (user shops on US laptop then opens cart on EU phone) need geo-replicated state. Global Tables replicate within seconds; conflict resolved by max(version) + LWW per item, acceptable for cart UX. Cart is not financial-grade so LWW is fine here.</td><td>Single-region with cross-region read (high latency); manual sync via Kafka (bug-prone).</td></tr>
+<tr><td>Pricing/Stock svc fan-out</td><td>On cart open, we fan out async per-SKU to Pricing + Stock so the cart-open response is fast (cached cart) while a "price dropped" badge updates over WS. Avoids the blocking N+1 lookup that would push read p99 past 50 ms.</td><td>Synchronous pricing on cart-read (kills p99); precomputed prices in cart (stale, must invalidate on every price change).</td></tr>
+<tr><td>Single-flight in Redis</td><td>Cache stampede on a viral SKU (everyone clicks the deal at once) would multiplex thousands of concurrent DDB reads through one cold Redis key. Single-flight (one fetch, others wait) and negative caching of "no cart" cap origin reads at one per key per refresh.</td><td>Naive per-request fetch (DDB throttles); pre-warming (we don't know what's viral in advance).</td></tr>
+</tbody>
+</table>
+

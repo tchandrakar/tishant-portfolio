@@ -1,0 +1,137 @@
+<h1>Design Google Meet (browser-based VC, WebRTC)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a browser-first video conferencing service that requires no install. All clients use WebRTC over getUserMedia/MediaStream APIs. Must integrate with Google Calendar, support Workspace SSO, and provide enterprise-grade compliance (SOC2, HIPAA-eligible). Live captions, noise cancellation, and meeting recordings are first-class.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Calendar-driven meeting creation; one-click join from invite.</li>
+  <li>Up to 1000 participants in Enterprise; 500 audio+video tiles.</li>
+  <li>Live closed captions and translation in 30+ languages.</li>
+  <li>In-meeting chat, polls, Q&amp;A, hand raise, breakout rooms.</li>
+  <li>Recording to Google Drive; auto-generated transcript in Docs.</li>
+  <li>Companion mode (2nd device for chat while in conf room).</li>
+  <li>Phone dial-in (Google Voice / PSTN gateway).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> mouth-to-ear < 200 ms p95 inter-region; < 100 ms intra-region.</li>
+  <li><b>Scale:</b> 100M DAU, peak 10M concurrent meetings.</li>
+  <li><b>Browser-only path:</b> no plugin, must work on Chrome/Safari/Edge.</li>
+  <li><b>Compliance:</b> data residency by domain; E2E option for premium.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Concurrent participants:</b> 10M meetings * avg 4 = 40M peak peers.</li>
+  <li><b>Bandwidth:</b> 40M * 1 Mbps up + 1 Mbps down (avg) = 80 Tb/s.</li>
+  <li><b>SFU servers:</b> at 2K participants/host → 20K SFU instances.</li>
+  <li><b>Captioning:</b> 40M streams piped to ASR; ASR throughput needs ~400K GPUs assuming 100 streams/GPU; in practice batched on TPUs.</li>
+  <li><b>Recording:</b> assume 5% recorded * 30 min avg * 0.6 Mbps = 100 PB/year stored to Google Drive.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/spaces                {calendarEventId}    → spaceId, joinUri
+POST /v1/spaces/{id}/join       {ssoToken}          → mediaServer, iceCreds
+WS   /v1/signal/{spaceId}       (per-meeting)       ↔ SDP/ICE/control
+GET  /v1/captions/{spaceId}     (SSE)               ↔ {ts, lang, text}
+POST /v1/recordings             {spaceId, layout}   → recordingId</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Chrome]--WebRTC-->[Google Front End (GFE)]--->[Signaling/Spanner]
+                                              |
+                                              +--->[SFU PoP (Borg)]<---->[SFU PoP (peer region)]
+                                                            |
+                                                            +-->[Captioner: Speech-to-Text]
+                                                            +-->[Recorder]-->[Drive/Colossus]
+                                                            +-->[NoiseSuppressor (Lyra)]
+</div>
+<p>Walk-through: client establishes DTLS/SRTP with the nearest SFU PoP via GFE-routed signaling. SFU forwards packets among peers; ASR taps the audio stream for captions; recorder is a virtual participant that composites and uploads to Drive.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Spaces (Spanner)</h3>
+<pre>CREATE TABLE spaces (
+  space_id STRING(36) NOT NULL,
+  org_id STRING(36), calendar_event_id STRING(64),
+  data_region STRING(8), e2e_enabled BOOL,
+  created_at TIMESTAMP,
+) PRIMARY KEY (space_id);
+CREATE TABLE participants (
+  space_id STRING(36), user_id STRING(36),
+  joined_at TIMESTAMP, role STRING(16),
+) PRIMARY KEY (space_id, user_id), INTERLEAVE IN PARENT spaces;</pre>
+<p>Spanner gives multi-region strong consistency for org policies (data residency, recording opt-in) which need transactional updates across replicas.</p>
+<h3>7.2 Captions store</h3>
+<p>Streamed to Bigtable keyed by (space_id, ts) for fast retrieval; flushed to Drive transcript on meeting end.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 WebRTC stack in browser</h3>
+<p>Uses VP9 SVC (3 spatial * 3 temporal layers) for video and Opus for audio. SVC enables single-encode that the SFU can forward partial layers per subscriber — saves CPU vs simulcast.</p>
+<h3>8.2 SFU on Borg</h3>
+<p>Stateful service; participant pinned to SFU for meeting lifetime; if SFU crashes, client reconnects, ICE-restart picks new SFU within 2s (one tile flicker).</p>
+<h3>8.3 Captioner</h3>
+<p>Audio forked at SFU into Speech-to-Text streaming API; partial transcripts pushed via SSE to all participants. Translation pipelined by Google NMT for non-source languages.</p>
+<h3>8.4 Lyra noise cancellation</h3>
+<p>Runs client-side via WASM/WebGL — zero server cost, but a server-side fallback exists for low-power devices via the SFU's audio mixer.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Large meetings (1000-person):</b> SFU subscribes only to top-N speakers via dominant-speaker detection (DSD); other tiles show static avatars.</li>
+  <li><b>Cross-region meetings:</b> cascade SFU mesh — each region runs its own SFU, peer-to-peer relay between SFUs over Google's backbone.</li>
+  <li><b>ICE/TURN:</b> Google's TURN ridges run on the same Borg cluster; ~15% of users need them.</li>
+  <li><b>Captioning latency:</b> ASR adds ~300 ms; mitigate by streaming partials every 100 ms.</li>
+  <li><b>Data residency:</b> Spanner placement rules pin space metadata to org's region; SFUs chosen accordingly even if it costs latency.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>VP9 SVC vs simulcast</td><td>Single encode, less upload BW</td><td>Decoder complexity, CPU on weak clients</td></tr>
+<tr><td>Browser-only (no native app)</td><td>Zero install friction</td><td>Browser bugs hit you, no kernel hooks</td></tr>
+<tr><td>SFU forwarding</td><td>Cheap, scalable</td><td>Client must decode N streams</td></tr>
+<tr><td>Spanner for control plane</td><td>Strong consistency, multi-region</td><td>Higher write latency, cost</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 9 Consistency &amp; Consensus — Spanner's TrueTime for control plane.</li>
+  <li>Ch. 5 Replication — multi-leader for SFU mesh in cascaded mode.</li>
+  <li>Ch. 11 Stream Processing — captions pipeline as a streaming dataflow.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"WebRTC in the browser dictates a lot — I work backwards from the supported codecs (VP9, Opus, H.264) and the JS APIs."</li>
+  <li>"Dominant-speaker detection is what lets me serve a 1000-person meeting on a single SFU — I'm not sending 999 streams to each client."</li>
+  <li>"Compliance is the underrated hard part: data residency means picking SFU PoP based on policy not just latency, and recordings must land in the org's region of Drive."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b><code>WebRTC</code> (browser-only)</b></td><td>Zero-install requirement on Chrome/Safari/Edge means leveraging the browser's built-in <code>WebRTC</code> stack — getUserMedia, RTCPeerConnection, DTLS-SRTP — for 40M peak peers without distributing native binaries.</td><td>Native app (like Zoom) — install friction violates product principle; Flash — dead</td></tr>
+    <tr><td><b>VP9 SVC</b></td><td>Single encode emits 3 spatial × 3 temporal layers; SFU drops layers per subscriber rather than running 3-layer simulcast — saves CPU on weak Chromebook publishers, critical when up to 1000 participants need to publish simultaneously.</td><td>Simulcast — 3× upload bandwidth per publisher; AV1 — encoder cost too high for browser CPUs in 2024</td></tr>
+    <tr><td><b>Opus codec</b></td><td>Adaptive 6–510 kbps audio with built-in PLC and 20ms frames — the only codec that handles voice and music smoothly, mandatory in <code>WebRTC</code> spec.</td><td>G.711 — narrowband only; AAC-LD — not <code>WebRTC</code>-native</td></tr>
+    <tr><td><b>Spanner</b></td><td>Org policies (data residency, recording opt-in, e2e_enabled) need transactional updates across multi-region replicas; TrueTime gives external consistency so a policy change can't be applied unevenly across SFU PoPs.</td><td>Bigtable — no transactions for policy edits; CockroachDB — Google internal preference</td></tr>
+    <tr><td><b>Bigtable (captions)</b></td><td>Caption streams keyed by (space_id, ts) for fast retrieval during live and post-meeting transcript flush; append-heavy with low-latency single-row reads matches Bigtable strengths perfectly.</td><td>Spanner — overkill cost for append-only data; Postgres — no horizontal write scale</td></tr>
+    <tr><td><b>Borg (SFU hosting)</b></td><td>SFUs are stateful services pinned to participants for meeting lifetime; Borg's bin-packing + binary-rolling-update mechanics handle the 20K SFU instances better than k8s does in 2024.</td><td>k8s — fine externally but Borg is the Google-internal default; bare-metal — no fast bursting</td></tr>
+    <tr><td><b>Speech-to-Text streaming API</b></td><td>30+ language live captions need partial transcripts every 100ms; Google's batched-on-TPU ASR delivers ~300ms inference latency on 40M concurrent streams in the captioning fleet.</td><td>Per-language models in-house — model zoo maintenance burden; Whisper — not optimized for streaming partials</td></tr>
+    <tr><td><b>Lyra (WASM noise cancellation)</b></td><td>Runs client-side via WASM/WebGL — zero server cost on 100M DAU and works offline; server-side fallback exists for low-power devices via the SFU mixer.</td><td>RNNoise — less effective; server-side only — adds 80 Tb/s of audio backhaul</td></tr>
+    <tr><td><b>SSE (Server-Sent Events)</b></td><td>Caption streaming to all participants is unidirectional and HTTP-friendly; SSE works through corporate firewalls where WebSocket sometimes doesn't.</td><td>WebSocket — bidirectional overhead unneeded; long-polling — higher latency</td></tr>
+    <tr><td><b>Google Front End (GFE)</b></td><td>Termination of HTTPS/QUIC at edge with sub-50ms anycast routing to nearest signaling cluster; integrates Workspace SSO + DDoS protection in one tier.</td><td>Cloud Load Balancer — fine externally, GFE is Google's internal optimized variant; nginx fleet — operational overhead</td></tr>
+    <tr><td><b>STUN/TURN on Borg</b></td><td>~15% of users need TURN relay; Google's TURN ridges run on the same Borg cluster as SFUs to amortize bare-metal capacity instead of running a separate cluster.</td><td>Public STUN — no relay capacity; third-party TURN — privacy leak for enterprise traffic</td></tr>
+    <tr><td><b>Cascaded SFU mesh</b></td><td>Cross-region meetings relay between regional SFUs over Google's private backbone instead of every peer crossing oceans; saves transatlantic bandwidth and gives each user a local low-latency SFU.</td><td>Single-region SFU — 250ms+ latency for far peers; full mesh per meeting — quadratic backbone usage</td></tr>
+    <tr><td><b>Dominant Speaker Detection</b></td><td>1000-person meetings can't subscribe everyone to everyone; DSD selects top-N speakers and shows static avatars for silent participants — without it, the SFU forward bandwidth scales as N².</td><td>Always-all — won't fit in any network or client decode budget; manual pin — bad UX</td></tr>
+    <tr><td><b>Colossus (Drive backend)</b></td><td>100 PB/year of recordings written to Google's distributed file system; integrates with Drive ACLs so org admins can enforce retention and data-residency rules transactionally.</td><td>S3 — multi-cloud unnecessary; HDFS — Google internal Colossus is the established option</td></tr>
+  </tbody>
+</table>

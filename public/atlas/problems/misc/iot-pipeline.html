@@ -1,0 +1,141 @@
+<h1>Design IoT Data Pipeline (1B devices, MQTT → time-series store)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">misc</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a telemetry ingestion pipeline for 1 B connected devices (smart meters, vehicles, sensors) emitting one reading every 30 s on average over MQTT. Data lands in a time-series store for queries (last value, last 24 h, monthly aggregates) and is forked into a stream-processing tier for alerts. Comparable scale: AWS IoT Core (trillions of msgs/year), Tesla fleet telemetry, John Deere connected farm.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Devices connect via MQTT 5 over TLS, publish to <code>tenants/{t}/dev/{id}/...</code>.</li>
+  <li>Bidirectional: server can push commands (firmware update, config) to a device.</li>
+  <li>Per-device shadow (last-known state) accessible by REST.</li>
+  <li>Time-series store keeps 13 months at 1-min raw + 5-yr at 1-h rollups.</li>
+  <li>Real-time rules engine: trigger on threshold (e.g. temp &gt; 80 °C) within 5 s.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 1 B devices × 1 msg/30 s = ~33 M msg/s steady-state, ~80 M/s peak.</li>
+  <li><b>Latency:</b> ingest-to-rule-eval &lt; 5 s p99; shadow read &lt; 50 ms.</li>
+  <li><b>Connection density:</b> 100 K simultaneous TLS conns per broker pod, 10 K broker pods.</li>
+  <li><b>Durability:</b> no data loss on broker failure; QoS 1 end-to-end.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>33 M msg/s × 200 B = 6.6 GB/s ingress = ~570 TB/day raw.</li>
+  <li>Compress 8× (numeric, repeated tags) → 70 TB/day, ~25 PB/yr at 13-month raw.</li>
+  <li>Rollups 1-min → 1-h (60×): keep 5 yr = ~2 PB.</li>
+  <li>Kafka cluster: 80 M/s × 1 KB × replication-3 = 240 GB/s → ~2400 brokers (100 MB/s each).</li>
+  <li>~10 K MQTT broker pods (EMQX/HiveMQ); 100 K conn/pod = 1 B device capacity.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre># Device side (MQTT)
+PUBLISH tenants/acme/dev/1234/telemetry  payload={ts,t,p,batt}  QoS=1
+SUBSCRIBE tenants/acme/dev/1234/cmd                                     # for commands
+
+# Cloud REST
+GET  /v1/devices/{id}/shadow                              → {state,ts}
+POST /v1/devices/{id}/cmd            {op,args}            → {jobId}
+GET  /v1/query?dev=&amp;metric=&amp;from=&amp;to=&amp;agg=avg&amp;step=1m      → series</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Device] --MQTT/TLS--&gt; [NLB] --&gt; [MQTT broker pool] --&gt; [Kafka: telemetry]
+                                       |                        |
+                                       v                        +--&gt; [Flink: rules engine] --&gt; [Alert svc]
+                                 [Auth + ACL svc]               +--&gt; [Flink: rollups]      --&gt; [TSDB rollups]
+                                                                +--&gt; [Spark: archival]      --&gt; [S3 Parquet]
+                                                                +--&gt; [Shadow updater]       --&gt; [Cassandra shadow]
+                                                                +--&gt; [TimescaleDB/Druid raw]
+[Browser] &lt;-- [Query API] &lt;-------------------------------------------+
+[Backend] -- /cmd -- [Cmd svc] --&gt; [Kafka: cmd] --&gt; [Broker] --&gt; [Device]
+</div>
+<p>Walk-through: TLS-terminated NLBs spread connections across MQTT brokers. The broker authenticates the device cert, applies topic ACLs, and republishes payloads onto Kafka. Multiple Flink jobs consume the same Kafka topic — fan-out, not fan-in — so rules, rollups, archival, and shadow updates are independent.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Time-series (Druid / TimescaleDB)</h3>
+<pre>-- Timescale hypertable
+CREATE TABLE readings (
+  ts TIMESTAMPTZ, dev_id BIGINT, metric SMALLINT, value DOUBLE PRECISION
+);
+SELECT create_hypertable('readings','ts',
+  chunk_time_interval =&gt; INTERVAL '1 hour',
+  partitioning_column =&gt; 'dev_id', number_partitions =&gt; 256);</pre>
+<h3>7.2 Device shadow (Cassandra)</h3>
+<pre>CREATE TABLE shadow (
+  dev_id BIGINT PRIMARY KEY, last_seen timestamp, state map&lt;text,text&gt;, version BIGINT
+);</pre>
+<h3>7.3 Why these stores?</h3>
+<p>Druid is unrivaled for scan-heavy time-series queries with high cardinality on <code>dev_id</code>. Cassandra's wide rows + LSM perfectly fit the "1 row per device, frequently overwritten last-state" pattern. S3 Parquet is the cold archive — cheap, scannable from Athena/Trino. See DDIA Ch. 6 on partitioning by composite (tenant, dev_id, time).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 MQTT broker tier</h3>
+<p>EMQX clustered with shared subscriptions. TLS session resumption keeps reconnect cost low. Each broker maintains an in-memory routing table; cross-broker delivery via internal gossip + Kafka backbone for QoS 1 durability.</p>
+<h3>8.2 Sharding key</h3>
+<p>Kafka partition = <code>hash(tenant_id, dev_id) % 4096</code>. Co-locates a device's traffic on one partition so rule state can be local. Avoids hot-shard with random suffix bucketing for a small set of mega-tenants.</p>
+<h3>8.3 Rules engine (Flink)</h3>
+<p>RocksDB-backed keyed state per device; checkpoints to S3 every 30 s. Watermark = max(event_time) − 60 s, so out-of-order packets from cellular networks still land in the right window. Materialized rules compiled to bytecode for &lt; 100 µs/event eval.</p>
+<h3>8.4 Downlink commands</h3>
+<p>Cmd service writes to Kafka <code>cmd</code> topic; brokers subscribe and route to the connected broker holding the session. If the device is offline, persist in Cassandra and replay on reconnect (LWT for "claimed").</p>
+<h3>8.5 Backpressure</h3>
+<p>If Kafka lag &gt; 30 s, brokers downgrade QoS to 0 for non-critical metrics and drop telemetry classes B/C — graceful degradation per the device contract.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Connection storms (post-outage reconnect):</b> jittered reconnect on device, plus broker-side rate limit on auth (1 K/s/pod).</li>
+  <li><b>Cardinality explosion:</b> 1 B dev_ids in TSDB tag indexes — partition by tenant, use roaring bitmaps (Druid).</li>
+  <li><b>Hot tenants:</b> top 1% of customers can drive 50% of traffic — dedicated Kafka topics per VIP tenant + dedicated Flink jobs.</li>
+  <li><b>Cross-region replication:</b> regional brokers and TSDB; cross-region only for global rollups via S3.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>MQTT vs HTTP-long-poll</td><td>Cheap conn, push, QoS</td><td>Operational complexity, less LB tooling</td></tr>
+<tr><td>QoS 1 e2e</td><td>No data loss</td><td>Duplicates → consumers must dedupe</td></tr>
+<tr><td>Druid raw + S3 cold</td><td>Fast queries on hot, cheap on cold</td><td>Two query layers</td></tr>
+<tr><td>Cell-local Flink state</td><td>Sub-ms rule eval</td><td>State migration on rebalance</td></tr>
+<tr><td>One Kafka spine</td><td>Replay, audit</td><td>Single-tenant blast radius</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — composite key partitioning, hot-shard mitigation.</li>
+  <li>Ch. 11 Stream Processing — exactly-once-effectively via Kafka + Flink checkpoints; watermarks for late events.</li>
+  <li>Ch. 12 Future of Data Systems — lambda vs kappa; this design is kappa-leaning with raw Kafka as system-of-record.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd defend MQTT over HTTP/2 explicitly: at 1 B devices, TCP/TLS overhead and persistent-conn semantics matter more than ecosystem familiarity."</li>
+  <li>"Cardinality is my biggest fear — the moment a customer adds a UUID tag per reading, Druid lookups fall over. I'd reject high-cardinality tags at the schema layer."</li>
+  <li>"For the rules engine, exactly-once is achievable inside Flink, but downstream alert delivery is at-least-once over the internet — same trap as the webhook problem."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>EMQX (MQTT broker)</td><td>1 B devices need 100 K simultaneous TLS connections per pod across 10 K pods; EMQX clusters battle-tested at 100 M-conn scale with shared subscriptions and Kafka bridge — exactly the topology our 33 M msg/s spine demands.</td><td>HiveMQ (commercial, similar but pricier); Mosquitto (single-node, no cluster).</td></tr>
+    <tr><td>MQTT 5 over TLS</td><td>Cheap persistent connections (~3 KB RAM each) are mandatory at 1 B devices; QoS 1 + retained messages match the device-shadow semantics, and TLS 1.3 0-RTT keeps reconnect storms tractable.</td><td>HTTP/2 long-poll (10× connection overhead); CoAP (UDP, but no enterprise tooling).</td></tr>
+    <tr><td>Apache Kafka (telemetry spine)</td><td>80 M msg/s peak × 1 KB × 3-replica = 240 GB/s requires ~2400 brokers; Kafka's append log gives every Flink/Spark consumer independent fan-out without re-reading from devices, satisfying the kappa architecture.</td><td>Pulsar (less mature at 240 GB/s); RabbitMQ (no log semantics, ceiling at 1 M msg/s).</td></tr>
+    <tr><td>Apache Flink (rules engine)</td><td>Stateful keyed state with RocksDB backing handles &lt; 5 s ingest-to-rule-eval p99 across 1 B device keys; checkpoints to S3 every 30 s give exactly-once semantics for the alert pipeline.</td><td>Spark Streaming (micro-batch latency); Kafka Streams (no watermark for late mobile packets).</td></tr>
+    <tr><td>Apache Druid (raw TSDB)</td><td>Scan-heavy time-series with high <code>dev_id</code> cardinality is Druid's sweet spot; bitmap indexes on tenant + dev_id + metric serve dashboard queries over 25 PB/yr in seconds — Timescale would page-fault.</td><td>InfluxDB (cardinality blows past 10 M series); TimescaleDB (great up to 100 M series, struggles at 1 B).</td></tr>
+    <tr><td>TimescaleDB (small-tenant fallback)</td><td>For the long tail of tenants with &lt; 10 K devices, hypertables with 1 h chunks and SQL joins are operationally simpler than running Druid clusters; gives operators a familiar Postgres surface.</td><td>Druid only (overkill for 10 K-device tenants); plain Postgres (chunk-pruning by hand).</td></tr>
+    <tr><td>Apache Cassandra (device shadow)</td><td>1 B-row "1 row per device, frequently overwritten last-state" pattern is exactly the LSM wide-row workload; sub-50 ms shadow reads at 1 B keys via partition-by-dev_id.</td><td>Redis (RAM cost prohibitive at 1 B keys); DynamoDB (cost; less control on compaction).</td></tr>
+    <tr><td>Apache Spark (archival)</td><td>Daily batch of 70 TB compressed telemetry into S3 Parquet for Trino/Athena — Spark's columnar shuffle handles the rollup-and-write pipeline overnight with predictable resource cost.</td><td>Flink batch (less mature for huge shuffles); MapReduce (decade-old, slower).</td></tr>
+    <tr><td>S3 + Parquet (cold archive)</td><td>5-yr retention at 1-h rollups (~2 PB) on S3 Glacier-Instant gives $0.004/GB-month vs Druid's $0.10+; Parquet's column pruning lets Trino scan a year of data for a single metric in minutes.</td><td>HDFS (operational burden); Druid deep storage only (no ad-hoc SQL).</td></tr>
+    <tr><td>RocksDB (Flink state backend)</td><td>Per-device state (windows, last value, threshold history) at 1 B keys exceeds JVM heap; RocksDB on local NVMe spills cleanly with &lt; 100 µs/event eval — meeting the bytecode-compiled rules SLO.</td><td>Heap state (OOMs at 1 B keys); Redis-backed state (network hop kills latency).</td></tr>
+    <tr><td>NLB + TLS termination at broker</td><td>33 M msg/s peak through L4 NLB scales linearly; TLS terminates at the broker (not LB) so we keep client-cert-based device auth, which is the membership story for IoT.</td><td>L7 ALB (no MQTT awareness); TLS at LB (loses client cert).</td></tr>
+    <tr><td>BLS / X.509 device certs</td><td>1 B unique identities need a non-password auth that survives 10-yr deployments; mutual TLS with per-device certs lets us revoke individual compromised devices without bouncing the fleet.</td><td>JWT/HMAC tokens (rotation hard at 1 B); username/password (unmaintainable).</td></tr>
+    <tr><td>Roaring bitmaps (Druid index)</td><td>1 B distinct dev_ids in tag indexes blow up plain inverted indexes; roaring bitmaps compress sparse + dense ranges adaptively, keeping per-segment indexes under 10% of column data.</td><td>Plain inverted index (10× space); range trees (slow set-intersect).</td></tr>
+  </tbody>
+</table>

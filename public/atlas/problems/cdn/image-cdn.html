@@ -1,0 +1,139 @@
+<h1>Design Image CDN with on-the-fly resize / format conversion</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">cdn</span>
+  <span class="tag">file-storage</span>
+</div>
+
+<h1></h1>
+<h2>1. Problem statement</h2>
+<p>Design an image-optimization CDN (Cloudflare Images / Imgix / Akamai Image Manager). Customers upload one master image; consumers request arbitrary derivatives — width, height, crop, quality, format (WebP/AVIF/JPEG XL) — via URL parameters. The system must transform on the fly, cache aggressively, and never let a viral image melt the transformer fleet.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Upload master image (up to 100 MB, JPEG/PNG/HEIC/RAW/TIFF).</li>
+  <li>URL-driven transforms: <code>/img/abc?w=400&amp;h=300&amp;fit=cover&amp;fm=avif&amp;q=80</code>.</li>
+  <li>Auto format negotiation via <code>Accept</code> header (serve AVIF to Chrome, JPEG to Safari ≤14).</li>
+  <li>Smart crop (face/saliency detection), watermarking, signed URLs.</li>
+  <li>Per-customer storage quotas, hotlink protection.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> warm cache p99 &lt; 50 ms; cold transform p99 &lt; 600 ms.</li>
+  <li><b>Scale:</b> 5 M req/sec globally, 10 B masters stored, 100 B derivative URLs.</li>
+  <li><b>Availability:</b> 99.99%; cache-miss must never page-out the origin.</li>
+  <li><b>Cost:</b> AVIF saves ~30% bytes vs JPEG → directly drops egress bill.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 5 M derivative req/s; 99% cache-hit → 50 k transforms/sec at the edge.</li>
+  <li>Each transform: ~150 ms CPU (AVIF encode). 50 k/s × 0.15 s = 7,500 cores busy → ~250 transformer boxes (32 vCPU each).</li>
+  <li>Master storage: 10 B × 500 KB avg = 5 PB; replicated 3× across regions = 15 PB.</li>
+  <li>Derivative cache: 100 B URLs × 30 KB avg × 1% hot = 30 PB hot tier across all POPs.</li>
+  <li>Bandwidth: 5 M/s × 30 KB = 150 GB/s = 1.2 Tbps egress.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/images                  multipart upload          → {imageId, masterUrl}
+GET   /img/{imageId}?w=&amp;h=&amp;fit=&amp;fm=&amp;q=&amp;crop=  Accept: image/avif → bytes
+POST  /v1/images/{id}/variants    {name, params}            → variantUrl
+DELETE /v1/images/{id}                                       → 204
+GET   /v1/images/{id}/metadata                              → {w,h,format,faces[]}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] ─Accept: image/avif─► [Edge POP]
+                                  │ hit → bytes
+                                  │ miss
+                                  ▼
+                          [Derivative Cache (regional)]
+                                  │ miss
+                                  ▼
+                          [Transformer Pool] ──► [Master Store (S3)]
+                                  │                    ▲
+                                  └─ writes back ──────┘
+                          [Smart-crop / Face-detect svc] (gRPC)
+</div>
+<p>Edge serves the derivative if cached. On miss, a regional <i>derivative cache</i> is consulted (so 300 edge misses don't hit 300 transformers). On second-tier miss, a transformer pulls the master from S3, decodes once, applies operations, encodes to target format, and writes back through both cache tiers.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Master metadata (Postgres / DynamoDB)</h3>
+<pre>CREATE TABLE images (
+  image_id    uuid PRIMARY KEY,
+  customer_id uuid,
+  s3_key      text,
+  width int, height int, format text,
+  bytes bigint, created_at timestamptz,
+  faces jsonb,        -- precomputed saliency boxes
+  variants jsonb      -- named presets
+);</pre>
+<h3>7.2 Derivative cache key</h3>
+<pre>key = imageId | sorted(params) | accept_format_class
+TTL: 30 days; immutable since master_id changes invalidate.</pre>
+<p>Master objects sit in S3 / GCS with cross-region replication (DDIA Ch. 5: leader-based async replication, bounded staleness ~seconds). Derivative blobs live in NVMe at edge POPs with TinyLFU admission.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Transformer</h3>
+<p>libvips (8–10× faster than ImageMagick, streaming pipeline, low RAM). Per request: decode → resize → color-correct → encode. AVIF encode is the long pole at ~120 ms for a 1080p frame; we cap concurrency per box and shed load via 503 + Retry-After when queue depth &gt; 50.</p>
+<h3>8.2 Format negotiation</h3>
+<p>Edge varies on a normalized <code>Accept</code> bucket: <code>{avif, webp, jpeg}</code>. Cardinality stays at 3 instead of millions of raw header strings, keeping cache-key explosion bounded.</p>
+<h3>8.3 Smart crop</h3>
+<p>Async ML service (MobileNet-class) runs on master upload, stores face/saliency JSON in metadata. Crop math at request time uses precomputed boxes — no GPU on the hot path.</p>
+<h3>8.4 Single-flight coalescing</h3>
+<p>If 1,000 users request the same viral derivative simultaneously, the transformer fleet sees exactly one fetch + one encode. Followers wait on the in-flight future (≤ 600 ms) and stream the same result. Without this, a tweet-storm = pager.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Combinatorial cache explosion:</b> attackers append <code>?w=401, 402, ...</code> to bust cache. Mitigation: signed URLs or a per-customer allow-list of param dimensions.</li>
+  <li><b>AVIF encode CPU:</b> two-pass libavif is too slow; use single-pass + speed=8.</li>
+  <li><b>Cold master fetch from S3:</b> ~80 ms p99. Pre-warm hot masters into a regional object cache on first hit.</li>
+  <li><b>Memory pressure:</b> 100 MP TIFFs OOM workers. Hard limit decoded pixel area per request (e.g. 50 MP).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>On-the-fly transform</td><td>Storage 100× smaller than precomputing</td><td>CPU spikes; cold-miss latency</td></tr>
+<tr><td>Param whitelist + signed URLs</td><td>Bounds cache cardinality</td><td>Customer must pre-declare variants</td></tr>
+<tr><td>AVIF default</td><td>30% smaller than JPEG, 20% smaller than WebP</td><td>Encode is 10× slower than JPEG</td></tr>
+<tr><td>Regional derivative tier</td><td>Origin/transformer offload</td><td>Extra network hop (+10–20 ms)</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — async multi-region replication of master objects; read-after-write challenges for the upload→serve handoff.</li>
+  <li>Ch. 8 Distributed Systems — single-flight coalescing as a defense against retry storms and partial failures.</li>
+  <li>Ch. 11 Stream Processing — async smart-crop pipeline triggered by upload events.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The system is really a cache in front of a transform — get the cache key right and everything else is engineering."</li>
+  <li>"I'd push back on 'AVIF for everyone'; falling back to JPEG for old Safari is a real cost saver."</li>
+  <li>"The biggest production foot-gun is param-explosion abuse. Signed URLs are not optional at scale."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>libvips (transformer core)</td><td>8–10× faster than ImageMagick with streaming pipelines and low RAM, critical when we need 50k transforms/sec across only ~250 boxes (32 vCPU each). ImageMagick's full-buffer model would OOM on 100 MP TIFFs that hit the 50 MP decoded-pixel hard limit.</td><td>ImageMagick (memory-hungry); GraphicsMagick (no AVIF); Sharp (Node overhead).</td></tr>
+<tr><td>AVIF as default format (libavif single-pass, speed=8)</td><td>30% smaller than JPEG and 20% smaller than WebP — directly drops the 1.2 Tbps egress bill. Single-pass speed=8 keeps AVIF encode at ~120 ms per 1080p frame, fitting the 600 ms cold-transform p99 budget.</td><td>WebP only (loses 20% bytes); JPEG XL (Safari support TBD); two-pass AVIF (3× CPU).</td></tr>
+<tr><td>WebP / JPEG fallback via Accept negotiation</td><td>Safari ≤14 lacks AVIF. Edge varies on a normalized 3-bucket Accept class so Chrome users get AVIF and Safari users get JPEG, saving the egress on modern browsers without breaking older ones.</td><td>AVIF-only (Safari breakage); JPEG-only (loses 30% savings).</td></tr>
+<tr><td>S3/GCS master store with cross-region replication</td><td>10 B masters × 500 KB × 3× replication = 15 PB needs object-store economics, not block storage. Cross-region async replication (DDIA Ch. 5) gives bounded-staleness reads at every regional transformer pool.</td><td>Self-managed Ceph (ops burden at 15 PB); HDFS (not designed for HTTP serving).</td></tr>
+<tr><td>Regional derivative cache tier</td><td>99% edge hit ratio still leaves 50k transforms/sec; without a regional tier, 300 edge misses on the same viral derivative would hit 300 transformers. Regional tier collapses fan-out to 1 transform per derivative.</td><td>Edge-only cache (300× transformer amplification); origin-only (transformer fleet meltdown).</td></tr>
+<tr><td>Single-flight coalescing on transformer queue</td><td>1,000 simultaneous viral-derivative requests collapse to one decode+encode. Without it, a tweet-storm produces 1,000 × 150 ms = 150 vCPU-seconds of redundant work, blowing the 50-deep queue threshold and triggering 503/Retry-After.</td><td>No coalescing (queue overflow); per-key locks (deadlock risk).</td></tr>
+<tr><td>Normalized Accept-bucket cache key (Vary)</td><td>Caching on raw Accept header gives millions of variants per image. Bucketing into {avif, webp, jpeg} keeps cache cardinality at 3× the param-space, preserving the 99% hit ratio.</td><td>Vary on raw Accept (cache explosion); ignore Accept (wrong format served).</td></tr>
+<tr><td>MobileNet smart-crop on upload (async)</td><td>Face/saliency detection precomputed once on master upload writes JSON to metadata; crop math at request time is pure arithmetic. Keeps GPU off the hot path so cold transforms hit the 600 ms p99 without GPU scheduling jitter.</td><td>On-demand ML (GPU on hot path); no smart-crop (poor UX on auto-thumbnails).</td></tr>
+<tr><td>Signed URLs + per-customer param whitelist</td><td>Attackers append ?w=401, 402, ... to bust cache. Signed URLs bound the param space to the customer's pre-declared variants, capping the 100 B URL count and protecting transformer CPU.</td><td>Open params (DoS via cache busting); preset-only (kills flexibility).</td></tr>
+<tr><td>TinyLFU admission on edge NVMe</td><td>30 PB hot derivative tier across all POPs needs admission filtering — without it, single-hit derivatives evict the 1% truly hot working set. Same trade-off as static CDN but with derivatives that average 30 KB instead of mixed sizes.</td><td>Plain LRU (scan-traffic pollution); ARC (more memory overhead).</td></tr>
+<tr><td>503 + Retry-After load shedding (queue depth &gt;50)</td><td>AVIF encode at ~120 ms means each 32-vCPU box handles ~265 transforms/sec; runaway queues cause cascading p99 violations. Shedding at queue=50 keeps tail latency bounded and lets clients back off rather than time out at 30 s.</td><td>Unbounded queue (latency cliff); kill on overload (no graceful degradation).</td></tr>
+<tr><td>Postgres / DynamoDB master metadata</td><td>10 B image rows with face JSON and variant configs need indexed lookups by image_id and customer_id. Postgres for OLTP-style customer dashboards; DynamoDB at the read tier for the hot path's master-fetch metadata.</td><td>MongoDB (no strong customer_id partitioning); MySQL (JSON support weaker).</td></tr>
+<tr><td>gRPC for smart-crop service</td><td>Async pipeline triggered by upload events (DDIA Ch. 11); gRPC's streaming + protobuf keeps per-RPC overhead low when we burst-process customer uploads. HTTP/JSON would double serialization cost.</td><td>HTTP/REST (overhead); Kafka direct (no request-response semantics).</td></tr>
+</tbody>
+</table>
+

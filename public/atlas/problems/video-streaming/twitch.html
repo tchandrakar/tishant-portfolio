@@ -1,0 +1,139 @@
+<h1>Design Twitch (live streaming with chat at 10M concurrent)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">messaging</span>
+  <span class="tag">cdn</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a global live-streaming platform where creators broadcast game/IRL video, viewers watch with sub-5-second glass-to-glass latency, and millions interact via real-time chat. The system must support a long tail of small streams plus mega-events (Twitch Rivals, Marbles tournaments) that hit 6M+ concurrent viewers on a single channel. Core challenge: ingest millions of RTMP streams, transcode in real time, fan out HLS segments through CDN, and run a chat system that delivers messages with <500ms p99.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Creators ingest via RTMP/SRT; viewers watch via HLS/LL-HLS.</li>
+  <li>Adaptive bitrate ladder: source, 1080p60, 720p60, 720p30, 480p, 360p, 160p audio-only.</li>
+  <li>Real-time chat per channel, with slow-mode, sub-only, emote support, moderation.</li>
+  <li>Channel pages, browse/discovery, follow, raid, host, clip creation.</li>
+  <li>VOD recording: archive past broadcasts, generate highlights.</li>
+  <li>Subscriptions, bits, ads insertion.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> glass-to-glass 2–5s with LL-HLS; chat p99 < 500ms.</li>
+  <li><b>Scale:</b> 10M concurrent viewers, 100K concurrent broadcasts, 30M DAU.</li>
+  <li><b>Availability:</b> 99.95% for video plane; 99.9% for chat.</li>
+  <li><b>Throughput:</b> peak 25 Tb/s egress globally.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Ingest:</b> 100K streams * 6 Mbps source = 600 Gbps ingress.</li>
+  <li><b>Transcode:</b> each stream → 5 renditions; 100K * 5 = 500K transcode slots; ~50K GPU/ASIC nodes (each handles ~10 streams).</li>
+  <li><b>Egress:</b> 10M viewers * avg 2.5 Mbps = 25 Tb/s; assume CDN offload 95% → 1.25 Tb/s back to origins.</li>
+  <li><b>Chat:</b> 10M concurrent, avg 1 msg/viewer/min, 10× fan-out per msg = ~1.6M msg/s send; 16M msg/s deliveries.</li>
+  <li><b>VOD storage:</b> 100K streams * avg 4h * 6 Mbps = 1 PB/day raw; deduped + tiered to S3 Glacier after 14d.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/ingest/start         {streamKey}                → rtmpUrl, ingestPop
+GET   /v1/playback/{channel}                              → masterManifest.m3u8
+GET   /hls/{channel}/{rendition}/seg{n}.ts                → segment
+WS    /v1/chat/{channel}       (auth: token)              ↔ {type, msg, ts}
+POST  /v1/clip                 {channel, startMs, endMs}  → clipId
+GET   /v1/vod/{channel}/{id}                              → vodManifest.m3u8</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Broadcaster] --RTMP--> [Anycast Ingest PoP] --> [Transcoder (GPU)] --> [Origin Shield]
+                                                            |
+                                                            v
+                                                       [HLS Packager] --> [CDN Edge] --> [Viewer]
+                                                            |
+                                                            v
+                                                     [VOD Recorder] --> [S3]
+
+[Viewer] --WS--> [Chat Edge (haproxy)] --> [Channel Shard (Erlang)] --> [Redis pubsub]
+                                                |
+                                                v
+                                          [Kafka chat-log] --> [Moderation ML] --> [Spam Filter]
+</div>
+<p>Walk-through: Broadcaster sends RTMP to nearest anycast PoP. Ingest forwards the source to a transcoder cluster that emits an ABR ladder. Packager produces HLS/LL-HLS segments uploaded to origin shield; CDN edges pull-through and serve to viewers. Chat is a separate plane: WebSocket connections terminated at chat edges, sharded per-channel onto Erlang/Elixir nodes that fan out via Redis pub/sub.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Channel metadata (DynamoDB)</h3>
+<pre>channel_id (PK) | streamer_id | title | category | started_at | viewer_count | sub_only_chat (bool)</pre>
+<h3>7.2 Chat history (Cassandra, TTL 30d)</h3>
+<pre>CREATE TABLE chat_msgs (
+  channel_id text, bucket_5m bigint, msg_id timeuuid,
+  user_id text, body text, badges set&lt;text&gt;,
+  PRIMARY KEY ((channel_id, bucket_5m), msg_id)
+) WITH CLUSTERING ORDER BY (msg_id DESC);</pre>
+<h3>7.3 VOD index (Postgres + S3)</h3>
+<p>Master manifest in Postgres; segments and thumbnails in S3 with lifecycle to Glacier Deep Archive after 60 days for non-partner streams.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Transcoder</h3>
+<p>NVIDIA NVENC ASICs on bare-metal; one source stream → 5 outputs in parallel. Use 2-second GOPs aligned across renditions for clean ABR switching. Failover: if a transcoder dies mid-segment, viewer skips one segment (≤2s glitch); supervisor reschedules within 1s.</p>
+<h3>8.2 LL-HLS packager</h3>
+<p>CMAF chunks of 200ms, 10 chunks per 2s segment; uses HTTP/2 push and #EXT-X-PRELOAD-HINT to keep latency under 3s. Falls back to standard HLS for older clients.</p>
+<h3>8.3 Chat fanout</h3>
+<p>Channel sharded by consistent hash on channel_id. Mega-channels (>100K viewers) auto-split into a tree: leader receives sends, fans to N regional sub-shards which deliver to viewers. Slow-mode and follower-mode enforced at the channel leader.</p>
+<h3>8.4 Moderation</h3>
+<p>Async pipeline: every chat msg published to Kafka. ML classifier flags slurs/spam; heavily flagged users auto-timed-out via API back to chat. Mods get instant override authority.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Mega-events:</b> pre-warm CDN PoPs and origin shields based on category trends; subscribe streamers go through reserved capacity pool.</li>
+  <li><b>Thundering herd:</b> when a big streamer goes live, viewer count can ramp 0→1M in 60s. Use jittered manifest TTLs and connection-rate limiters at edges.</li>
+  <li><b>Chat hot channel:</b> Erlang VM per channel; if mailbox queue >50K, switch channel to read-only sample-mode where only 10% of msgs are delivered to non-subs.</li>
+  <li><b>Cross-region replication:</b> chat is single-leader per channel; reads served from regional replicas to avoid WAN RTT.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>LL-HLS vs WebRTC</td><td>CDN-friendly, scales to 10M</td><td>Still 2–3s vs WebRTC's <500ms</td></tr>
+<tr><td>Erlang chat vs Kafka-only</td><td>1M+ connections per box, cheap fanout</td><td>Operational complexity, BEAM expertise</td></tr>
+<tr><td>RTMP ingest vs SRT</td><td>Universal OBS support</td><td>TCP-based, lossy on bad uplinks</td></tr>
+<tr><td>Sample-mode chat for huge channels</td><td>Protects backend</td><td>Some viewers miss messages</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — single-leader chat with regional read replicas.</li>
+  <li>Ch. 6 Partitioning — channel_id sharding with auto-split for hotspots.</li>
+  <li>Ch. 11 Stream Processing — Kafka-backed chat moderation pipeline.</li>
+  <li>Ch. 12 The Future of Data Systems — derived data flows for highlight clips.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start by separating the video plane (CDN-served HLS) from the chat plane (WebSocket pub/sub) — they have totally different scaling characteristics."</li>
+  <li>"Hottest channel sharding is the killer problem; Drake or a Worlds final pulls 6M concurrent into one logical channel — I'd use a fanout tree rooted at the leader Erlang node."</li>
+  <li>"For LL-HLS I trade away the sub-second latency of WebRTC because I cannot serve 10M concurrent WebRTC peers without a forest of SFUs — CDN economics win."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b><code>RTMP</code> ingest</b></td><td>Universal OBS/X-Split support — every streamer's existing software encoder speaks <code>RTMP</code> out of the box. With 100K concurrent broadcasts at 6 Mbps each, requiring streamers to switch tooling would cost the entire creator pipeline.</td><td><code>WebRTC</code>-WHIP — newer, fewer encoders; <code>SRT</code> — better loss handling but limited adoption</td></tr>
+    <tr><td><b>NVIDIA NVENC ASICs</b></td><td>500K transcode slots (100K streams × 5 renditions) need hardware encode at 10 streams/box; software FFmpeg would require ~500K CPU cores vs ~50K GPU nodes — 10× CapEx.</td><td>Intel QuickSync — quality regression on game footage; software-only — economically infeasible</td></tr>
+    <tr><td><b>LL-HLS with CMAF</b></td><td>2-second segments + 200ms CMAF chunks deliver 2–5s glass-to-glass at CDN scale; <code>WebRTC</code> can't fan out to 10M concurrent without a forest of SFUs, so we trade sub-second latency for CDN economics.</td><td><code>WebRTC</code> — won't scale to 10M concurrent; standard <code>HLS</code> — 20s latency is unacceptable for chat-coupled experience</td></tr>
+    <tr><td><b>Erlang/Elixir (chat plane)</b></td><td>BEAM runtime handles 1M+ persistent WebSocket connections per box with cheap green processes; per-channel actor model maps directly to Twitch's "channel = isolated chat room" semantic at 16M msg/s deliveries.</td><td>Go — viable but BEAM excels at this exact workload; Node.js — single-threaded bottleneck on hot channels</td></tr>
+    <tr><td><b>Redis pub/sub</b></td><td>Channel-scoped fanout for chat msg broadcast; sub-ms latency keeps p99 chat under 500ms even when an Erlang node fans to thousands of subscribers per channel.</td><td>NATS — fine alternative; Kafka — too slow for live fanout (consumer-pull model)</td></tr>
+    <tr><td><b>Apache Kafka (chat-log)</b></td><td>Async moderation pipeline consumes the full chat firehose for ML classification; Kafka's replay lets us re-run moderation models on historical messages when classifiers improve.</td><td>SQS — no replay; Kinesis — partition limits at 1.6M msg/s</td></tr>
+    <tr><td><b>Cassandra (chat history)</b></td><td>Append-heavy writes at 1.6M msg/s with TTL=30d for chat history; partition key (channel_id, bucket_5m) keeps hot channels' writes spread across partitions while clustering newest-first reads.</td><td>Postgres — no horizontal write scale; DynamoDB — region cost at this volume</td></tr>
+    <tr><td><b>DynamoDB (channel metadata)</b></td><td>Single-key access on channel_id with predictable single-digit-ms reads at 30M DAU; viewer_count updates are write-heavy and DynamoDB's atomic counters fit naturally.</td><td>Cassandra — already used elsewhere, but DynamoDB managed ops win for low-write metadata; Redis — no durability for channel state</td></tr>
+    <tr><td><b>Postgres (VOD index)</b></td><td>VOD master manifest with relational queries (by streamer, by category, by date range); manifest scale is small (100K streams/day), Postgres is the right durability/transactionality fit.</td><td>DynamoDB — no relational queries; MySQL — fine alternative</td></tr>
+    <tr><td><b>S3 + Glacier Deep Archive</b></td><td>1 PB/day raw VOD storage at 11 nines; 14-day Glacier transition for non-partner streams cuts storage cost ~80% since most VODs are watched in the first 48 hours.</td><td>HDFS — durability requires triple-replicate; warm storage only — bills explode at 365 PB/year</td></tr>
+    <tr><td><b>Anycast BGP routing</b></td><td>Streamers send <code>RTMP</code> to nearest ingest PoP via anycast IP — no DNS-based geo-routing latency, sub-50ms first-byte across continents.</td><td>GeoDNS — DNS resolution adds 200ms; static IPs — manual region selection</td></tr>
+    <tr><td><b>HAProxy (chat edge)</b></td><td>Terminates millions of WebSocket connections with sticky-session routing to per-channel Erlang shards; battle-tested for long-lived TCP at scale.</td><td>nginx — fine for HTTP, less optimized for stateful WS sharding; Envoy — viable modern alternative</td></tr>
+    <tr><td><b>Origin Shield</b></td><td>Collapses thundering-herd 1.25 Tb/s edge misses to single origin pulls when a streamer goes 0→1M viewers in 60s; saves origin from being DDoSed by its own CDN.</td><td>No shield — origin melts on viral spike; multi-tier shield — diminishing returns past one layer</td></tr>
+    <tr><td><b>ML moderation classifier</b></td><td>Async slur/spam detection on Kafka chat firehose; auto-timeout on heavily-flagged users with mod override means moderators stay focused on judgment calls, not triage.</td><td>Pure regex blocklist — high false-negative rate; manual mods only — doesn't scale to 16M msg/s</td></tr>
+  </tbody>
+</table>

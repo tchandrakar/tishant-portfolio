@@ -1,0 +1,194 @@
+<h1>Design Yelp / nearby places review platform</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">search</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a location-based discovery platform: users open the app, see ranked restaurants/businesses within walking distance, filter by cuisine/rating/price, read 250 M+ reviews, post their own with photos, and reserve a table. Read-heavy (≈50:1 read:write), latency-sensitive on the home feed (&lt;300 ms), and search relevance must blend distance, rating, recency, and personalisation.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>"Nearby" feed: top-K businesses within radius r of (lat, lng) with filters.</li>
+  <li>Full-text + geo search ("ramen near me, open now, $$").</li>
+  <li>Business detail: photos, hours, menu, 5-star rating, paginated reviews.</li>
+  <li>Write reviews + photos; verified-check-in via GPS proximity.</li>
+  <li>Reservations integration (OpenTable-style slots).</li>
+  <li>Owner portal: claim listing, respond to reviews, run promoted ads.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> nearby feed p99 &lt; 300 ms; search p99 &lt; 400 ms.</li>
+  <li><b>Scale:</b> 250 M MAU, 80 M DAU, 5 M businesses, 250 M reviews, 1 B photos.</li>
+  <li><b>QPS:</b> 60 K rps search avg, 200 K peak; 500 rps review writes.</li>
+  <li><b>Availability:</b> 99.95%; reviews durable (no loss).</li>
+  <li><b>Freshness:</b> new review visible &lt; 60 s; rating recompute &lt; 5 min.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Reviews: 250 M × 1 KB text + 5 photos × 200 KB ≈ 250 TB text + 1 PB photos.</li>
+  <li>Geo-index: 5 M businesses × 200 B = 1 GB — fully RAM-resident per shard.</li>
+  <li>Read fan-out: home feed = 1 geo query + 50 business detail lookups (cached).</li>
+  <li>Cache: hottest 100 K businesses × 5 KB = 500 MB Redis (LFU).</li>
+  <li>Photo CDN egress: 80 M DAU × 30 photo views × 80 KB = 200 TB/day.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/nearby            ?lat=&amp;lng=&amp;radius=2000&amp;cat=ramen   → [businesses]
+GET   /v1/search            ?q=&amp;lat=&amp;lng=&amp;openNow=true        → [businesses]
+GET   /v1/businesses/{id}                                       → details
+GET   /v1/businesses/{id}/reviews?cursor=                       → reviews page
+POST  /v1/reviews           {bizId, stars, text, photoIds}      → reviewId
+POST  /v1/checkin           {bizId, lat, lng}                   → token
+POST  /v1/reservations      {bizId, partySize, time}            → confirmation</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Mobile] ─▶ [API GW + Rate Limit] ─▶ [Feed Svc] ──▶ [Geo Index: S2/Geohash, RAM]
+                                       │                       │
+                                       ├─▶ [Search: Elasticsearch cluster]
+                                       ├─▶ [Business Svc] ─▶ [MySQL (sharded by biz_id)]
+                                       ├─▶ [Review Svc]   ─▶ [Cassandra reviews table]
+                                       └─▶ [Reco Svc]     ─▶ [Feature Store + LightGBM]
+                                                                    ▲
+[Photo Upload] ─▶ [S3] ─▶ [Lambda: thumbnails] ─▶ [CloudFront CDN]──┘
+[Review Write] ─▶ [Kafka] ─▶ [Flink: rating rollup, spam filter] ─▶ [MySQL biz.stats]
+</div>
+<p>Feed flow: client sends (lat,lng) → Feed Svc queries the in-memory geo index for candidate biz_ids within radius → fetches details from Redis (fallback MySQL) → ranks via Reco Svc → returns. Writes go through Kafka so rating rollups, spam classification, and search index updates are async but eventually consistent within a minute.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Business (MySQL, sharded by biz_id)</h3>
+<pre>CREATE TABLE businesses (
+  biz_id BIGINT PRIMARY KEY,
+  name VARCHAR(200), category_ids JSON,
+  lat DECIMAL(9,6), lng DECIMAL(9,6),
+  geohash9 CHAR(9), s2_cell BIGINT,
+  avg_rating FLOAT, review_count INT,
+  hours JSON, price_tier TINYINT
+) /* secondary idx on geohash9 */;</pre>
+<h3>7.2 Reviews (Cassandra)</h3>
+<pre>CREATE TABLE reviews_by_biz (
+  biz_id bigint, created_at timeuuid,
+  user_id bigint, stars tinyint, body text, photo_ids list&lt;text&gt;,
+  PRIMARY KEY (biz_id, created_at)
+) WITH CLUSTERING ORDER BY (created_at DESC);</pre>
+<h3>7.3 Geo index (custom, in-RAM)</h3>
+<p>S2 cell-id at level 13 (≈1 km²) → bucket of biz_ids, sorted by popularity. Backed by snapshot from MySQL every 10 min; deltas via Kafka tail. Shards by S2 face (6 shards) — each &lt;200 MB.</p>
+<h3>7.4 Why this mix?</h3>
+<p>MySQL: sane joins for owner CRUD; sharded by biz_id avoids cross-shard reads on detail page. Cassandra: review write throughput + clustering by created_at for cheap pagination. Custom geo index: ES geo-distance queries hit ~30 ms p99, the in-RAM S2 index hits 2 ms — matters for the home feed.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Geo lookup</h3>
+<p>Compute caller's S2 cell at level 13; expand to covering cells of radius r (typically 9 cells); union of candidate lists; filter by exact haversine. For dense urban cells we cap candidates at 500 and let the ranker do the rest.</p>
+<h3>8.2 Ranking (DDIA Ch. 11 stream-derived features)</h3>
+<p>LightGBM with features: distance, log(review_count), Wilson-lower-bound rating, "open now" boolean, personal click history, time-of-day match, promoted-bid (sponsored slot capped at 1 of top 5).</p>
+<h3>8.3 Spam &amp; review integrity</h3>
+<p>Async pipeline: Kafka → Flink → text classifier + IP/device velocity → quarantine queue → human ops for borderline. Verified-check-in (GPS within 100 m of biz at time of review) gives a "verified" badge boosting trust score.</p>
+<h3>8.4 Photo pipeline</h3>
+<p>Direct-to-S3 upload via signed URL → S3 event → Lambda generates 240/480/1080 thumbnails → CDN. EXIF stripped server-side for privacy.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Tourist hot spots (Times Square):</b> single S2 cell with 8 K businesses — pre-rank by popularity into a "hot cell" Redis set.</li>
+  <li><b>Rating recompute thundering herd:</b> debounce per biz_id (1 update / 30 s) — DDIA Ch. 11 windowed aggregation.</li>
+  <li><b>Long-tail reviews:</b> Cassandra's clustering by created_at prevents wide rows by time-bucketing on year.</li>
+  <li><b>Search relevance drift:</b> nightly offline relevance evaluation against held-out clicks.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>S2 cells vs geohash</td><td>Equal-area, multi-resolution, fast covering</td><td>Library complexity, less mainstream</td></tr>
+<tr><td>Cassandra for reviews</td><td>Linear write scaling, time-ordered reads</td><td>No transactions, joins are app-side</td></tr>
+<tr><td>Async rating rollup</td><td>Cheap, smooth load</td><td>5-min staleness; users see "your review posted, rating updating"</td></tr>
+<tr><td>In-RAM geo index</td><td>2 ms lookups, no ES tax</td><td>Custom code, snapshot/restore complexity</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — biz_id sharding for MySQL, S2 face sharding for geo index.</li>
+  <li>Ch. 11 Stream Processing — Kafka + Flink for ratings, spam, search-index sync.</li>
+  <li>Ch. 12 Future — CRDTs considered for offline review drafts.</li>
+  <li>Ch. 5 Replication — leader-follower MySQL; multi-DC for read locality.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The interview-bait answer is 'use ES geo-distance' — that's fine for v1 but breaks at top-K personalisation; I'd separate retrieval (geo index) from ranking (ML)."</li>
+  <li>"I'd push hard on the spam pipeline; review trust is the product. Verified check-ins are a strong cheap signal."</li>
+  <li>"Sponsored placements need a transparent floor (1 of top 5) — bad ranking destroys trust."</li>
+  <li>"For MVP: PostGIS + a single Rails monolith; the architecture above is the year-3 picture."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>S2 cells (level 13, ~1 km²)</td>
+      <td>The home feed needs 2 ms p99 candidate retrieval; S2 gives equal-area cells globally so a 2 km radius lookup reliably touches ~9 cells whether you're in Tokyo or Reykjavik. Equal-area matters because Yelp's 5 M businesses are globally distributed and we don't want lat-distorted relevance.</td>
+      <td>Geohash (rectangle distortion near poles); H3 (great for hex coverage but radius queries need extra ring math); ES geo_distance (~30 ms p99, 15× slower).</td>
+    </tr>
+    <tr>
+      <td>In-RAM custom geo index (sharded by S2 face)</td>
+      <td>5 M businesses × 200 B = 1 GB fits trivially in RAM per shard, giving 2 ms lookups vs 30 ms in ES. With 6 S2 face shards under 200 MB each, snapshot/restore takes seconds and we sustain 200 K rps peak without ES tax.</td>
+      <td>Elasticsearch geo (~30 ms p99, expensive licensing); PostGIS (~5-20 ms, write-bottlenecked); Redis GEO (good for v1 but no attribute filters).</td>
+    </tr>
+    <tr>
+      <td>MySQL (sharded by biz_id)</td>
+      <td>Owner CRUD (claim listing, edit hours, respond to reviews) needs joins and transactions across business + photos + reservations. Sharding by biz_id keeps the detail page a single-shard read, which is the hot path served from Redis 95% of the time anyway.</td>
+      <td>PostgreSQL (similar — chose MySQL for ops familiarity); DynamoDB (no joins, painful for owner portal); Spanner (overkill, expensive).</td>
+    </tr>
+    <tr>
+      <td>Cassandra (reviews)</td>
+      <td>250 M reviews growing at 500 wps need linear write scaling, and "load reviews newest-first" is a clustering-key range scan over (biz_id, created_at DESC). Cassandra nails this pattern; durability via tunable consistency QUORUM matches our "no review loss" SLA.</td>
+      <td>MySQL (review row count would dwarf business shards); DynamoDB (10 KB item limit awkward for long reviews + photos); ScyllaDB (similar; chose Cassandra for ops maturity).</td>
+    </tr>
+    <tr>
+      <td>Elasticsearch (full-text + geo search)</td>
+      <td>"Ramen near me, open now, $$" is a multi-field query: text (ngrams), geo (distance filter), category, hours, price tier. ES BM25 + geo_distance + custom function_score handles this in 50-100 ms; building it ourselves with retrieval-time blending would take a team a year.</td>
+      <td>Solr (smaller talent pool); Algolia (cost prohibitive at 60 K rps); Vespa (fewer hosted options); Postgres FTS (no fuzzy + facet ranking).</td>
+    </tr>
+    <tr>
+      <td>Kafka + Flink (rating rollup, spam, search-index sync)</td>
+      <td>500 review wps with 1-min freshness on rating recompute and spam classification needs a stream backbone. Flink's keyed state debounces per-biz_id rollups (1 update/30 s) and integrates ML scoring inline, hitting the 5-min staleness SLA without overwhelming MySQL with rating writes.</td>
+      <td>Spark Streaming (micro-batch latency); Kinesis Firehose (no stateful ops); cron-based recompute (5-min cron = 5-min freshness floor with herd issues).</td>
+    </tr>
+    <tr>
+      <td>Redis (hot-business cache, hot-cell pre-rank)</td>
+      <td>Hottest 100 K businesses × 5 KB = 500 MB easily fits one Redis shard. LFU eviction + sub-ms reads serve 80% of detail page lookups. For tourist hotspots (Times Square's 8 K-business cell), we maintain a sorted set pre-ranked by popularity to skip per-request ranking entirely.</td>
+      <td>Memcached (no sorted sets); local in-process LRU (no cross-pod sharing); DynamoDB DAX (vendor lock-in, slower).</td>
+    </tr>
+    <tr>
+      <td>S3 + CloudFront + Lambda (photo pipeline)</td>
+      <td>1 B photos at 200 KB each = 200 TB; 80 M DAU × 30 photo views = 200 TB/day egress. S3 stores cheap, signed-URL direct upload bypasses our app servers, Lambda generates 240/480/1080 thumbnails on the S3 event, and CloudFront absorbs the egress at edge POPs.</td>
+      <td>Self-hosted Ceph (ops nightmare at PB); GCS+Cloud Functions (similar — we're on AWS); imgix (great but cost at 200 TB/day).</td>
+    </tr>
+    <tr>
+      <td>LightGBM (re-ranking)</td>
+      <td>Retrieval gives top-500 candidates from S2; ranking blends distance, log(review_count), Wilson-lower-bound rating, "open now", click priors, and bid in &lt;5 ms. Tree models handle the heterogeneous feature mix and explain promoted-bid placement for transparency.</td>
+      <td>Deep ranker (50 ms — too slow for feed); pure rule-based (no personalisation); XGBoost (similar perf, LightGBM is 2× faster training on click logs).</td>
+    </tr>
+    <tr>
+      <td>Wilson lower bound (rating ranking)</td>
+      <td>A 5.0-stars-from-2-reviews business shouldn't outrank a 4.6-stars-from-2000-reviews place. Wilson lower bound on a Bernoulli interval gives a confidence-aware score that punishes low-sample averages — directly defending against "buy 5 fake 5-star reviews" attacks.</td>
+      <td>Plain mean (rewards thin samples); Bayesian average with global prior (similar but more tunable knobs to defend); IMDb formula (effectively a special case of Bayesian).</td>
+    </tr>
+    <tr>
+      <td>Geohash9 secondary index on businesses</td>
+      <td>For batch jobs ("export all bay-area businesses for ML training"), a geohash9 column with a B-tree index lets MySQL serve city-bbox queries at ~150 ms without round-tripping through S2. Different tool for different workload than the live S2 in-RAM index.</td>
+      <td>S2 cell column (works but PostGIS-style queries need int range gymnastics); PostGIS migration (operational lift not justified for batch path).</td>
+    </tr>
+    <tr>
+      <td>GPS-verified check-in (review trust signal)</td>
+      <td>Verified check-ins (GPS within 100 m at review time) cut fake-review noise by ~70% and feed the spam classifier as a strong free feature. At 500 wps and a clamoring fake-review economy, cheap trust signals beat expensive ML.</td>
+      <td>Photo EXIF geotag check (easily faked); IP geolocation (carrier-grade NAT obscures); manual moderation only (doesn't scale).</td>
+    </tr>
+  </tbody>
+</table>

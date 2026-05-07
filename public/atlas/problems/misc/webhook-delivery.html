@@ -1,0 +1,147 @@
+<h1>Design Webhook Delivery Service (at-least-once, retry, signing)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">misc</span>
+  <span class="tag">notifications</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the platform-as-a-service component that delivers webhook events from our application (e.g. Stripe-like payment events, GitHub push events) to customer-controlled HTTPS endpoints. Stripe delivers ~5 B webhook attempts/month with at-least-once semantics, exponential backoff over 3 days, HMAC signatures, and replay protection. Customer endpoints fail constantly — we must isolate slow/broken endpoints from healthy ones.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Customers register endpoints, choose event types, rotate signing secrets.</li>
+  <li>For each platform event, fan out to all matching subscriptions.</li>
+  <li>HMAC-SHA256 sign each request; include timestamp + idempotency key.</li>
+  <li>Retry with exponential backoff up to 72 h on 5xx/timeout.</li>
+  <li>Dashboard: per-event delivery log, manual replay, dead-letter inspection.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> first attempt p99 &lt; 10 s after event publish.</li>
+  <li><b>Throughput:</b> 5 B attempts/month → ~2 K rps avg, 50 K rps peak.</li>
+  <li><b>Durability:</b> never drop an event before exhausting retry policy.</li>
+  <li><b>Isolation:</b> a slow endpoint (10 s response) must not slow others.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>1 B events/month × avg 5 subscriptions = 5 B attempts; first-attempt success ~95% → 250 M retries/month.</li>
+  <li>Event payload ~2 KB; queue storage = 5 B × 2 KB × 3 day TTL = ~30 TB.</li>
+  <li>~5 M outbound HTTPS connections in flight peak; ~10 K worker pods (500 conn/pod).</li>
+  <li>DB: 50 M active subscriptions, 200 B/row → 10 GB; trivial.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/endpoints       {url, events[], description}     → {id, secret}
+POST /v1/endpoints/{id}/rotate                            → {newSecret}
+GET  /v1/messages?endpoint=&amp;status=failed&amp;cursor=         → list
+POST /v1/messages/{id}/replay                             → 202
+
+# Outbound (to customer)
+POST {customer.url}
+  Webhook-Id: msg_01H...
+  Webhook-Timestamp: 1714900000
+  Webhook-Signature: v1,base64(HMAC_SHA256(secret, id.ts.body))
+  Content-Type: application/json
+  body: {...event...}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Producers] --&gt; [Kafka events] --&gt; [Fan-out worker] --&gt; [Per-endpoint queue (Redis Streams)]
+                                       |                          |
+                                       v                          v
+                                [Subscription DB]          [Delivery worker pool]
+                                                                   |
+                                                                   v
+                                                          [Customer HTTPS endpoint]
+                                                                   |
+                                                                   v (on failure)
+                                                          [Retry scheduler (Redis ZSET, score=next_attempt_ts)]
+                                                                   |
+                                                                   v (after N retries)
+                                                          [DLQ + dashboard]
+</div>
+<p>Walk-through: Kafka is the event spine. A fan-out worker reads each event, looks up matching subscriptions, and pushes one task per endpoint into a per-endpoint queue. Delivery workers pull, sign, and POST. Failures push to a delayed retry ZSET keyed by the next-attempt epoch. A scheduler thread pops due tasks every second.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Subscriptions (Postgres)</h3>
+<pre>CREATE TABLE endpoints (
+  id UUID PRIMARY KEY, account_id UUID, url TEXT, secret_v INT, secret BYTEA,
+  event_filter TEXT[], created_at TIMESTAMPTZ, disabled_at TIMESTAMPTZ
+);
+CREATE INDEX ix_account ON endpoints(account_id) WHERE disabled_at IS NULL;</pre>
+<h3>7.2 Attempt log (Cassandra)</h3>
+<pre>CREATE TABLE attempts (
+  endpoint_id uuid, msg_id timeuuid,
+  attempt_n int, status_code int, response_excerpt text,
+  attempted_at timestamp, next_attempt_at timestamp,
+  PRIMARY KEY (endpoint_id, msg_id, attempt_n)
+) WITH CLUSTERING ORDER BY (msg_id DESC, attempt_n ASC);</pre>
+<h3>7.3 Why split?</h3>
+<p>Subscription metadata is small + relational; attempts are append-heavy time-series — Cassandra's LSM tree handles 50 K writes/sec/node easily. See DDIA Ch. 3 (LSM vs B-tree) and Ch. 11 (event log as system-of-record).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Per-endpoint isolation</h3>
+<p>Each endpoint has a bounded queue and a token bucket (default 200 in-flight, 50 rps). A slow endpoint backs up its own queue; the global pool stays free. Circuit-break individual endpoints after 50 consecutive failures — pause for 5 min, then probe.</p>
+<h3>8.2 Retry policy</h3>
+<p>Backoff schedule: 5 s, 5 min, 30 min, 2 h, 5 h, 10 h, 1 d (×3) — total ~72 h, max 10 attempts. Add 25% jitter to avoid synchronized retry storms (the "thundering herd after we recover" problem).</p>
+<h3>8.3 Signing</h3>
+<p>Header: <code>v1,base64(HMAC_SHA256(secret, id + "." + ts + "." + body))</code>. Customers can rotate; we keep prior secret valid for 24 h and emit both signatures so they migrate cleanly. Reject deliveries where ts older than 5 min on inbound replays.</p>
+<h3>8.4 Idempotency</h3>
+<p>Every delivery has a stable <code>Webhook-Id</code>. Customer is contractually expected to dedupe — we are at-least-once, not exactly-once. (Exactly-once over the open internet is impossible; see DDIA Ch. 9.)</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Customer-induced HOL blocking:</b> per-endpoint queue + connection pool prevents one bad URL from starving the system.</li>
+  <li><b>SSRF / internal-IP attack:</b> URL validator blocks RFC1918, link-local, metadata-IP (169.254.169.254), DNS-rebinding via re-resolution at connect time.</li>
+  <li><b>TLS handshake cost:</b> connection reuse per endpoint via persistent HTTP/2 pool — 10× throughput.</li>
+  <li><b>Hot endpoints (millions of events/min):</b> shard into N parallel queues by hash(msg_id) so a single endpoint can use all worker capacity.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>At-least-once</td><td>Simple, durable</td><td>Customer must dedupe</td></tr>
+<tr><td>Per-endpoint queue</td><td>Isolation, fairness</td><td>Many small queues; mgmt overhead</td></tr>
+<tr><td>Kafka spine</td><td>Replay, audit, replicate</td><td>Operational complexity</td></tr>
+<tr><td>HMAC vs mTLS</td><td>Easy to adopt</td><td>Customer must store shared secret</td></tr>
+<tr><td>Auto-disable on 410 Gone</td><td>Stops noise</td><td>Risk of disabling a flaky-but-live endpoint</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 9 Consistency &amp; Consensus — why "exactly-once over the network" is unattainable; idempotency is the answer.</li>
+  <li>Ch. 11 Stream Processing — Kafka as the durable event log; reprocessing for backfills.</li>
+  <li>Ch. 8 Trouble with Distributed Systems — partial failures of customer endpoints, timeouts, and the Two Generals echo.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The most common interviewer trap is conflating ordering with at-least-once — I'll declare that we don't guarantee per-endpoint ordering during retries, and document it."</li>
+  <li>"SSRF is the number-one production incident category for webhook services; I'd budget real time on URL validation, DNS pinning, and a deny-listed egress proxy."</li>
+  <li>"For the dashboard's 'replay' button, I keep raw payloads in S3 with a 30-day TTL — replay re-enqueues from S3, not from Kafka, so we don't run out of Kafka retention."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Apache Kafka (event spine)</td><td>Stripe-scale 5 B attempts/month needs durable replay for backfills and the 30 TB queue storage at 3-day TTL; Kafka's append-only log lets us reprocess after bug fixes without re-running customer-facing producers.</td><td>RabbitMQ (no replay, harder at 50 K rps peak); Kinesis (24 h retention vs Kafka's 7+ day).</td></tr>
+    <tr><td>Redis Streams (per-endpoint queue)</td><td>Per-endpoint isolation needs millions of small queues with cheap creation/teardown; Streams' consumer groups + XAUTOCLAIM give exactly-once dispatch within a group at sub-ms latency.</td><td>One Kafka topic per endpoint (broker meltdown at 50 M endpoints); SQS (per-queue cost prohibitive).</td></tr>
+    <tr><td>Redis ZSET (retry scheduler)</td><td>Score = next_attempt_epoch makes "what's due now?" an O(log N) ZRANGEBYSCORE; popping due tasks every second across 250 M monthly retries fits the 10 s first-attempt p99 trivially.</td><td>SQL "SELECT WHERE next_attempt &lt; now" (lock contention); SQS DelaySeconds (15-min cap).</td></tr>
+    <tr><td>PostgreSQL (subscriptions)</td><td>50 M subscriptions × 200 B = 10 GB; partial index <code>WHERE disabled_at IS NULL</code> and array-typed <code>event_filter</code> with GIN gives the relational queries (per-account dashboards) without sharding.</td><td>DynamoDB (no array index for event filtering); MongoDB (weaker constraints on critical billing data).</td></tr>
+    <tr><td>Cassandra (attempt log)</td><td>Append-heavy 5 B writes/month at 50 K rps peak is exactly LSM-tree's sweet spot; partition by <code>endpoint_id</code> with <code>CLUSTERING ORDER BY (msg_id DESC)</code> serves the dashboard "last 100 attempts" query in one row read.</td><td>Postgres (vacuum cost on 5 B-row table); ClickHouse (overkill for point lookups).</td></tr>
+    <tr><td>HMAC-SHA256 signing</td><td>Customers can verify with a 5-line snippet in any language; SHA-256 is hardware-accelerated on x86/ARM, keeping the per-request signing under 10 µs even at 50 K rps peak — no measurable hot-path cost.</td><td>RSA sig (50× CPU); mTLS (customer must manage cert; adoption friction).</td></tr>
+    <tr><td>HTTP/2 connection pool</td><td>Customer endpoints are TLS-heavy; persistent multiplexed connections reuse the handshake across many deliveries — measured 10× throughput vs HTTP/1.1 keep-alive at the 5 M in-flight connection peak.</td><td>HTTP/1.1 (head-of-line per conn); HTTP/3 (immature, customer infra often blocks UDP).</td></tr>
+    <tr><td>Token bucket (per-endpoint)</td><td>200 in-flight + 50 rps caps protect a slow endpoint from starving the global pool; bucket state in Redis lets any worker enforce limits without sticky routing.</td><td>Leaky bucket (less burst tolerance); no rate limit (one bad endpoint takes down the fleet).</td></tr>
+    <tr><td>Apache Flink / Go workers</td><td>Delivery work is CPU-light, IO-heavy at 5 M concurrent connections; Go's goroutines + epoll model handle 500 conn/pod across 10 K pods cheaper than JVM threads.</td><td>Java/Vert.x (heavier per-connection); Node.js (single-threaded ceiling).</td></tr>
+    <tr><td>Amazon S3 (raw payload archive)</td><td>30-day TTL on raw payloads at 5 B × 2 KB = 10 TB/month; replay button re-enqueues from S3 (cheap) instead of from Kafka (limited retention), keeping replay free of compaction-vs-retention tension.</td><td>Kafka long-retention (10× cost); database BLOB (vacuum/IO ceiling).</td></tr>
+    <tr><td>DNS pinning + egress proxy</td><td>SSRF is the #1 production incident category for webhook services; resolving once and pinning the IP through a deny-list-aware proxy blocks DNS rebinding attacks on RFC1918/169.254.169.254.</td><td>Resolve-at-connect (rebinding window); allowlist (impossible at internet scale).</td></tr>
+    <tr><td>Argon2id + envelope-encrypted secrets</td><td>HMAC secrets are bearer tokens — encrypting at rest with KMS-wrapped DEKs keeps the 50 M-row Postgres dump useless if exfiltrated; rotation re-emits dual signatures for 24 h, easing customer migration.</td><td>Plaintext (catastrophic on breach); HSM per secret (cost prohibitive at 50 M secrets).</td></tr>
+    <tr><td>Prometheus + alertmanager</td><td>Per-endpoint success rate, queue depth, and circuit-breaker-open metrics need histogram quantiles; Prom's pull model with sub-minute scrape catches the 50-consecutive-failure threshold before customer impact escalates.</td><td>Statsd (lossier counters); CloudWatch (per-endpoint cardinality cost-prohibitive).</td></tr>
+  </tbody>
+</table>

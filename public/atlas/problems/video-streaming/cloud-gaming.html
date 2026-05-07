@@ -1,0 +1,134 @@
+<h1>Design Cloud Gaming (Stadia / GeForce Now — sub-50ms input-to-pixel)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">cdn</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a cloud gaming service that runs full-fat AAA games on GPU servers in datacenters and streams the rendered video to thin clients (browser, phone, TV). Input (controller, mouse, keyboard) travels back to the server. The hard constraint is end-to-end input-to-pixel latency under 50–80 ms — otherwise FPS games are unplayable. Must support millions of concurrent sessions and hundreds of game titles.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Launch any supported game in <30s from click.</li>
+  <li>1080p60 default, 4K60 / 120fps premium tiers.</li>
+  <li>Controller, keyboard, mouse, touch input.</li>
+  <li>Save game state to cloud; resume across devices.</li>
+  <li>Multiplayer matchmaking integrated with publisher backends.</li>
+  <li>Family/parental controls, session time limits.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> input-to-pixel < 80 ms p95 within region; <50 ms p50.</li>
+  <li><b>Scale:</b> 1M concurrent sessions globally.</li>
+  <li><b>Reliability:</b> session resume after transient disconnects up to 30s.</li>
+  <li><b>Image quality:</b> 35+ Mbps effective at 4K, 15 Mbps at 1080p; PSNR > 40 dB.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>GPU fleet:</b> 1M sessions; one GPU per session at peak (some lighter games can multi-tenant). 1M GPUs is impractical → ~250K NVIDIA A10G/L4 tier multiplexed at avg 4 sessions/GPU = 250K GPUs.</li>
+  <li><b>Bandwidth:</b> 1M * 20 Mbps = 20 Tb/s egress; this is comparable to all of Twitch peak.</li>
+  <li><b>Storage:</b> game library 200 titles * 80 GB avg = 16 TB; replicated to every PoP. Save states ~50 MB each * 100M users = 5 PB.</li>
+  <li><b>PoP density:</b> need a PoP within ~30 ms RTT of every user → ~50 PoPs globally for tier-1 markets.</li>
+  <li><b>Provisioning:</b> session warm-pool 1% of capacity (always-on idle VMs) to keep launch latency under 5s.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/sessions               {gameId, region}      → sessionId, edgeUrl, ice
+WS   /v1/sessions/{id}/control                        ↔ {input, ping, hud}
+SRTP /v1/sessions/{id}/media    (UDP)                 ← H.265 video, Opus audio
+POST /v1/saves                  {sessionId, blob}     → saveId
+POST /v1/sessions/{id}/resume                         → newEdgeUrl</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]                                      [Edge PoP]
+   |  controller --WebSocket/UDP--> [Input Forwarder] --> [Game VM (GPU)]
+   |                                                          |
+   |                                                          v
+   |  <----H.265/Opus over SRTP---  [HW Encoder (NVENC)] <-- [Rendered frames]
+                                                              |
+                                                              v
+                                                         [Save Sync] -> [S3]
+   [Auth/Session API] -> [Scheduler] -> [GPU Pool Mgr] -> [Game Image Cache]
+</div>
+<p>Walk-through: client requests session; scheduler picks the nearest PoP with available GPU and a warm VM with the requested game image. Client establishes a WebRTC data channel for input and an SRTP receiver for video/audio. Game runs in a Windows/Linux VM with a virtual GPU; frames are HW-encoded and streamed.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Sessions (Redis cluster)</h3>
+<pre>HSET session:{id} userId 12345 gameId witcher3 vmId vm-iad-7842
+                  startedAt 1714999999 lastInputAt 1715000050
+EXPIRE session:{id} 14400</pre>
+<h3>7.2 Save game blobs</h3>
+<p>Per-user, per-game; stored in S3 with versioning. Synced on game save callbacks and on session end. Cache last save in Redis for fast resume.</p>
+<h3>7.3 Game images</h3>
+<p>Distributed read-mostly: a master copy in object storage; each PoP has a local NVMe-backed cache. Use content-addressed dedup so 200 titles sharing engine binaries don't bloat storage.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 GPU multi-tenancy</h3>
+<p>NVIDIA MIG (Multi-Instance GPU) or vGPU partitions a single A100/L4 into 4–7 slices. Each slice gets dedicated VRAM and SMs, isolated from neighbors. Lighter games (indie, mobile ports) share more aggressively; AAA gets dedicated GPU.</p>
+<h3>8.2 Encoder pipeline</h3>
+<p>Game renders to a back-buffer; capture path uses NVFBC (NVIDIA Frame Buffer Capture) or Vulkan capture extension to grab without a GPU-CPU round-trip. NVENC encodes H.265 at low-latency preset (P1, lookahead off) in <2 ms per frame.</p>
+<h3>8.3 Input path</h3>
+<p>Client samples controller at 250 Hz; sends each event over WebRTC data channel (unreliable ordered) — UDP avoids head-of-line blocking. Server replays event into the game's HID via virtual gamepad driver.</p>
+<h3>8.4 Latency budget (target 60 ms total)</h3>
+<p>input capture 4ms + network up 20ms + game tick 16.6ms (1 frame) + encode 4ms + network down 15ms + decode 5ms + display ~ 65ms.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>GPU is the bottleneck cost:</b> CapEx dominates. Drive utilization via diurnal load balancing (Asia peak fills NA daytime capacity).</li>
+  <li><b>Cold start:</b> Windows + AAA game cold boot is 60–120s. Mitigate with warm pools (per-title) and snapshot/resume of running VMs.</li>
+  <li><b>Network jitter:</b> dynamic FEC (5–20% redundancy) and adaptive bitrate; on 5%+ loss, drop from 1080p to 720p inside one frame.</li>
+  <li><b>NAT/firewall:</b> 100% UDP; need TURN-over-TCP fallback for restrictive networks (extra 10–20 ms).</li>
+  <li><b>Hot title spikes (game release day):</b> pre-stage image to all PoPs and pre-warm 5K VMs the day of launch.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>H.265 vs H.264</td><td>30% better quality at same bitrate</td><td>Patent licensing, decoder availability</td></tr>
+<tr><td>WebRTC media transport</td><td>Mature, browser-native</td><td>Designed for conferencing, not pristine quality</td></tr>
+<tr><td>Per-session VM</td><td>Strong isolation, security</td><td>Boot time, RAM overhead</td></tr>
+<tr><td>MIG / vGPU multi-tenancy</td><td>4× GPU utilization for casual games</td><td>Performance variance, driver complexity</td></tr>
+<tr><td>Edge PoPs (50+)</td><td>Sub-30ms RTT for 95% of users</td><td>CapEx, capacity stranded by region</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 8 Trouble with Distributed Systems — clock and frame-pacing skew between client and server.</li>
+  <li>Ch. 5 Replication — read-mostly replication of game images to PoPs.</li>
+  <li>Ch. 11 Stream Processing — telemetry pipeline for input-to-pixel measurement and SLO alerting.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Cloud gaming is fundamentally a real-time hardware-rendering problem disguised as a streaming problem — the hardest sub-system is the GPU pool manager."</li>
+  <li>"I'd treat the 16.6 ms render frame as fixed and squeeze every other phase: NVENC at 4 ms, capture-zero-copy via NVFBC, kernel-bypass UDP — anything more is luxury."</li>
+  <li>"Stadia's failure was not technology — latency was actually solid — but business: the library, the per-game purchase model, and CapEx pricing didn't fit consumer expectations."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>NVIDIA A10G / L4 GPUs</b></td><td>Per-session GPU rendering at 1080p60 / 4K60 needs dedicated VRAM and SMs; A10G hits the price/performance sweet spot for 4-way multi-tenancy via MIG, keeping CapEx tractable on a 250K GPU fleet.</td><td>A100 — overprovisioned for 1080p; consumer RTX — no MIG/vGPU support, ToS blocks data-center use</td></tr>
+    <tr><td><b>NVIDIA MIG / vGPU</b></td><td>Partitions one GPU into 4–7 isolated slices with dedicated VRAM/SMs; AAA games get full GPU, indie/mobile ports share — drives 4× utilization and cuts CapEx by ~75% for the long tail.</td><td>Time-sliced GPUs — quality variance unacceptable for FPS; dedicated GPU per session — economically infeasible</td></tr>
+    <tr><td><b>NVENC (HW H.265 encode)</b></td><td>&lt; 2 ms encode per frame in the 60 ms latency budget; software encoding would consume an entire CPU per session at 60fps — nothing else fits the budget.</td><td>Software x265 — 50ms+ per frame, blows budget; Intel QuickSync — quality regression on game footage</td></tr>
+    <tr><td><b><code>H.265</code> (HEVC)</b></td><td>30% better quality at the same bitrate as H.264, critical at 35 Mbps 4K where every Mbps matters for ISP last-mile; PSNR &gt; 40 dB target requires the modern codec's coding tools.</td><td>H.264 — 30% bandwidth bloat; AV1 — encoder hardware too rare in 2024 mobile decoders</td></tr>
+    <tr><td><b>NVFBC (frame capture)</b></td><td>NVIDIA Frame Buffer Capture grabs rendered back-buffer without a GPU↔CPU round-trip; standard capture would add 4–8 ms, blowing the 60 ms input-to-pixel budget by 10–15%.</td><td>DXGI Desktop Duplication — slower; CPU readback — adds 8ms per frame</td></tr>
+    <tr><td><b><code>WebRTC</code> (data channel + SRTP)</b></td><td>Browser-native, mature NAT traversal, congestion control, and ICE — reusing it for input (data channel) and media (SRTP) means we don't reinvent UDP transport. Unreliable-ordered data channel matches input semantics.</td><td>Custom UDP — reinvents NAT/FEC; QUIC — emerging, no game-input transport profile</td></tr>
+    <tr><td><b>Opus (audio)</b></td><td>Adaptive 6–510 kbps with PLC and 20ms frames; mandatory in <code>WebRTC</code> spec and handles game audio (music + SFX + voice chat) without re-tuning per title.</td><td>AAC — higher latency; G.711 — narrowband only</td></tr>
+    <tr><td><b>Redis Cluster (sessions)</b></td><td>1M concurrent sessions need sub-ms HSET/HGET on session:{id} for input forwarding and 4-hour TTL for cleanup; predictable single-digit-ms reads at this fanout require in-memory KV.</td><td>DynamoDB — too slow for 250 Hz input dispatch; etcd — wrong access pattern</td></tr>
+    <tr><td><b>S3 (save game blobs)</b></td><td>5 PB of save states across 100M users with versioning for rollback; 50 MB blobs are perfect S3 size and durability requirements (loss = lost progress) demand 11 nines.</td><td>Block storage — overpriced for blob workload; HDFS — durability needs triple-replicate</td></tr>
+    <tr><td><b>NVMe-backed PoP cache (game images)</b></td><td>200 titles × 80 GB = 16 TB game library replicated to all 50 PoPs; NVMe latency keeps game launch &lt; 30s and content-addressed dedup reduces engine-binary duplication.</td><td>Spinning disk — load times unacceptable; pull-on-demand — 80 GB transfer to remote PoP is too slow</td></tr>
+    <tr><td><b>Content-addressed dedup</b></td><td>Many AAA titles share Unreal/Unity engine binaries; CAS storage means 200 titles don't duplicate 50 GB of common runtime, saving ~8 TB per PoP.</td><td>Per-title naive copy — wastes NVMe; manual dedup — error-prone</td></tr>
+    <tr><td><b>Warm pool (1% capacity)</b></td><td>Always-on idle VMs pre-loaded with the game image keep launch latency under 5s; cold Windows + AAA boot is 60–120s, killing the &lt;30s session start SLO.</td><td>No warm pool — 60s+ launch; 100% pre-warm — wastes 99% of capacity</td></tr>
+    <tr><td><b>Dynamic FEC + ABR</b></td><td>5–20% redundancy adapts to packet loss in real time; on 5%+ loss the system drops 1080p→720p inside one frame to keep the game playable, since latency is non-negotiable while quality can degrade.</td><td>Static FEC — wastes bandwidth on clean networks; no FEC — game unplayable on 2% loss</td></tr>
+    <tr><td><b>TURN-over-TCP fallback</b></td><td>Restrictive corporate/cellular networks block UDP; TURN-over-TCP costs +10–20ms but is the only way to keep the 100% UDP design reachable for the long tail of network conditions.</td><td>UDP-only — locks out enterprise users; full TCP — adds HoL blocking on game packets</td></tr>
+    <tr><td><b>50+ Edge PoPs</b></td><td>Sub-30ms RTT for 95% of users requires a PoP within ~200km of major metros; the 60 ms latency budget can absorb 35ms of network round-trip but no more.</td><td>Centralized DCs — fails the &lt;80ms SLO; 200+ PoPs — capex unjustifiable</td></tr>
+  </tbody>
+</table>

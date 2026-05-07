@@ -1,0 +1,198 @@
+<h1>Design A/B Testing Platform (bucketing, stats engine, guardrails)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">recommendation</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design an experimentation platform powering 1000+ concurrent A/B tests at TikTok scale (1B users, 200M DAU). Must handle deterministic bucketing in microseconds, exposure logging, daily metric computation, sequential testing with guardrails (latency, crashes), and a UI for PMs/scientists to launch and read out experiments.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Define experiments with arms, traffic allocation, eligibility predicates.</li>
+  <li>Deterministic, sticky bucketing per (user, experiment).</li>
+  <li>Mutually-exclusive layers and orthogonal layers (factorial designs).</li>
+  <li>Exposure log: every flag check writes (user, exp, arm, ts).</li>
+  <li>Compute daily and cumulative metrics with confidence intervals.</li>
+  <li>Auto-shutdown on guardrail violation (crash rate, p99 latency).</li>
+  <li>Sample ratio mismatch (SRM) detection.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> bucket assignment p99 under 1 ms in-process; remote eval under 5 ms.</li>
+  <li><b>Scale:</b> 200M DAU * 1000 flags * 100 evals/session = 20T evals/day = 230M QPS.</li>
+  <li><b>Metric freshness:</b> daily counts within 4 hours of midnight; near-real-time dashboards within 5 min.</li>
+  <li><b>Correctness:</b> identical user always gets same arm; bucket changes audited.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Bucketing: 230M QPS, but co-located in app via SDK -&gt; 0 network cost.</li>
+  <li>Exposure events: 200M DAU * 1000 flags * 5 unique daily = 1T events/day, 200 bytes -&gt; 200 TB/day raw, ~50 TB compressed.</li>
+  <li>Metric pipeline: 50 TB/day Spark scan, 4-hour SLO with 200-node cluster.</li>
+  <li>Config distribution: 1000 experiments * 2KB = 2MB config, refreshed every 60s to clients.</li>
+  <li>Storage: exposures retained 90 days = 4.5 PB, on S3 + Iceberg.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// SDK
+bool inArm(userId, expId, arm)         // local hash, 1 us
+Variant getVariant(userId, expId)      // returns control/treatment/...
+
+// Control plane
+POST /v1/experiments {name, layers, arms, allocation, eligibility}
+POST /v1/experiments/{id}/ramp  {fraction}
+GET  /v1/experiments/{id}/readout?metric=ctr  -> {effect, ci, pvalue}
+POST /v1/experiments/{id}/halt   (auto or manual)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App + SDK]
+   |  bucket = hash(userId + expSalt) % 10000
+   |  emit exposure event
+   v
+[Kafka exposures] -> [Flink dedupe + SRM check] -> [S3/Iceberg]
+                                                       |
+                                                       v
+                              [Spark daily metrics] -> [Metric Store (BigQuery/Druid)]
+                                                                    |
+                              [Stats engine: t-test/CUPED/sequential]|
+                                                                    v
+                                                            [Readout UI]
+
+Config plane:
+[Console UI] -> [Experiment Svc (Postgres)] -> [Config CDN] -> SDK polls
+</div>
+<p>Walk-through: SDK does local bucketing using a config snapshot; emits one exposure event per (user, exp, day) via dedupe layer. Daily Spark job aggregates metrics, joins guardrails, writes to a metric store. Stats engine runs t-tests / sequential tests, surfaces in UI.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Experiment metadata (Postgres)</h3>
+<pre>CREATE TABLE experiments (
+  exp_id text PRIMARY KEY, name text, status text,
+  layer text, salt text, created_at timestamptz);
+CREATE TABLE arms (
+  exp_id text, arm text, allocation_bps int, params jsonb,
+  PRIMARY KEY (exp_id, arm));</pre>
+<h3>7.2 Exposure log (Iceberg on S3)</h3>
+<pre>Partitioned by (date, exp_id). Columns: user_id, exp_id, arm, ts, ctx.
+Compaction: daily merge of small files; Z-order on (exp_id, user_id).</pre>
+<h3>7.3 Bucketing</h3>
+<p>arm = arms[ murmur3_128(user_id || ":" || exp_salt) mod 10000 / 10000 * cumulative_alloc ]. Salt per experiment ensures orthogonality across layers; same salt within a layer ensures mutual exclusion.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Stats engine</h3>
+<p>Frequentist: Welch's t-test on per-user mean metric, with CUPED variance reduction using a 30-day pre-period covariate (typically reduces variance ~30%). Sequential: mSPRT for daily peeking without alpha inflation. Bayesian alternative for low-power surfaces.</p>
+<h3>8.2 Guardrails</h3>
+<p>Auto-halt when: arm crash rate &gt;control + 0.5pp, p99 latency +30 ms, SRM p&lt;0.001, or revenue -2% with 95% CI. Halt latency under 10 minutes via near-real-time aggregator on the same Flink job.</p>
+<h3>8.3 SDK</h3>
+<p>5 KB binary delta config pulled every 60s from a CDN-fronted config service. Falls back to last-good on fetch failure. Bucketing is pure-functional, fully offline-capable.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Exposure flood:</b> dedupe to one event per (user, exp, day) at the Flink layer cuts volume 100x.</li>
+  <li><b>SRM false positives:</b> with 1000 experiments and p&lt;0.01, you'll fire 10/day by chance; use Bonferroni or FDR control.</li>
+  <li><b>Network effects:</b> social/marketplace experiments leak between arms; cluster-randomize by region or social cluster.</li>
+  <li><b>Config drift:</b> stale SDK keeps using old config; bound to 5 min and reject older with circuit breaker.</li>
+  <li><b>Metric store hotspots:</b> top experiments queried 100x more; cache readouts for 5 min.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Local SDK bucketing</td><td>Microsecond, offline-safe</td><td>Config sync lag</td></tr>
+<tr><td>Remote bucketing</td><td>Instant ramp-down</td><td>Network cost, SPOF</td></tr>
+<tr><td>Frequentist + sequential</td><td>Fast halts, well-understood</td><td>Stats expertise needed</td></tr>
+<tr><td>Bayesian readouts</td><td>Intuitive, peek-safe</td><td>Priors hard to defend</td></tr>
+<tr><td>CUPED variance reduction</td><td>~30% smaller samples</td><td>Needs pre-period data</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 10 Batch Processing — Spark daily metric jobs over Iceberg exposure log.</li>
+  <li>Ch. 11 Stream Processing — Flink for exposure dedupe, SRM, near-real-time guardrails; exactly-once via Kafka transactional writes.</li>
+  <li>Ch. 7 Transactions — idempotent exposure writes with dedupe key (user, exp, day).</li>
+  <li>Ch. 9 Consistency &amp; Consensus — config plane needs strong consistency; metric plane is fine with eventual.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Bucketing is the single most reliability-sensitive surface; it must be local, deterministic, and never break a user."</li>
+  <li>"The hardest part is trust. PMs need readouts they believe; that means SRM checks, CUPED, sequential testing, and a culture of pre-registered hypotheses."</li>
+  <li>"For network-effect surfaces I'd push for cluster-randomized designs even though they hurt power."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Murmur3-128 (bucketing hash)</td>
+      <td>230M QPS of bucketing must be local and 1us per call; Murmur3 is non-cryptographic, well-distributed, and faster than CityHash on common ARM/x86 mobile devices. 128-bit output gives 10000-bucket precision with negligible collision risk.</td>
+      <td>SHA256 (10x slower, overkill); xxHash (great speed but weaker distribution at low bucket counts).</td>
+    </tr>
+    <tr>
+      <td>In-process SDK bucketing</td>
+      <td>200M DAU * 1000 flags * 100 evals = 230M QPS would require thousands of remote eval boxes; local bucketing reduces that to 0 network cost and gives the sub-1ms p99 the design demands. Offline-safe critical for mobile.</td>
+      <td>Remote flag service (network cost, SPOF); edge-cached eval (weaker offline).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka</td>
+      <td>1T exposure events/day at 200 bytes = 2.3M events/sec peak; Kafka's partitioned log handles the throughput and gives Flink replay-from-offset semantics for the SRM and dedupe pipeline.</td>
+      <td>Kinesis (lower retention, per-shard cap); Pulsar (smaller Flink connector ecosystem).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink</td>
+      <td>Dedupe to one event per (user, exp, day) cuts volume 100x; Flink keyed-state with TTL plus Kafka transactional sinks gives exactly-once guarantees per DDIA Ch.11. Same job emits near-real-time guardrails feeding the &lt;10min auto-halt SLO.</td>
+      <td>Spark Streaming (micro-batch lag breaks 10min halt); Kafka Streams (state size unfriendly to 200M-key dedupe).</td>
+    </tr>
+    <tr>
+      <td>Apache Spark</td>
+      <td>Daily metrics over 50 TB/day compressed exposure log with a 4-hour SLO needs a 200-node cluster doing wide shuffles for per-experiment aggregations; Spark's Catalyst optimizer plus Iceberg pruning meets the window.</td>
+      <td>Trino (better ad-hoc, weaker scheduled-job tooling); Beam (vendor-coupled).</td>
+    </tr>
+    <tr>
+      <td>Apache Iceberg on S3</td>
+      <td>4.5 PB exposure log retained 90 days needs partition-pruned reads for daily metric jobs; Iceberg's hidden partitioning by (date, exp_id) plus Z-order on (exp_id, user_id) gives O(1) experiment scans without listing all files.</td>
+      <td>Hive tables (no atomic writes, slower planning); Delta Lake (similar; Iceberg picked for engine neutrality).</td>
+    </tr>
+    <tr>
+      <td>BigQuery / Druid (metric store)</td>
+      <td>PMs query readouts with sub-5min freshness and slice/dice across 1000 experiments * 100 metrics; columnar OLAP with pre-aggregated rollups is the only architecture that supports interactive readout latency.</td>
+      <td>Postgres (cannot scale to 4.5 PB); ClickHouse (viable; chose Druid for time-series rollup ergonomics).</td>
+    </tr>
+    <tr>
+      <td>PostgreSQL (experiment metadata)</td>
+      <td>1000 active experiments with arms, allocations, eligibility predicates is small (&lt;10 GB) but mutates frequently and requires ACID for the ramp/halt control plane; Postgres is the safe correct choice.</td>
+      <td>etcd (no relational queries for arm config); MySQL (similar; Postgres picked for jsonb richness).</td>
+    </tr>
+    <tr>
+      <td>CDN config distribution</td>
+      <td>2MB binary delta config refreshed every 60s to 200M DAU SDKs needs caching; CDN edge serves 99% of these without origin load, and 60s staleness is bounded by the 5-min circuit-breaker reject threshold.</td>
+      <td>Direct origin (origin overload); push via WebSocket (mobile battery cost).</td>
+    </tr>
+    <tr>
+      <td>Welch's t-test + CUPED</td>
+      <td>Per-user mean metric with unequal variances is the realistic distribution; CUPED with a 30-day pre-period covariate cuts variance ~30%, meaning we need ~30% smaller samples to detect the same effect, which is essential at 1000 concurrent experiments.</td>
+      <td>Mann-Whitney U (less power on continuous metrics); raw t-test (variance budget too high).</td>
+    </tr>
+    <tr>
+      <td>mSPRT (sequential testing)</td>
+      <td>PMs peek daily; classical fixed-horizon t-tests inflate alpha catastrophically. mSPRT (mixture sequential probability ratio test) preserves alpha under continuous monitoring, which is the only honest way to support the daily readout culture.</td>
+      <td>Bonferroni-on-peeks (over-conservative); always-valid CIs (similar; mSPRT chosen for tooling familiarity).</td>
+    </tr>
+    <tr>
+      <td>Bonferroni / FDR control</td>
+      <td>1000 experiments at p&lt;0.01 fire 10 false SRM alerts/day by chance; multiple-testing correction (Bonferroni for guardrails, BH-FDR for exploratory readouts) is mandatory to keep the alert volume actionable.</td>
+      <td>Per-test alpha=0.05 (alarm fatigue); no correction (loss of trust).</td>
+    </tr>
+    <tr>
+      <td>Bloom filter (dedupe assist)</td>
+      <td>Exposure dedupe at 1T events/day uses Flink keyed-state but a per-(user,exp,day) bloom in front avoids most state lookups; small RAM footprint, microsecond check, FP rate acceptable for an optimization layer.</td>
+      <td>Pure Flink state (more RAM, slightly slower); HyperLogLog (counts not membership).</td>
+    </tr>
+  </tbody>
+</table>
