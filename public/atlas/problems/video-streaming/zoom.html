@@ -1,0 +1,139 @@
+<h1>Design Zoom (video conferencing)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a video conferencing platform supporting 1:1 calls, small huddles, and large webinars (up to 10K active viewers, 1K speakers). Audio/video must be real-time (<200ms mouth-to-ear), resilient to packet loss, and run on phones, browsers, desktop apps. The system must also handle screen share, recording, breakout rooms, chat, and PSTN bridging — at planet scale with 300M daily meeting participants.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Schedule and join meetings with Meeting ID + passcode or SSO.</li>
+  <li>Multi-party audio/video; up to 49 tiles in gallery view, simulcast streams.</li>
+  <li>Screen share, virtual backgrounds, raise-hand, reactions.</li>
+  <li>Cloud recording to MP4 with searchable transcript.</li>
+  <li>Breakout rooms (split N participants into M sub-meetings).</li>
+  <li>PSTN dial-in/out, SIP gateway for room systems.</li>
+  <li>Webinar mode: hosts, panelists, view-only attendees.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> end-to-end audio < 150 ms p95; video < 200 ms p95.</li>
+  <li><b>Scale:</b> 300M daily participants, peak 30M concurrent.</li>
+  <li><b>Reliability:</b> packet-loss tolerance up to 30% via FEC + retransmit.</li>
+  <li><b>Availability:</b> 99.99% control plane, 99.95% media plane.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Concurrent meetings:</b> 30M participants / avg 5 = 6M meetings.</li>
+  <li><b>Bandwidth:</b> 30M * avg 1.5 Mbps up + 1.5 Mbps down = 90 Tb/s aggregate.</li>
+  <li><b>SFU footprint:</b> a single SFU box handles ~500 participants → 60K SFU nodes globally; ~120 PoPs.</li>
+  <li><b>Recording:</b> 10% of meetings recorded * avg 45min * 0.5 Mbps = ~150 PB/year stored to S3.</li>
+  <li><b>Signaling QPS:</b> 6M meetings * 4 control msgs/sec = 24M msg/s on the control plane.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v2/meetings              {topic, scheduledAt}    → meetingId, passcode, joinUrl
+POST /v2/meetings/{id}/join     {token, deviceCaps}    → sfuEdge, ice, turnCreds
+WS   /v2/signaling              (per-meeting room)     ↔ {sdp, ice, mute, leave}
+POST /v2/recordings/start       {meetingId}            → recordingId
+GET  /v2/recordings/{id}                               → mp4Url, transcriptUrl</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] --HTTPS--> [Edge LB] --> [Signaling Cluster] --> [Meeting Coordinator]
+   |                                                            |
+   |                                                            v
+   |                                                       [SFU Selector]
+   |                                                            |
+   +----UDP/SRTP----------------------------------------> [SFU Edge PoP]
+                                                              |
+                                                              +--> [Recording Pod] --> [S3]
+                                                              +--> [Transcribe Svc] --> [Postgres]
+                                                              +--> [PSTN Gateway]
+</div>
+<p>Walk-through: Client signs in, requests to join a meeting; the coordinator picks a SFU PoP near the centroid of participants. Media flows over UDP/SRTP via the SFU which forwards (not mixes) packets. Recording, transcription, and PSTN are independent subscribers that pull from the SFU.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Meeting metadata (Postgres, sharded by meeting_id)</h3>
+<pre>CREATE TABLE meetings (
+  meeting_id bigint PRIMARY KEY,
+  host_id bigint, topic text, scheduled_at timestamptz,
+  passcode text, sfu_pop text, started_at timestamptz, ended_at timestamptz
+);
+CREATE TABLE participants (
+  meeting_id bigint, user_id bigint, joined_at timestamptz, role text,
+  PRIMARY KEY (meeting_id, user_id)
+);</pre>
+<h3>7.2 Recording index (DynamoDB)</h3>
+<pre>recording_id (PK) | meeting_id | s3_uri | duration_s | transcript_id | retention_days</pre>
+<h3>7.3 Why SFU vs MCU?</h3>
+<p>SFU forwards encrypted streams without decoding — 10× cheaper CPU than MCU mixing, and preserves E2E options. Trade-off: client must decode N streams (Zoom mitigates with simulcast and SVC layer dropping).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 SFU</h3>
+<p>Built on libwebrtc forks; runs on bare-metal with kernel-bypass UDP (DPDK). Each participant publishes 3 simulcast layers (180p, 360p, 720p); SFU subscribes others to the layer matching their viewport. SVC is used for screen-share where layered SVC bitrate adaptation reduces CPU vs simulcast.</p>
+<h3>8.2 Congestion control</h3>
+<p>Google Congestion Control (GCC) per stream; SFU passes REMB/TWCC feedback. On 5%+ loss, client downgrades to next simulcast layer; on 30% loss, audio-only fallback.</p>
+<h3>8.3 Breakout rooms</h3>
+<p>Logically a parent meeting spawns N child meetings; SFU keeps the same physical session and re-routes pub/sub maps server-side, so participants don't reconnect.</p>
+<h3>8.4 Recording</h3>
+<p>Recording bot subscribes as a virtual participant; mixes layouts server-side via headless renderer; uploads MP4 in 30s chunks to S3 multipart, finalized when meeting ends.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot meetings (10K+ webinars):</b> use a cascaded SFU tree — one origin SFU forks to N relay SFUs that each serve up to 1K viewers.</li>
+  <li><b>Geographic optimization:</b> coordinator picks SFU minimizing weighted RTT to participants; live-migrates if centroid shifts (e.g., majority join late from another region).</li>
+  <li><b>NAT traversal:</b> 80% of clients reach SFU directly via STUN; 20% need TURN relay → TURN cluster sized at 25% of SFU bandwidth.</li>
+  <li><b>Signaling scale:</b> Kafka-backed pub/sub per meeting room; meeting-level state in Redis with lease; failover via Raft (5-node etcd) for coordinator.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>SFU forwarding (no mixing)</td><td>Low CPU, preserves quality, supports E2E</td><td>Client decodes N streams</td></tr>
+<tr><td>Simulcast 3-layer</td><td>Bandwidth-adaptive without re-encode</td><td>3× upload bandwidth</td></tr>
+<tr><td>UDP/SRTP over QUIC</td><td>Lower latency, mature</td><td>NAT/firewall punching needed</td></tr>
+<tr><td>Cascaded SFUs for webinars</td><td>Linear scale to 10K+ viewers</td><td>Extra hop = +30 ms latency</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 8 Trouble with Distributed Systems — clock-skew handling for AV sync.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — Raft for meeting coordinator leadership.</li>
+  <li>Ch. 11 Stream Processing — recording pipeline and live transcription.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd separate signaling (TCP, control) from media (UDP, real-time) — they have totally different reliability and latency profiles."</li>
+  <li>"SFU vs MCU: SFU wins on CPU and quality but pushes complexity to the client; for webinars I cascade SFUs into a tree to scale viewers without exploding upload bandwidth."</li>
+  <li>"PSTN is a hard problem — I'd model it as a transcoding bridge that ingests PCM, runs WebRTC, and joins as a virtual participant."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b><code>WebRTC</code> (libwebrtc)</b></td><td>Browser-native API for getUserMedia + DTLS-SRTP gives sub-200ms mouth-to-ear without plugins; <code>WebRTC</code> congestion-control (GCC) and FEC handle 30% packet loss out of the box.</td><td>Custom UDP — reinvents NAT traversal/FEC; <code>HLS</code> — wrong latency profile by 100×</td></tr>
+    <tr><td><b>SFU (Selective Forwarding Unit)</b></td><td>10× cheaper CPU than MCU mixing for 60K SFU nodes serving 30M concurrent; preserves E2E encryption option since SFU forwards opaque encrypted RTP, only inspecting headers.</td><td>MCU — 10× CPU cost; mesh P2P — quadratic upload past 4 peers</td></tr>
+    <tr><td><b>Simulcast (3-layer)</b></td><td>Each publisher sends 180p/360p/720p; SFU subscribes others to the layer matching their viewport — no server-side re-encode needed for adaptive delivery to weak clients.</td><td>SVC — Zoom uses SVC for screen-share but simulcast is more universally encoder-supported; single-layer — no adaptation</td></tr>
+    <tr><td><b>UDP/SRTP</b></td><td>Low-latency real-time media must avoid TCP head-of-line blocking; SRTP encrypts payloads while keeping RTP headers visible to SFU for layer selection.</td><td>TCP — HoL blocking kills latency; QUIC — viable future, RTP-over-QUIC standardization in flight</td></tr>
+    <tr><td><b>DPDK (kernel-bypass UDP)</b></td><td>SFU at 500 participants/box pushes &gt; 10 Gbps of UDP packets; kernel networking stack can't sustain the packet rate, DPDK polls NICs from userspace bypassing the kernel.</td><td>io_uring — promising but less mature for UDP; standard sockets — bottleneck at high pps</td></tr>
+    <tr><td><b>STUN/TURN</b></td><td>80% reach SFU via STUN-discovered direct UDP; 20% need TURN relay for restrictive NATs/firewalls. TURN cluster sized at 25% of SFU bandwidth covers the relay tail.</td><td>No NAT traversal — 20% of users can't connect; full mesh — quadratic bandwidth</td></tr>
+    <tr><td><b>Postgres (sharded by meeting_id)</b></td><td>Meeting metadata is relational (meetings ↔ participants) and benefits from transactional join/leave semantics; sharding by meeting_id distributes 24M control msgs/s across the fleet.</td><td>Cassandra — no transactions; Spanner — too expensive for non-globally-consistent state</td></tr>
+    <tr><td><b>DynamoDB (recordings index)</b></td><td>Single-key access on recording_id at 150 PB/year; managed TTL handles retention_days policy without cleanup cron.</td><td>Postgres — TTL needs cron, harder to scale; S3 metadata only — no queryable index</td></tr>
+    <tr><td><b>Redis (meeting state with lease)</b></td><td>Meeting-level state (active SFU, host token, participant list) at sub-ms read for join requests; lease ensures coordinator failover doesn't split-brain.</td><td>etcd — too slow for high-frequency state; in-memory only — loses state on coordinator restart</td></tr>
+    <tr><td><b>Raft (etcd 5-node)</b></td><td>Coordinator leadership election with consensus durability; an SFU pod going down must reassign meetings deterministically without two coordinators picking different replacements.</td><td>ZooKeeper — older API; single-node — no fault tolerance</td></tr>
+    <tr><td><b>Apache Kafka</b></td><td>Per-meeting signaling pub/sub at 24M msg/s control plane; signaling decoupling lets media plane scale independently of control state.</td><td>Redis pub/sub — no durability for replay; RabbitMQ — won't sustain 24M/s</td></tr>
+    <tr><td><b>Headless renderer (recording)</b></td><td>Recording bot subscribes as a virtual participant and composites tiles via headless Chromium; layout is pixel-identical to what users see — no separate rendering pipeline to maintain.</td><td>Server-side compositing — different layout from client; client-side recording — privacy and reliability concerns</td></tr>
+    <tr><td><b>S3 multipart (recordings)</b></td><td>30s MP4 chunks uploaded in parallel during the meeting; if the meeting runs 8 hours we don't lose progress on a single failed upload, and finalization is a CompleteMultipartUpload.</td><td>Single PUT at meeting end — fails for long meetings; chunked HTTP — reinvents multipart</td></tr>
+    <tr><td><b>SIP gateway (PSTN)</b></td><td>Phone dial-in needs PCM ↔ Opus transcoding; SIP gateway translates between PSTN telco signaling and <code>WebRTC</code>, joining the call as a virtual participant.</td><td>No PSTN — loses enterprise customers; Twilio — vendor lock-in for core feature</td></tr>
+  </tbody>
+</table>

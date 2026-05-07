@@ -1,0 +1,138 @@
+<h1>Design Real-time Bidding (RTB exchange — sub-100ms auction)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">ad-tech</span>
+</div>
+
+<h1>1. Problem statement</h1>
+<h2>1. Problem statement</h2>
+<p>Build an OpenRTB 2.x compliant ad exchange. When a publisher serves an ad slot, the exchange must broadcast a bid request to dozens of DSPs (Demand-Side Platforms), collect their bids, run a second-price auction, return the winning creative, and reconcile the win-notification — all under a hard 100 ms wall-clock budget. The exchange handles billions of bid requests per day, persists every auction for billing and audit, and exposes near-real-time analytics.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Receive bid requests from publishers (OpenRTB JSON or Protobuf over HTTP/2).</li>
+  <li>Fan out to N DSPs (typically 20–50) with deadlines &lt; 80 ms.</li>
+  <li>Run second-price auction with reserve, deal-ID priority, brand-safety filtering.</li>
+  <li>Return a creative URL or VAST tag to the publisher; fire win-notice to the winner.</li>
+  <li>Track impression beacons, deduplicate, bill the DSP at the cleared price.</li>
+  <li>Provide DSP throttling, QPS quotas, and time-out blacklists.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 end-to-end &lt; 100 ms; DSP timeout 80 ms; internal auction &lt; 5 ms.</li>
+  <li><b>Scale:</b> 5 M QPS peak, 400 B bid requests/day, 100 PB raw logs/year.</li>
+  <li><b>Availability:</b> 99.99%; degraded mode (skip DSPs, serve fallback) instead of failing.</li>
+  <li><b>Throughput per DSP:</b> 100k–1M QPS sustained.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 5 M peak × 30 DSP fan-out = 150 M outbound RPCs/s.</li>
+  <li>Storage: 400 B requests/day × 1 KB compressed = 400 TB/day; tiered to S3/Glacier.</li>
+  <li>Network: 30 Gbps inbound, 200 Gbps east-west to DSPs.</li>
+  <li>Servers: ~5,000 bid routers (1k QPS each at 100 ms p99 with 100 in-flight).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /rtb/v2.5/bid    (publisher → exchange)   body: BidRequest{id,imp[],site,user,device}
+POST /rtb/v2.5/bid    (exchange → DSP)         deadline: 80ms
+POST /rtb/v2.5/win    (exchange → DSP)         body: {bidId, clearingPrice}
+GET  /img/imp?aid=... (browser → exchange)     fires impression beacon
+GET  /img/clk?aid=... (browser → exchange)     fires click, 302 to landing</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Publisher] ──► [Edge LB / TLS term] ──► [Bid Router (Netty/gRPC)]
+                                              │  fan-out (parallel async)
+                  ┌───────────────────────────┼─────────────────────────┐
+                  ▼                           ▼                         ▼
+              [DSP-1]                     [DSP-2]   ...             [DSP-N]
+                  └───────────────────────────┼─────────────────────────┘
+                                              ▼
+                                     [Auction Engine (in-proc)]
+                                              │
+                       ┌──────────────────────┼──────────────────────┐
+                       ▼                      ▼                      ▼
+                 [Win Notify]            [Kafka log]          [Creative cache]
+                                              │
+                                              ▼
+                              [Flink → ClickHouse + S3 (Parquet)]
+</div>
+<p>The Bid Router holds the request in memory, fans out to DSPs with a hard deadline (80 ms), collects bids as they arrive, picks the winner at deadline, returns the response. Everything else (logging, billing, beaconing) is asynchronous.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Auction log (Kafka → ClickHouse)</h3>
+<pre>CREATE TABLE auctions (
+  auction_id String, ts DateTime64(3),
+  pub_id UInt32, imp_type Enum,
+  bids Nested(dsp_id UInt32, price_cpm Decimal(10,4), latency_ms UInt16),
+  winner_dsp UInt32, clearing_cpm Decimal(10,4)
+) ENGINE = MergeTree PARTITION BY toYYYYMMDD(ts) ORDER BY (pub_id, ts);</pre>
+<h3>7.2 DSP config (Redis)</h3>
+<p>Endpoint, QPS quota, current QPS counter, timeout SLA, blacklist categories — hot-loaded into the router process every 30 s.</p>
+<h3>7.3 Cold storage</h3>
+<p>Raw bid requests Parquet on S3, 90-day retention for ML training and audit.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Bid Router</h3>
+<p>Single-threaded event-loop per core (Netty / Vert.x). Async HTTP client with connection pooling (1 conn per DSP × cores). Deadline timer cancels late bids. CPU-pinned, GC-tuned (ZGC or off-heap pools).</p>
+<h3>8.2 Auction engine</h3>
+<p>Filters: brand-safety category match, advertiser blocklist, deal-ID priority, reserve price. Then second-price: winner pays max(secondHighest, reserve) + $0.01. Tie-break by latency, then DSP score.</p>
+<h3>8.3 Throttling and dynamic timeout</h3>
+<p>Each DSP gets an adaptive timeout based on rolling p95 (PID-controlled). DSPs that exceed timeout 5x in 1 min are temporarily downsampled. Token-bucket per-DSP enforces QPS quota.</p>
+<h3>8.4 Cookie sync &amp; user matching</h3>
+<p>Pre-auction: pixel sync builds (exchange-uid ↔ dsp-uid) mapping in a ScyllaDB. Lookup &lt; 2 ms p99 to enrich BidRequest with audience segments.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Tail latency:</b> DSP at p99=120 ms wrecks budget; use hedged requests only as last resort due to traffic doubling.</li>
+  <li><b>GC pauses:</b> off-heap object pools, low-allocation parsing (jsoniter / Protobuf direct).</li>
+  <li><b>Network jitter:</b> co-locate router and DSP in same metro; cross-region adds 30+ ms.</li>
+  <li><b>Bid log throughput:</b> sample 10% raw, 100% summary; Kafka with snappy compression, 1 MB batches.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Hard 80 ms deadline</td><td>Predictable SLA</td><td>Drops slow-but-good bids</td></tr>
+<tr><td>Second-price (vs first)</td><td>Truth-telling incentive</td><td>Industry shifting to first-price</td></tr>
+<tr><td>Async logging</td><td>Off the hot path</td><td>Bid log can lag in incidents</td></tr>
+<tr><td>Co-located DSPs</td><td>Lower RTT</td><td>Operational coupling</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 8 Trouble with Distributed Systems — bounded-time RPC and timeouts.</li>
+  <li>Ch. 11 Stream Processing — exactly-once auction logging via Kafka transactions; windowed aggregations in Flink.</li>
+  <li>Ch. 12 Future of Data Systems — derived data (ClickHouse) from immutable Kafka log.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The 100 ms budget is the system's prime constraint — every architectural choice is in service of tail latency."</li>
+  <li>"I'd be conservative on hedged requests; doubling DSP traffic is expensive and causes feedback loops."</li>
+  <li>"For first-price migration we'd add bid-shading services, which is a clean extension."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>OpenRTB 2.5 (Protobuf over HTTP/2)</td><td>The protocol is the industry contract with 50+ DSPs; HTTP/2 multiplexing avoids TCP handshake within the 80 ms DSP timeout, and Protobuf parsing is 3-5x faster than JSON which matters when each of 5 M QPS allocates parsers.</td><td>OpenRTB JSON (rejected: GC pressure at 5 M QPS); gRPC native (DSPs don't all support it).</td></tr>
+<tr><td>Netty / Vert.x bid router</td><td>Single-threaded event-loop per core handles the 100 ms hard deadline with predictable latency; one router box at 1k QPS holds ~100 in-flight requests, and ~5,000 boxes serve the 5 M QPS without thread-context-switch overhead.</td><td>Tomcat / Spring (rejected: thread-per-request collapses at 100k connections); Go net/http (viable, but JVM ecosystem here for ZGC + jsoniter).</td></tr>
+<tr><td>ZGC / off-heap pools (JVM)</td><td>A 50 ms GC pause inside an 80 ms deadline drops the bid; ZGC keeps p99 pauses under 1 ms even with 32 GB heaps, and off-heap pools for BidRequest objects eliminate per-request allocation in the 5 M QPS hot path.</td><td>G1GC (rejected: 10-50 ms pauses); CMS (deprecated); Shenandoah (similar to ZGC, ZGC chosen for predictability).</td></tr>
+<tr><td>jsoniter / Protobuf direct parsing</td><td>Standard Jackson allocates per field; jsoniter and Protobuf direct parse onto pre-allocated buffers so a 1 KB BidRequest avoids ~30 small allocations — multiplied by 5 M QPS that's the difference between 80 ms p99 and missing the deadline.</td><td>Jackson (rejected: GC churn); Gson (slower); fastjson (security history).</td></tr>
+<tr><td>Apache Kafka (auction log)</td><td>400 B requests/day = 1 KB compressed produces 5 GB/s sustained; Kafka with snappy compression and 1 MB batches absorbs this off the hot path, and transactional producers give exactly-once into ClickHouse for billing.</td><td>Pulsar (smaller ops community); Kinesis (per-shard limits force excessive sharding at 5 GB/s).</td></tr>
+<tr><td>ClickHouse (auction analytics)</td><td>Bid analytics need slice/dice on (publisher, dsp, time) over 400 TB/day; ClickHouse's MergeTree partition-by-day with sparse index serves p99 dashboard queries in &lt;500 ms where Druid's segment overhead would explode at this cardinality.</td><td>Druid (rejected: too many segments at 400 B rows/day); BigQuery (per-scan cost).</td></tr>
+<tr><td>S3 + Parquet (cold storage)</td><td>90-day retention of raw bid requests = 36 PB; Parquet column pruning makes ML training on bid features economical, and S3 lifecycle to Glacier moves day-90 files automatically without ops work.</td><td>HDFS (operational overhead at 36 PB); GCS (similar, AWS chosen for closer to DSP infra).</td></tr>
+<tr><td>ScyllaDB (cookie sync / user matching)</td><td>The (exchange-uid ↔ dsp-uid) lookup before each auction must complete &lt;2 ms p99 at 5 M QPS; Scylla's shard-per-core C++ implementation hits sub-ms p99 on point lookups where Cassandra would 5-10x that under load.</td><td>Cassandra (rejected: JVM tail latency); Aerospike (viable, ScyllaDB cheaper at this scale); Redis (RAM cost prohibitive for 2 B users).</td></tr>
+<tr><td>Redis (DSP config / QPS quotas)</td><td>20-50 DSPs × per-DSP timeout / quota / blacklist config is small (~MB) but read every request; Redis hot-loaded into router process every 30 s gives nanosecond reads with bounded staleness — a config DB query per auction would burn the latency budget.</td><td>etcd (rejected: read latency 1-2 ms); ZooKeeper (heavier).</td></tr>
+<tr><td>Apache Flink (post-auction ETL)</td><td>Windowed aggregations on auction outcomes (DSP win rate, latency p99) need exactly-once into ClickHouse; Flink's Kafka transactional sink + RocksDB state cleanly handles late bid notifications and billing-grade accuracy.</td><td>Spark Streaming (rejected: micro-batch lag); Kafka Streams (state size limits).</td></tr>
+<tr><td>Second-price auction</td><td>Truth-telling incentive minimizes DSP bid-shading complexity; though the industry is shifting to first-price, second-price is simpler to onboard new DSPs and the engine logs both clearing and second-bid for future migration.</td><td>First-price (would force bid-shading services); VCG (overkill for K=1 slot).</td></tr>
+<tr><td>Hard 80 ms deadline timer</td><td>Without a deadline, slow DSPs would bloat p99 across the fleet; the timer cancels late bids deterministically so the 100 ms publisher SLA holds even when 1-2 DSPs are degraded — predictable failure beats variable latency.</td><td>Adaptive deadline (used too — but a hard floor must exist); hedged requests (rejected: doubles outbound traffic).</td></tr>
+<tr><td>PID-controlled adaptive DSP timeout</td><td>Each DSP's rolling p95 informs its per-request deadline within the 80 ms cap; PID smoothing avoids flapping where a DSP is briefly slow then fast, and 5x-timeout-in-1-min downsampling protects budget from a hung DSP.</td><td>Static per-DSP timeout (rejected: doesn't adapt to ops issues); EWMA only (no integral term, slow to converge).</td></tr>
+</tbody>
+</table>

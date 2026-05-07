@@ -1,0 +1,83 @@
+<h1>The 12-step interview frame: how to deliver an HLD answer</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">interview</span>
+  <span class="tag">framework</span>
+  <span class="tag">communication</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>An HLD interview is not a knowledge dump — it is a 45-minute structured conversation. The same 12 sections appear in every strong answer, in the same order, because each one feeds the next: requirements drive capacity, capacity drives the API shape, the API drives the architecture, and so on. If you internalize the 12-step frame, you stop "freezing" mid-question; you always know what comes next, and so does the interviewer. This lesson is the canonical template the rest of the vault writes against.</p>
+
+<h2>Why it matters</h2>
+<p>Interviewers grade on signal density, not breadth. A candidate who calmly walks the 12 sections in 40 minutes lands in the top quartile, even when their answer is technically average, because they have demonstrated the trait the role requires: <i>structured thinking under ambiguity</i>. The frame is also how you recover when stuck — if you blank, look at where you are in the 12 sections and the next move is mechanical.</p>
+
+<h2>The 12 sections at a glance</h2>
+<div class="ascii-diagram">  1. Problem statement        - "Restate in my words..."
+  2. Functional requirements  - "Must do X, Y, Z; out of scope: W."
+  3. Non-functional reqs      - latency, availability, consistency, durability
+  4. Capacity estimation      - QPS, storage, bandwidth, fan-out
+  5. API design               - 3-6 endpoints, request/response shapes
+  6. High-level architecture  - boxes-and-arrows, the spine
+  7. Data model               - tables/collections, partition keys, indexes
+  8. Component deep-dives     - 2-3 hottest components in detail
+  9. Scaling strategy         - sharding, caching, replication, async
+ 10. Trade-offs               - "we chose X because of Y; we gave up Z"
+ 11. DDIA principles invoked  - replication, partitioning, consensus, etc.
+ 12. Talking points + tech rationale - "why this stack, what we'd revisit"
+</div>
+
+<h2>1–3: Frame the problem (first 5 minutes)</h2>
+<p><b>Step 1 — Problem statement.</b> Restate in one sentence. Cue: <i>"Let me make sure I understand: we're building &lt;X&gt; that lets &lt;user&gt; do &lt;action&gt;. Is that the scope?"</i></p>
+<p><b>Step 2 — Functional requirements.</b> List 4–6 must-haves and 2–3 explicit non-goals. Cue: <i>"In scope: post, follow, view feed. Out of scope: DMs, ads, search. Sound right?"</i> The non-goals matter — they show judgment.</p>
+<p><b>Step 3 — Non-functional requirements.</b> Pin numbers to: <i>availability</i> (e.g., 99.9% read, 99.99% write), <i>latency</i> (p99 read &lt; 200ms), <i>consistency</i> (read-your-writes vs. eventual), <i>durability</i> (no data loss after ack), <i>scale</i> (DAU). Cue: <i>"I'll target 99.95% with p99 reads under 150ms; consistency can be eventual within a second."</i></p>
+
+<h2>4–5: Numbers and contract (next 5 minutes)</h2>
+<p><b>Step 4 — Capacity estimation.</b> Show the math. <i>"100M DAU × 5 actions/day / 86,400 ≈ 5,800 QPS avg, peak 15k. Storage: 100M × 5 × 365 × 200B × 3 RF ≈ 110 TB/year."</i> Numbers anchor every later choice.</p>
+<p><b>Step 5 — API design.</b> Sketch 3–6 endpoints with verbs, paths, and response shape. Mention idempotency keys on writes and pagination cursors on reads. Cue: <i>"POST /posts with Idempotency-Key; GET /feed?cursor=&amp;limit=50 returns next page + opaque cursor."</i></p>
+
+<h2>6–8: Build the architecture (the meat: 15 minutes)</h2>
+<p><b>Step 6 — High-level architecture.</b> Draw the spine: client → CDN/LB → API gateway → service tier → data tier (DB, cache, queue, search). Keep it to 6–10 boxes. Cue: <i>"Reads hit CDN-then-cache-then-DB; writes go through the write API into a primary, async-fanned-out via Kafka."</i></p>
+<p><b>Step 7 — Data model.</b> Show 2–4 main entities with primary key, partition key, and one or two secondary indexes. Always state the partition key explicitly — it is the single biggest scaling decision. Cue: <i>"posts table partitioned by user_id, clustered by (created_at desc); secondary index on hashtag for trending."</i></p>
+<p><b>Step 8 — Component deep-dives.</b> Pick the 2–3 components with the most interesting design pressure (usually feed assembly, write path, or hot-key handling). Spend 3–5 minutes each. STAR-like cue: <i>"Situation: celebrity has 10M followers. Task: feed delivery. Action: hybrid push/pull — push for &lt;10k followers, pull for celebs. Result: bounded fan-out cost, sub-second timeline."</i></p>
+
+<h2>9–10: Scale and trade-offs (next 10 minutes)</h2>
+<p><b>Step 9 — Scaling strategy.</b> Walk through what changes at 10x. Cue: <i>"At 10x: shard by user_id (64 shards), Redis cluster with consistent hashing, Kafka topics with key-based partitioning, read replicas in 3 regions."</i> Always tie back to the capacity numbers from step 4.</p>
+<p><b>Step 10 — Trade-offs.</b> Be explicit about what you gave up. Cue: <i>"We chose eventual consistency on the feed for write availability; the cost is a user might not see their own post for ~500ms — we mitigate with read-your-writes via session pinning."</i></p>
+
+<h2>11–12: Demonstrate depth (final 5 minutes)</h2>
+<p><b>Step 11 — DDIA principles.</b> Name the textbook concepts you used: leaderless replication, log-structured storage, idempotent producers, two-phase commit avoided via outbox + saga, vector clocks for conflict resolution, etc. This signals you didn't reinvent — you reached for the right tool. Cue: <i>"This is leaderless replication with R+W&gt;N for read-your-writes, and an outbox pattern to avoid 2PC across the order and inventory services."</i></p>
+<p><b>Step 12 — Talking points + tech rationale.</b> Wrap with: which technology fills each box and why, what you would revisit at higher scale, and what you intentionally deferred. Cue: <i>"DynamoDB for posts (single-digit-ms p99, autoscaling shards); Kafka for fan-out (durable, replayable); Redis for hot timelines (sub-ms reads). At 100x I'd revisit fan-out by adopting a celebrity-only pull path. I deferred a multi-region active-active design — that's the next 6 months of work."</i></p>
+
+<h2>STAR-like cues you can reuse</h2>
+<ul>
+  <li><b>"The pressure here is..."</b> — names the design constraint before the solution.</li>
+  <li><b>"The trade-off is..."</b> — pre-empts the interviewer's pushback.</li>
+  <li><b>"Out of scope for now, but worth flagging..."</b> — shows judgment without scope creep.</li>
+  <li><b>"At 10x this would break because..."</b> — demonstrates forward planning.</li>
+  <li><b>"In DDIA terms, this is..."</b> — anchors your choice to a known principle.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Jumping to architecture (step 6) before requirements (steps 1–3). You will optimize the wrong thing.</li>
+  <li>Skipping capacity math. Every later decision becomes hand-wave.</li>
+  <li>Talking about every component equally. Spend time on the 2–3 hottest, mention the rest.</li>
+  <li>Refusing to name trade-offs. Strong candidates volunteer the weakness in their own design.</li>
+  <li>Running out of time. Watch the clock; better to land all 12 sections shallowly than 6 of them deeply.</li>
+  <li>Using buzzwords without rationale. "We'll use Kafka" without QPS or durability reasoning is negative signal.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Pick any vault problem (e.g., design Twitter, design Uber, design Dropbox) and time-box yourself: 5 min on steps 1–3, 5 min on 4–5, 15 min on 6–8, 10 min on 9–10, 5 min on 11–12. Speak it out loud. Where did you stall? Add one cue from this lesson to that section and try again.
+  <br/>
+  <b>Hint:</b> Most candidates stall at step 4 (numbers) or step 10 (trade-offs). Memorize 3 BOE constants and 3 stock trade-off phrasings; the rest is just walking the frame.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-twitter">Design Twitter</a> — every one of the 12 sections has a textbook answer here.</li>
+  <li><a href="#problem/design-uber">Design Uber</a> — heaviest on steps 8–9 (matching algorithm + geo-sharding).</li>
+  <li><a href="#problem/design-dropbox">Design Dropbox</a> — heaviest on steps 7 + 11 (chunking, dedup, sync protocol).</li>
+</ul>

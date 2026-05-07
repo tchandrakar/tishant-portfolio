@@ -1,0 +1,142 @@
+<h1>Design Hotstar / JioCinema (live + VOD with 25M+ concurrent)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">cdn</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a streaming platform that handles both VOD and live events, where the live events are cricket matches (IPL final). Hotstar reached 25.3 M concurrent viewers in 2019 and JioCinema crossed 32 M concurrent in the 2023 IPL final — one of the largest single-event audiences in internet history. The system must scale from a normal day's ~5 M concurrent VOD viewers to 30 M+ concurrent live viewers within a 2-hour window, with sub-30-second glass-to-glass latency to keep live commentary in sync with social chatter.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Live linear streaming of an event with adaptive bitrate.</li>
+  <li>VOD catalog (movies, shows) browse + playback.</li>
+  <li>Multi-language audio + multi-camera feeds.</li>
+  <li>DVR rewind during live (last 2 hours).</li>
+  <li>Real-time chat / reactions during the live event.</li>
+  <li>Geo-restrictions per content rights.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 30 M peak concurrent on a single live event; ramp from 1 M → 30 M within 30 minutes after toss.</li>
+  <li><b>Latency:</b> &lt; 30 s glass-to-glass for live; VOD start &lt; 2 s.</li>
+  <li><b>Availability:</b> 99.99% during the event window — failure is news.</li>
+  <li><b>Bandwidth:</b> tens of Tbps in-country (India).</li>
+  <li><b>Cost:</b> ARPU is low (free or ad-supported), so per-viewer cost must be aggressively optimized.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Bandwidth: 30 M × avg 2.5 Mbps (mobile-dominant) = 75 Tbps egress.</li>
+  <li>Manifest fetches: 30 M / 6 s segment = 5 M RPS.</li>
+  <li>Telemetry / heartbeats: 30 M × 1 event/15 s = 2 M events/s.</li>
+  <li>Chat/reactions: 1% of viewers reacting → 300 K msgs/s in spikes.</li>
+  <li>Storage (DVR): 2 h × ~1 GB/h × 8 ABR rungs × 5 audio tracks = ~80 GB rolling per event.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/live/{eventId}/manifest?abr=...           → HLS/DASH manifest URL
+GET   /v1/live/{eventId}/segments/{n}.ts            → ts segment
+POST  /v1/live/{eventId}/heartbeat {position,abr}   → 204
+POST  /v1/live/{eventId}/react     {kind}           → 204
+GET   /v1/vod/{titleId}/manifest                    → manifest URL
+GET   /v1/vod/{titleId}/segment/{n}.m4s             → segment</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Stadium camera]
+       │ SDI
+       ▼
+[Encoder/Packager (low-latency HLS, 2s seg)]
+       │ push
+       ▼
+[Origin (S3 / object store)] ─► [Multi-CDN: Akamai + Cloudfront + Jio CDN]
+                                        │
+                                        ▼ India ISPs
+                                     [Viewers]
+
+Control plane:
+[Viewer] → [Edge GW] → [Playback Svc] → [Manifest Svc]
+                 ├─► [Auth/Geo Svc] (rights enforcement)
+                 ├─► [Heartbeat Svc] → [Kafka] → [Flink] → concurrency dashboard
+                 └─► [Reactions Svc] → [Pulsar] → fanout to chat clients
+</div>
+<p>The single most important decision: <b>multi-CDN with active steering</b>. No single CDN in India has the headroom for 75 Tbps; manifest URLs are signed by a CDN-selector that watches per-CDN error rate and rebalances every 30 s.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Live session state (Redis Cluster)</h3>
+<pre>HSET sess:{userId} eventId={..} cdn={..} abr={..} startedAt={..}
+EXPIRE sess:{userId} 7200</pre>
+<p>Redis is in-memory, sharded by userId hash, used for the rate-limit counters and CDN-affinity decisions. Hot keys (event-level counters) use a 256-shard split and a periodic flusher.</p>
+<h3>7.2 VOD metadata (Cassandra)</h3>
+<pre>CREATE TABLE titles (
+  title_id uuid PRIMARY KEY,
+  language text, genre text,
+  drm_keys map&lt;text,text&gt;,
+  manifest_path text
+);</pre>
+<h3>7.3 Telemetry warehouse</h3>
+<p>Heartbeats land in Kafka → Flink rolls up to per-second concurrency, per-CDN error rate, per-ISP throughput. This drives the CDN steering decisions in real time.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Low-latency live pipeline</h3>
+<p>LL-HLS with 2-second segments and partial segments (CMAF chunks) brings glass-to-glass under 10 s when conditions allow; we accept up to 30 s for stability. The packager produces a single mezzanine and per-CDN-prefixed manifests so we can flip CDN by rewriting one URL.</p>
+<h3>8.2 Concurrency surge handling</h3>
+<p>At "toss" the system pre-warms by pushing the first 30 segments to all CDNs and pre-resolving DNS for the predicted user pool. Clients use a "cold-start" endpoint that returns a manifest already shifted to the least-loaded CDN.</p>
+<h3>8.3 Reactions / chat</h3>
+<p>Apache Pulsar with geo-partitioned topics; each region has its own writers and a global aggregator emits the trending counter back to all regions every 2 s (eventual consistency is fine, the user doesn't notice ±2 s on the meter).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Last-mile collapse:</b> Indian ISPs saturate at certain peering points; we negotiate direct on-net caches with Jio, Airtel, and large MSOs.</li>
+  <li><b>CDN failover:</b> client SDK has a circuit breaker — if 3 segments in 10 s fail, it requests a new manifest from the alternate CDN.</li>
+  <li><b>Heartbeat storm:</b> 2 M RPS into a single Kafka topic — partition by user_id hash across 200 partitions, batch 500 ms on client side.</li>
+  <li><b>Chat fanout:</b> capped at "top 20 reactions" + numeric counter rather than full message broadcast to avoid O(N²) fanout.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Multi-CDN steering</td><td>Survives single-CDN failure</td><td>Complex contract &amp; monitoring</td></tr>
+<tr><td>2 s segments + LL-HLS</td><td>Lower live latency</td><td>More request overhead</td></tr>
+<tr><td>Aggressive ABR floors (240p)</td><td>Keeps mobile users alive</td><td>Quality complaints from premium tier</td></tr>
+<tr><td>Counters not full chat</td><td>Constant fanout cost</td><td>Lose individual messages</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — heartbeat topic partitioning &amp; Redis sharding for session state.</li>
+  <li>Ch. 11 Stream Processing — Flink jobs for real-time concurrency &amp; CDN steering decisions.</li>
+  <li>Ch. 8 Trouble with Distributed Systems — circuit breakers and timeouts in the client SDK to handle CDN brownouts.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"For an event-shaped load curve, the system has to be designed for the peak hour, not the average — autoscale doesn't save you when ramp is 30 M in 30 minutes."</li>
+  <li>"The hardest part is last-mile in India, not encoding; that's why on-net ISP caches and aggressive ABR floors matter more than fancy codecs."</li>
+  <li>"I'd run a chaos drill the week before the final, deliberately failing one CDN to validate the steering."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Multi-CDN (Akamai + CloudFront + Jio CDN)</b></td><td>No single CDN in India has 75 Tbps of headroom for the IPL final; active steering rebalances every 30 s on per-CDN error rates so a single regional CDN brownout doesn't tank the event.</td><td>Single CDN — outage = news headline; DIY CDN — capex unjustifiable for one event/year</td></tr>
+    <tr><td><b>LL-HLS with CMAF chunks</b></td><td>2-second segments + 200ms partial chunks bring glass-to-glass under 10s when conditions allow; <code>HLS</code> is the only protocol with universal Indian-mobile and CTV support at 30M concurrent.</td><td><code>WebRTC</code> — can't scale via CDN to 30M; <code>DASH</code>-only — Apple iOS won't play it</td></tr>
+    <tr><td><b>Redis Cluster</b></td><td>30M concurrent sessions need sub-ms lookup for CDN affinity and rate-limit counters; sharded by userId hash with 256-shard split on event-level counters to avoid hot-key meltdowns during ramp.</td><td>Memcached — no Lua/atomic counters; DynamoDB — too slow at 5M manifest RPS</td></tr>
+    <tr><td><b>Cassandra</b></td><td>VOD title metadata is multi-region (India + SEA), needs eventual consistency tolerance and high write throughput when DRM key rotation happens; LOCAL_QUORUM keeps reads fast inside India.</td><td>MySQL — no multi-region active-active; DynamoDB — region cost</td></tr>
+    <tr><td><b>Apache Kafka</b></td><td>2M heartbeat events/s partitioned across 200 partitions by user_id hash; Flink consumes for per-second concurrency dashboards that drive CDN steering decisions in real time.</td><td>Kinesis — partition limits painful; RabbitMQ — won't sustain 2M/s</td></tr>
+    <tr><td><b>Apache Pulsar</b></td><td>Reactions/chat needs geo-partitioned topics with 300K msg/s spikes; Pulsar's tiered storage and per-namespace geo-replication fit better than Kafka for cross-region trending counter aggregation every 2s.</td><td>Kafka — geo-replication via MirrorMaker is fragile; SQS — no fanout semantics</td></tr>
+    <tr><td><b>Apache Flink</b></td><td>Real-time concurrency rollups (per-second, per-CDN, per-ISP) feed the steering algorithm; exactly-once on the heartbeat stream means concurrency dashboards aren't lying during the final.</td><td>Spark Streaming — micro-batch latency too high; ksqlDB — limited windowing</td></tr>
+    <tr><td><b>S3-compatible object store</b></td><td>Single-mezzanine origin with per-CDN-prefixed manifests means CDN flip is a URL rewrite, not a re-encode; 80 GB rolling DVR window fits any cloud blob store.</td><td>HDFS — operational pain at this scale; local NFS — no durability</td></tr>
+    <tr><td><b>FFmpeg + low-latency encoder</b></td><td>2-second GOPs aligned across the 8-rung ABR ladder enable seamless ABR switching and CMAF chunking; encoder is the latency floor — every 100ms saved here saves 100ms glass-to-glass.</td><td>Hardware ASIC encoders — overkill for a single live event; software-only without SIMD — too slow</td></tr>
+    <tr><td><b>Widevine / FairPlay / PlayReady</b></td><td>Cricket rights are exclusive territorial deals; multi-DRM enforcement is contractually required across Android, iOS, web, and CTV — without it, content licensors won't sign.</td><td>Single DRM — rights holders refuse; clear-key — non-starter</td></tr>
+    <tr><td><b>On-net ISP caches (Jio/Airtel)</b></td><td>Last-mile in India saturates at peering points before any CDN can deliver; on-net caches inside Jio and Airtel data centers bypass peering bottlenecks for 60% of viewers.</td><td>Pure transit — peering links saturate; satellite — latency forbids live</td></tr>
+    <tr><td><b>Client SDK with circuit breaker</b></td><td>3 failed segments in 10s triggers manifest reload from alternate CDN — clients self-heal in ~5s without server-side detection lag, which is critical when ramp is 30M in 30 minutes.</td><td>Server-only steering — too slow; no client logic — viewers see buffer-spinner during CDN flips</td></tr>
+    <tr><td><b>Aggressive ABR floor (240p)</b></td><td>2.5G/3G mobile users in tier-3 cities cannot sustain 720p; keeping a 240p rung means they stay connected (and ad-monetized) instead of giving up on the stream entirely.</td><td>720p floor only — drops 20% of the audience; per-region floor — added complexity for marginal gain</td></tr>
+  </tbody>
+</table>

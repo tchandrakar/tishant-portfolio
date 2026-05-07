@@ -1,0 +1,59 @@
+<h1>Caching basics: write-through, write-back, write-around, eviction</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Easy</span>
+  <span class="tag">caching</span>
+  <span class="tag">performance</span>
+  <span class="tag">consistency</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>A cache is a small, fast store that sits between your slow data source (disk, database, remote API) and your application, holding the items most likely to be asked for next. The clever part isn't the cache itself — it's the <b>write strategy</b> (how new data gets in) and the <b>eviction policy</b> (what gets thrown out when the cache fills up). Get those wrong and your cache becomes either stale or useless.</p>
+
+<h2>Why it matters</h2>
+<p>Most reads in real systems are repeats: the same product page, the same user profile, the same trending tweet. Caching those reads can drop database load by 90%+ and cut latency from tens of milliseconds to hundreds of microseconds. Almost every interview design ends with "and we put Redis in front of it" — the question is whether you can defend <i>which</i> cache pattern and <i>why</i>.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Write-through (Facebook TAO):</b> every write goes to cache <i>and</i> DB synchronously. Cache is always fresh; writes are slower.</li>
+  <li><b>Write-back / write-behind (Linux page cache, some Redis setups):</b> write to cache, flush to DB asynchronously. Fast writes, but a crash can lose data.</li>
+  <li><b>Write-around (CDN origin caches):</b> writes skip the cache and go straight to DB; cache only fills on read miss. Good for write-heavy, read-rare data.</li>
+  <li><b>LRU eviction (Memcached default):</b> drop the least recently used key when full.</li>
+  <li><b>LFU (Redis <code>allkeys-lfu</code>):</b> drop the least <i>frequently</i> used — better for hot-key workloads.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  WRITE-THROUGH                WRITE-BACK                  WRITE-AROUND
+  app -> cache -> DB           app -> cache  ~> DB         app -----> DB
+  (sync, fresh)                (async flush, fast,             |
+                                risk of loss)                  v read
+                                                         miss -> DB -> cache
+
+  EVICTION when cache is full:
+   LRU: kick out who-was-touched-longest-ago
+   LFU: kick out who-was-touched-least-often
+   TTL: kick out anyone whose timer ran out
+</div>
+<p>The strategies trade three things against each other: <b>write latency</b>, <b>read freshness</b>, and <b>risk of data loss</b>. Pick the one that matches your workload — there is no universal winner.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Caching with no TTL. Stale data lives forever; debugging becomes "did you flush the cache?".</li>
+  <li>Cache-stampede on miss: 10,000 requests for the same expired key all hit the DB at once. Fix with single-flight / request coalescing.</li>
+  <li>Using write-back for anything you can't afford to lose. A node crash drops un-flushed writes.</li>
+  <li>Caching the wrong layer. A 100% hit-rate cache in front of a 5ms query saves nothing; cache the 500ms join or the 200ms remote call.</li>
+  <li>Ignoring negative caching. Repeated 404s for the same key still hammer the DB unless you cache the "not found" too.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're designing a product-detail page. Reads are 100x writes, but when an item's price changes, customers must <i>never</i> see the old price for more than 1 second. Which write strategy do you pick — write-through, write-back, or write-around — and what TTL do you set? What do you do on a cache miss to avoid a stampede?
+  <br/>
+  <b>Hint:</b> Freshness requirement rules out one option immediately. For stampedes, look up "request coalescing" or "single-flight".
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-redis-cluster">Design Redis Cluster</a> — eviction policies and replication trade-offs.</li>
+  <li><a href="#problem/design-amazon">Design Amazon</a> — product-detail caching with strict freshness.</li>
+  <li><a href="#problem/design-netflix">Design Netflix</a> — multi-tier caches: client, edge, origin.</li>
+</ul>

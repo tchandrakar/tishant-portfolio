@@ -1,0 +1,140 @@
+<h1>Design SMS Gateway (multi-carrier, deliverability, fallback)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">notifications</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build an SMS gateway that delivers application-to-person (A2P) text messages globally via multiple carrier aggregators (Twilio, Sinch, Vonage, MessageBird) plus direct SMPP connections in select countries. The system must route by least-cost-and-best-deliverability, fallback when a route fails, handle DLRs (delivery receipts), respect country regulations (sender-ID rules, opt-out), and cap spend per tenant.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Send SMS by E.164 number; auto-segment long messages (160 GSM-7 / 70 UCS-2 chars).</li>
+  <li>Multi-provider routing with health-aware failover.</li>
+  <li>DLR ingestion: queued, sent, delivered, failed, expired.</li>
+  <li>Two-way SMS: receive inbound and route to tenant webhook.</li>
+  <li>STOP/HELP keyword handling, opt-out registry, TCPA compliance.</li>
+  <li>Per-tenant budget caps, per-country pricing tiers.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> publisher accept under 200 ms p95; carrier handoff under 1 s p95.</li>
+  <li><b>Scale:</b> 500M SMS/day, 6k/sec avg, 30k/sec peak.</li>
+  <li><b>Availability:</b> 99.95% — no single carrier outage causes message loss.</li>
+  <li><b>Cost:</b> route selection must minimize $/msg subject to deliverability SLA.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 500M/86,400 ≈ 5,800 avg; peak 30k/sec on auth-OTP spikes.</li>
+  <li>Storage: 500M × 1 KB metadata = 500 GB/day; 1-year retention ≈ 180 TB.</li>
+  <li>DLRs: ~2 per send (sent + delivered) → 1B events/day, 12k/sec.</li>
+  <li>Outbound bandwidth to SMPP: 30k msgs/sec × 200 B = 6 MB/s; trivial.</li>
+  <li>Routing decisions: 30k/sec route lookups served from in-memory weighted table.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/sms/send       {to, from, body, tenantId, callbackUrl}   -> messageId
+POST /v1/sms/batch      {messages:[...]}                          -> jobId
+GET  /v1/sms/{id}                                                 -> status, segments, cost
+POST /v1/sms/inbound    (carrier webhook)                         -> 200 OK
+POST /v1/numbers/lease  {country, type:[shortcode|longcode|toll-free]}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Tenant API] -> [Validate/Opt-out check] -> [Kafka: sms.accepted]
+                                                  |
+                                                  v
+                                         [Routing Engine]
+                                       (cost, success-rate, country)
+                                                  |
+              +---------------+---------------+---+---------------+
+              v               v               v                   v
+        [Twilio Adapter] [Sinch Adapter] [Direct SMPP]    [Vonage Adapter]
+              |               |               |                   |
+              +---------------+-------+-------+-------------------+
+                                      v
+                              [Carrier Networks]
+                                      |
+                                      v
+                              [DLR Listener]  -> [Kafka: sms.events]
+                                      |
+                                      v
+                          [Status Store: Cassandra] / [Webhook Dispatcher]
+</div>
+<p>The routing engine consults a per-(country, carrier) rolling-window success-rate computed on a 5-minute Flink job and a price table to choose the cheapest carrier above a configured deliverability floor. Failover is automatic on 5xx or timeout.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Message store (Cassandra)</h3>
+<pre>CREATE TABLE sms (
+  tenant_id text, day text, message_id timeuuid,
+  to_e164 text, from_id text, route text,
+  status text, segments int, cost_usd decimal,
+  PRIMARY KEY ((tenant_id, day), message_id)
+);</pre>
+<h3>7.2 Opt-out registry (Redis + DynamoDB)</h3>
+<pre>SET optout:{tenant}:{e164} = 1   (TTL: forever; sourced from STOP keyword)</pre>
+<h3>7.3 Why this split?</h3>
+<p>Opt-out is on the hot path of every send — Redis gives sub-ms checks. Cassandra holds the durable history with day-buckets to keep partition size bounded.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Routing engine</h3>
+<p>For each message: compute candidates = carriers supporting destination country and sender type. Rank by <code>score = w1 * success_rate - w2 * normalized_cost</code>. Health-check via 1-minute rolling p95 and short-circuit a carrier on >3% failure for 60s. Sticky-route per recipient for 24h to maximize delivery on numbers that worked previously.</p>
+<h3>8.2 SMPP adapter</h3>
+<p>Maintains long-lived TCP connections to carriers with <code>bind_transceiver</code>. Window size 100, throughput throttled per binding. Handles enquire_link keepalives and reconnects on link failure within 2 s.</p>
+<h3>8.3 DLR pipeline</h3>
+<p>DLRs arrive minutes to hours later. The listener correlates via carrier message-id stored at send time, updates the message row, and emits <code>sms.delivered</code> events. Webhooks to tenants use exponential backoff with a 24h DLQ.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>OTP storms:</b> auth flows generate synchronized bursts; isolate OTP traffic on a dedicated lane with reserved carrier capacity.</li>
+  <li><b>Sender-ID rotation:</b> India DLT and US 10DLC require pre-registered sender IDs; route engine must filter by registration state.</li>
+  <li><b>Cost runaway:</b> tenant budget cap enforced via Redis token bucket atomic decrement.</li>
+  <li><b>Hot countries:</b> Brazil/India dominate volume; pre-allocate SMPP windows per region.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Aggregator-only vs direct SMPP</td><td>Aggregators = fast time-to-market</td><td>Higher per-msg cost; less control</td></tr>
+<tr><td>Per-recipient sticky routing</td><td>Better delivery</td><td>Stale state on number porting</td></tr>
+<tr><td>Async DLR processing</td><td>Decouples carrier latency</td><td>Tenant sees delayed final status</td></tr>
+<tr><td>Cassandra by (tenant, day)</td><td>Bounded partitions</td><td>Cross-tenant analytics need ETL</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 8 Trouble with Distributed Systems — DLRs may arrive out of order or never; design for missing events.</li>
+  <li>Ch. 11 Stream Processing — Kafka pipelines for accept/route/send/DLR with idempotent consumers; routing decisions enriched by a Flink-maintained materialized view of per-route success rates.</li>
+  <li>Ch. 12 Future of Data Systems — feedback loops from DLRs adjust routing weights in near-real-time.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with two aggregators and add direct SMPP only after volume in a country justifies the regulatory work."</li>
+  <li>"The trickiest piece is fraud — pumping attacks where attackers hit premium-rate numbers; I'd add velocity rules and per-prefix anomaly detection."</li>
+  <li>"For OTP we want at-most-once-ish: if we suspect duplicate, skip. For marketing, at-least-once is fine."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>SMPP v3.4 (direct carrier)</td><td>The only open carrier-grade protocol for Brazil/India where direct SMPP is 30-50% cheaper than aggregators; <code>bind_transceiver</code> with window size 100 sustains 30k peak/sec across long-lived TCP sessions per binding.</td><td>HTTP REST to aggregator only (high $/msg at 500M/day); SMPP v5.0 (poor carrier support).</td></tr>
+<tr><td>Twilio / Sinch / Vonage adapters (HTTP)</td><td>Multi-aggregator routing means no single carrier outage causes message loss (99.95% SLO); HTTP REST adapters give a fast path to coverage in 100+ countries without per-country regulatory work.</td><td>Single aggregator (vendor lock-in, no failover); SMPP-everywhere (regulatory burden in 100+ countries blocks launch).</td></tr>
+<tr><td>Apache Kafka (sms.accepted, sms.events)</td><td>30k peak msgs/sec accepted decoupled from carrier handoff so a Twilio spike doesn't block tenant API; partition-by-tenantId preserves per-tenant ordering for OTP flows where sequence matters.</td><td>SQS standard (out-of-order kills OTP UX); Redis Streams (no multi-region replication for DR).</td></tr>
+<tr><td>Redis (opt-out registry, budget bucket)</td><td>Every send hits opt-out check on the hot path — 30k/sec SUBSTR-style key lookups must be sub-ms; atomic INCRBY on tenant budget prevents cost runaway when a tenant misconfigures a campaign.</td><td>Postgres (point-read latency too high at 30k/sec); DynamoDB (acceptable but 5× cost for the same QPS).</td></tr>
+<tr><td>DynamoDB (durable opt-out store)</td><td>STOP keyword opt-outs are TCPA-regulated and must survive Redis cluster loss; DynamoDB gives 11-9s durability and TTL=forever semantics with global tables for cross-region failover.</td><td>Cassandra (more ops burden); RDS (single-primary risk for a compliance-critical store).</td></tr>
+<tr><td>Cassandra (sms message store)</td><td>500M writes/day = 5,800/s avg with 30k bursts; <code>PRIMARY KEY ((tenant_id, day), message_id)</code> bounds partitions to ~5M rows for the biggest tenant and supports day-paginated tenant dashboards.</td><td>Postgres sharded (resharding pain at 180 TB/year); ClickHouse (great for analytics, weak for point-read by message_id).</td></tr>
+<tr><td>Apache Flink (5-min rolling success rate)</td><td>Routing decisions need a real-time materialized view of (country, carrier) success rate; Flink's event-time windows on the DLR stream produce p95 success rate at 12k events/sec without batch ETL lag that would lock in a degraded carrier.</td><td>Spark Streaming micro-batches (1-min lag misses fast outages); in-memory counters per box (incoherent routing across replicas).</td></tr>
+<tr><td>Sticky routing per recipient (24h)</td><td>Same recipient on the same successful carrier maximizes deliverability — porting + carrier preferences mean once a number works on Sinch in the US, it'll likely work again; cuts retry rate by ~15%.</td><td>Random per-send (worse delivery); permanent stick (bad on number porting events).</td></tr>
+<tr><td>Token bucket (tenant budget cap)</td><td>Atomic Redis DECR enforces $/day spend caps before SMS is enqueued; without this a misconfigured campaign at $0.05/msg × 30k/sec = $1500/sec tenant burn.</td><td>Post-hoc billing alerts (damage already done); fixed daily quotas (no fairness across hours).</td></tr>
+<tr><td>Webhook dispatcher with DLQ</td><td>Tenant webhooks for DLRs cannot block the 12k events/sec pipeline; exponential-backoff with 24h DLQ accommodates flaky tenant endpoints without dropping delivery receipts.</td><td>Synchronous webhook (one slow tenant blocks all DLR ingestion); fire-and-forget (loss of regulatory audit trail).</td></tr>
+<tr><td>Per-prefix anomaly detection (fraud)</td><td>Pumping attacks target premium-rate prefixes (e.g., +234, +252) where attackers profit per send; velocity rules on (tenant, country prefix) running in Flink catch the attack within minutes instead of after the bill.</td><td>Static blocklist (attackers rotate prefixes); manual review (30k/sec overwhelms ops).</td></tr>
+<tr><td>Carrier sender-ID registry (DLT, 10DLC)</td><td>India DLT and US 10DLC reject unregistered sender IDs at the carrier — routing engine must filter candidate routes by registration state per tenant or messages disappear silently with no DLR.</td><td>Best-effort send (silent drops, no audit trail); single shared sender ID (banned by carriers).</td></tr>
+<tr><td>OTP-isolated lane (separate Kafka topic + reserved IPs)</td><td>OTP-spike is bursty and latency-sensitive (under 1s critical for auth UX); isolating it from marketing on dedicated lanes with reserved carrier capacity guarantees auth flows never get queued behind a 1M-msg campaign.</td><td>Single shared queue (auth blocked by marketing burst); priority queue inside one topic (still shares carrier rate limit).</td></tr>
+</tbody>
+</table>

@@ -1,0 +1,192 @@
+<h1>Design Distributed Tracing (OpenTelemetry / Jaeger &mdash; span propagation)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a distributed tracing platform like Jaeger / Honeycomb / Tempo that captures causally-linked spans across hundreds of microservices, joins them into traces, and exposes them via a UI for debugging latency and errors. At Uber/Lyft scale, services emit billions of spans per day. The system must handle bursts during incidents (when traces matter most), yet keep storage costs bounded via sampling.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>OpenTelemetry-compatible ingest (OTLP/gRPC).</li>
+  <li>Trace lookup by trace-id; trace search by service, operation, tag, duration, error.</li>
+  <li>Service dependency graph derived from spans.</li>
+  <li>Tail-based sampling: keep all error traces, p99-slow traces, and 1% baseline.</li>
+  <li>Retention 7 days hot, 30 days cold.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Ingest:</b> 5B spans/day baseline, 50B during incidents.</li>
+  <li><b>Trace assembly latency:</b> a complete trace queryable within 30 s of last span.</li>
+  <li><b>Lookup p99:</b> &lt; 300 ms by trace-id.</li>
+  <li><b>Search p99:</b> &lt; 3 s on 24h window.</li>
+  <li><b>Loss budget:</b> &le; 0.1% of sampled traces.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>5e9 spans * 1 KB = <b>5 TB/day</b> raw; with 10% post-tail-sampling kept, ~500 GB/day persisted.</li>
+  <li>Span eps: ~58K baseline, ~580K incident peak.</li>
+  <li>Trace fan-out: avg 30 spans / trace, p99 1500 spans (think Uber dispatch).</li>
+  <li>Hot index: ~24h * 500 GB = 12 TB across cluster.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/traces            (OTLP protobuf batch)
+GET   /api/traces/{traceId}                            &rarr; full trace
+GET   /api/traces?service=&amp;op=&amp;minDur=&amp;tag=err:true    &rarr; trace list
+GET   /api/dependencies?lookback=1h                    &rarr; service graph
+</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[OTel SDK in app] -&gt; [OTel Collector sidecar] -&gt; [Regional Gateway]
+                                                        |
+                                                        v
+                                            [Kafka spans-raw, partitioned by trace-id]
+                                                        |
+                              +-------------------------+--------------------------+
+                              v                                                    v
+                  [Trace Assembler (Flink)]                                [Tail Sampler]
+                       sessionize 30s/trace                          decide keep/drop per trace
+                              |                                                    |
+                              +-----------------+----------------------------------+
+                                                v
+                                   [Object Store: traces/{traceId}.pb]
+                                                |
+                                   [Index: ES/Cassandra (svc,op,tag) -&gt; traceId]
+                                                |
+                                          [Query API + UI]
+</div>
+<p>Apps emit spans through OpenTelemetry SDKs. A sidecar Collector batches and forwards to the regional gateway, which produces to Kafka <b>partitioned by trace-id</b> so all spans of a trace land in the same partition and the same Flink operator instance. The assembler windows by trace-id with a 30-second inactivity timeout, then ships the complete trace to object storage and emits index entries.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Span</h3>
+<pre>{
+  trace_id:      [16]byte,        // W3C traceparent
+  span_id:       [8]byte,
+  parent_span:   [8]byte,
+  service:       string,
+  operation:     string,
+  start_ns:      int64,
+  duration_ns:   int64,
+  status:        OK|ERROR,
+  attrs:         map&lt;string, any&gt;,
+  events:        [{ts, name, attrs}],
+  links:         [{trace_id, span_id}]
+}</pre>
+<h3>7.2 Index</h3>
+<pre>service_op_idx (Cassandra):
+  PK = (service, op, day_bucket), CK = (start_ts DESC, trace_id)
+tag_idx        (Elasticsearch): inverted index over flattened attrs</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Trace assembly</h3>
+<p>The Flink operator keys spans by trace-id and uses an event-time session window with 30 s gap. State is RocksDB-backed. On window close, it serializes the trace, computes derived metrics (root duration, error count, critical path) and emits to two sinks: blob store and indexer. This is a textbook stream sessionization (DDIA Ch. 11).</p>
+<h3>8.2 Tail-based sampling</h3>
+<p>A tail sampler subscribes to the same Kafka topic and decides per trace whether to keep it. Policies: keep if any span has <code>status=ERROR</code>, keep if root duration &gt; service p99, keep with probability 0.01 otherwise. Decisions stream into a "keep-set" Kafka topic, joined into the assembler so dropped traces never reach storage.</p>
+<h3>8.3 Service graph</h3>
+<p>A separate stream job derives <code>(caller_service, callee_service, latency_histogram)</code> from each span pair and writes hourly aggregates &mdash; a small classic batch reduction (DDIA Ch. 10) that powers the dependency map.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot trace-id partition:</b> a runaway trace with 10M spans melts one Kafka partition. Mitigation: per-trace span cap at the SDK (e.g., 50K), and a producer-side circuit breaker.</li>
+  <li><b>Long-running traces:</b> async pipelines may keep a trace open for hours; we close the window at 5 min and stitch later via "trace-fragment" merging in queries.</li>
+  <li><b>Indexer back-pressure:</b> ES bulk &gt; 80% queue triggers shedding to a slow-path Kafka topic.</li>
+  <li><b>Cardinality:</b> attribute key allow-list per service prevents tag-explosion.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Tail sampling</td><td>Keeps interesting traces, drops noise</td><td>Needs whole trace before deciding &rarr; latency &amp; memory</td></tr>
+<tr><td>Head sampling (alt)</td><td>O(1) memory, decided at root</td><td>Uniform random; misses error traces</td></tr>
+<tr><td>Partition by trace-id</td><td>Local sessionization, no cross-shard joins</td><td>Skew if traces are heavy-tailed</td></tr>
+<tr><td>Blob store + secondary index</td><td>Cheap storage</td><td>Two systems to keep consistent</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 11 Stream Processing</b> &mdash; sessionization by key (trace-id), event-time windowing, watermarks for the inactivity gap, exactly-once via Kafka offsets + Flink checkpoints, materialized service-graph view as a streaming aggregation.</li>
+  <li><b>Ch. 10 Batch Processing</b> &mdash; daily compaction of sampled traces into Parquet for long-term cold queries; offline rebuild of indexes after schema change is a Hadoop-style batch job over immutable inputs.</li>
+  <li><b>Ch. 7 Transactions</b> &mdash; index + blob write must be atomic-ish; we use the blob as source of truth and reconcile the index in batch.</li>
+  <li><b>Ch. 8 Trouble with Distributed Systems</b> &mdash; clock skew between services makes start_ns ordering unreliable; we use <code>parent_span</code> for causal order, never wall-clock.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Sampling is the central trade-off: I'd default to tail sampling because head sampling silently drops the traces engineers actually need."</li>
+  <li>"Causality comes from the parent_span pointer, not timestamps &mdash; clocks across hosts disagree by tens of ms."</li>
+  <li>"During incidents traffic 10&times;es; the same incidents are when traces matter most, so back-pressure must shed low-value traces, not random ones."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>OpenTelemetry SDKs (OTel)</td>
+      <td>With 10K+ services in 7 languages, a vendor-locked agent is suicide. OTel gives one wire format (OTLP) and one context-propagation spec (W3C traceparent) so every service emits the same span shape; without this, trace assembly across polyglot fleets is impossible.</td>
+      <td>Zipkin libs (older, weaker context propagation); vendor SDKs (lock-in, no Rust/Go parity)</td>
+    </tr>
+    <tr>
+      <td>OTel Collector (agent + gateway tier)</td>
+      <td>10M spans/sec ingress means we can't push raw spans to backend. The collector batches, compresses, and applies head-sampling close to the source, cutting egress bandwidth ~10&times; before traces ever cross AZ boundaries.</td>
+      <td>Direct SDK&rarr;backend (network amplification); Fluentd (no trace-aware semantics)</td>
+    </tr>
+    <tr>
+      <td>Tail sampling (decision after full trace assembled)</td>
+      <td>Head sampling (1%) silently drops the slow/failing traces engineers actually need. Tail sampling buffers spans 30 s, then keeps 100% of errors and p99-latency traces; we throw away cheap healthy traffic instead of expensive incidents.</td>
+      <td>Pure head sampling (loses anomalies); 100% retention (10&times; cost, no extra signal)</td>
+    </tr>
+    <tr>
+      <td>Kafka between collector and backend</td>
+      <td>During incidents trace volume spikes 10&times; &mdash; exactly when traces matter most. Kafka absorbs the burst at 1 GB/sec/topic and lets the indexer fall behind without dropping; without it the indexer becomes the bottleneck and back-pressure shreds production.</td>
+      <td>gRPC direct (no buffering); Kinesis (lower throughput per partition, higher latency)</td>
+    </tr>
+    <tr>
+      <td>Cassandra for span storage by trace_id</td>
+      <td>Span lookup is point-query by trace_id (16 bytes); we never scan. Cassandra's LSM + partition-by-trace_id gives single-digit-ms read at PB scale, and tunable consistency (CL=ONE) is fine because traces are advisory, not transactional.</td>
+      <td>Postgres (insert rate too low at 10M spans/sec); HBase (operational pain); S3 (read latency)</td>
+    </tr>
+    <tr>
+      <td>Elasticsearch for service/operation/tag indexes</td>
+      <td>Engineers search by <code>service=checkout AND http.status&gt;=500 AND duration&gt;1s</code>. ES inverted indexes resolve this across 100B+ spans/day in &lt;500 ms; Cassandra alone cannot answer attribute-search queries.</td>
+      <td>Cassandra secondary index (high write amp); Lucene-on-HDFS (no live ingest)</td>
+    </tr>
+    <tr>
+      <td>Jaeger UI / Tempo-style query layer</td>
+      <td>Engineers expect a flame-graph UI; Jaeger's UI is the de-facto standard and integrates with OTel data models for free. Building a custom UI is months of work that doesn't move the SLO needle.</td>
+      <td>Custom React dashboard (re-invents wheel); Zipkin UI (weaker for tag search)</td>
+    </tr>
+    <tr>
+      <td>Parent-span pointer for causality (not timestamps)</td>
+      <td>Clocks across hosts skew by tens of ms; ordering spans by start-time produces wrong parent/child trees. The explicit parent_span_id in OTel context is the only correct causality signal at fleet-wide scale where NTP can't be trusted to ms.</td>
+      <td>Wall-clock ordering (wrong on clock drift); HLC (overkill for read-time assembly)</td>
+    </tr>
+    <tr>
+      <td>30-day hot retention + S3 cold tier</td>
+      <td>95% of trace lookups are within 24 h of the span. 30 days hot in Cassandra/ES (~600 TB) covers all incident postmortems; older traces go to S3 Parquet at 1/10 the cost, restored on demand for rare audits.</td>
+      <td>90-day hot (3&times; cost, no extra value); no archive (compliance failure)</td>
+    </tr>
+    <tr>
+      <td>Adaptive rate-limiter per service in collector</td>
+      <td>One service emitting 1M spans/sec from a hot loop must not drown the cluster. A token-bucket per service tag in the collector sheds that service's spans first, preserving the long tail of other services' traces during incidents.</td>
+      <td>Global rate limit (noisy neighbor wins); per-pod limit (no aggregate protection)</td>
+    </tr>
+    <tr>
+      <td>RoaringBitmap for trace-id set operations in tail sampler</td>
+      <td>The tail sampler holds ~30 s of trace_ids in memory (~30M IDs). Roaring bitmaps store these in &lt;100 MB and let us union "error trace IDs" with "slow trace IDs" in microseconds before flushing the kept set.</td>
+      <td>Hash set (3&times; memory); sorted array (slow union)</td>
+    </tr>
+    <tr>
+      <td>W3C Trace Context propagation</td>
+      <td>HTTP, gRPC, Kafka headers all need the same trace_id format; W3C is the only spec implemented across every language SDK. Without it cross-language calls (Go &rarr; Python &rarr; Node) lose the trace at the boundary.</td>
+      <td>B3 single-header (Zipkin legacy); custom header (no SDK support)</td>
+    </tr>
+  </tbody>
+</table>

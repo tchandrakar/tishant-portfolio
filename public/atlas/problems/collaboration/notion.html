@@ -1,0 +1,140 @@
+<h1>Design Notion (block-based docs, multi-tenant, sync engine)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">collaboration</span>
+  <span class="tag">file-storage</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build Notion: a multi-tenant workspace where every page is a recursive tree of <b>blocks</b> (paragraph, todo, table, embed, sub-page, database). Users edit blocks individually and concurrently, drag-reorder blocks across pages, and link them. Lower real-time bar than Google Docs (block-level, not character-level), but harder data modeling: a block can appear in many places (transclusion), and a database row is itself a page. Notion's actual sync engine is Postgres + a custom optimistic CRUD-op log per block.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Block-level edits with conflict resolution (last-writer-wins per property).</li>
+  <li>Tree of blocks per page, drag-and-drop reorder, transclusion.</li>
+  <li>Databases (tables, boards, calendars) where rows = pages.</li>
+  <li>Realtime co-editing of text inside a single block (CRDT for that block only).</li>
+  <li>Multi-tenant workspaces, granular sharing, comments, mentions.</li>
+  <li>Offline support on web/desktop/mobile with merge on reconnect.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 block save 100 ms, p99 page open 800 ms.</li>
+  <li><b>Scale:</b> 100 M users, 10 M paying workspaces, 50 B blocks total.</li>
+  <li><b>Durability:</b> RPO ≤ 1 s, RTO ≤ 5 min.</li>
+  <li><b>Tenancy isolation:</b> noisy-neighbor proof; per-workspace QPS caps.</li>
+  <li><b>Availability:</b> 99.9%.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>50 B blocks × avg 1.5 KB JSON = 75 TB hot, multiplied 3× (replicas + indexes) ≈ 225 TB.</li>
+  <li>Edit ops: 10 M DAU × 200 block ops/day = 2 B ops/day, ~25 K ops/s avg, 200 K peak.</li>
+  <li>Realtime sessions: 1 M concurrent, 5 ops/s/user → 5 M ops/s during peak (mostly transient).</li>
+  <li>Search index: 50 B blocks × 200 B inverted entries = 10 TB on Elasticsearch.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/block/{id}/op            { op:"update", props:{...}, baseVersion }
+POST /v1/page/{id}/move-block     { blockId, newParent, newIndex }
+GET  /v1/page/{id}?cursor=        → blocks[] (paginated)
+WS   /v1/workspace/{id}/sync      → { type:"op", blockId, op, version }
+GET  /v1/search?q=&amp;workspace=     → results
+POST /v1/db/{id}/row              → page (rows are pages)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──HTTPS/WS──&gt;[Edge]──&gt;[API Gateway]──&gt;[Sync Service]──&gt;[Postgres (sharded by workspace)]
+                                                  │                  │
+                                                  │                  └─&gt;[WAL]──&gt;[Kafka]──&gt;[Search Indexer / Reco / Audit]
+                                                  ▼
+                                           [Realtime Hub (per workspace shard)]
+                                                  │
+                                           [Block CDN cache] (presigned)
+                                           [Object Store: S3 for files/embeds]
+</div>
+<p>Workspace is the sharding unit. Each shard = a Postgres logical database + a Realtime Hub process. The Sync Service is the single write path; it appends to the WAL which Kafka mirrors to downstream consumers (search, audit, AI).</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Postgres</h3>
+<pre>CREATE TABLE blocks (
+  id              uuid PRIMARY KEY,
+  workspace_id    uuid NOT NULL,
+  parent_id       uuid,
+  type            text,           -- paragraph|todo|table|...
+  props           jsonb,          -- type-specific
+  position        numeric,        -- fractional index
+  version         bigint,         -- monotonic per block
+  updated_at      timestamptz,
+  deleted_at      timestamptz
+);
+CREATE INDEX ON blocks (workspace_id, parent_id, position);</pre>
+<h3>7.2 Why Postgres?</h3>
+<p>Notion famously sharded one giant Postgres into 480 logical shards, then 1,000+. Per-tenant ACID transactions are gold for the "move 50 blocks at once" UX; jsonb gives schema flexibility per block type. DDIA Ch.6 covers exactly this hash-by-tenant partitioning.</p>
+<h3>7.3 Why not a CRDT for blocks?</h3>
+<p>Block-level conflicts are rare (only one user usually edits a given block); LWW per property suffices. Inside a block (text), we run a Yjs YText CRDT — narrow scope, small payload.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Sync engine</h3>
+<p>Optimistic client: applies op locally with a tentative version, sends to server. Server validates baseVersion matches, increments, persists, broadcasts. On conflict, server returns latest state and client rebases — block-level rebase is trivial because props are independent.</p>
+<h3>8.2 Block ordering</h3>
+<p>Fractional indexing on <code>position</code>. Reorder = single UPDATE; bulk reorder = multi-row txn. Periodic rebalance when gaps shrink past 1e-9.</p>
+<h3>8.3 Realtime hub</h3>
+<p>Workspace-affinity websockets. Sub-channels per page so a 100k-block workspace doesn't spam every client. Presence on a separate ephemeral topic.</p>
+<h3>8.4 Search</h3>
+<p>Kafka → indexer → Elasticsearch with workspace_id as routing key. Permission filtering done at query time using ACL bitmaps.</p>
+<h3>8.5 Sub-pages &amp; transclusion</h3>
+<p>A block of type <code>page_ref</code> stores target_id only; loading is on-demand and cycle-detected at render time.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot workspace (10k editors):</b> split shard, add read replicas; Realtime Hub fans out via Redis pub/sub.</li>
+  <li><b>Resharding:</b> dual-write + backfill + cutover. Notion has documented this at length.</li>
+  <li><b>Large pages (10k+ blocks):</b> paginate; never load full tree. Render virtualized.</li>
+  <li><b>Long offline:</b> client keeps an op queue; on reconnect replays in order, server LWW resolves.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Postgres-per-tenant sharding</td><td>ACID, simple, tooling</td><td>Resharding pain at 1B+ blocks</td></tr>
+<tr><td>LWW per block prop</td><td>Cheap, no transforms</td><td>Concurrent edits to same prop lose data</td></tr>
+<tr><td>Yjs only inside text blocks</td><td>Realtime where needed, simple elsewhere</td><td>Two paradigms in one product</td></tr>
+<tr><td>Optimistic client</td><td>Snappy UX</td><td>Rollback flicker on conflict (rare)</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — Postgres single-leader with sync replica + async followers.</li>
+  <li>Ch. 6 Partitioning — hash partitioning by workspace_id, dynamic resharding.</li>
+  <li>Ch. 11 Stream Processing — WAL → Kafka → derived stores (search, analytics).</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I would not use a global CRDT. Block-level LWW + scoped Yjs for text is the pragmatic Notion-style choice."</li>
+  <li>"The interesting design pressure is resharding; I'd commit early to a logical-shard mapping table so I never re-hash the world."</li>
+  <li>"Transclusion + permissions is the subtlest correctness issue — must check ACLs on every dereference, not at link time."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Postgres (sharded by workspace)</td><td>50 B blocks need ACID for "move 50 blocks at once" UX; jsonb gives schema flexibility per of 30+ block types. Notion's documented 480→1000+ logical-shard scaling proves the model works at our 100 M-user target. Per-shard txn cost is trivial vs. 200 K peak ops/s.</td><td>MongoDB (rejected: weak multi-doc txns until recently, weaker tooling); CockroachDB (rejected: 3× cost, we don't need cross-region writes per workspace).</td></tr>
+    <tr><td>LWW per block prop (NOT a global CRDT)</td><td>Block-level conflicts are rare — only one user typically edits a given block at once. LWW per property avoids CRDT tombstone bloat across 50 B blocks (which would add ~225 TB overhead). Trades a tiny lost-edit risk for massive simplicity.</td><td>Global Yjs (rejected: 50 B blocks × tombstones = unfeasible); OT (rejected: no real character-level coediting requirement outside text blocks).</td></tr>
+    <tr><td>Yjs YText inside text blocks only</td><td>Real-time character-level coediting is needed only within a single paragraph. Scoping Yjs to one block keeps payload &lt; 1 KB and tombstones bounded per-block. Two paradigms is the price of operating at 10 M paying workspaces without 10× cost.</td><td>Global Yjs (rejected: cost); plain LWW for text (rejected: terrible UX for two cursors in same paragraph).</td></tr>
+    <tr><td>Kafka (WAL → derived stores)</td><td>Sync Service writes to Postgres then mirrors via logical decoding to Kafka, fanning to search, audit, AI. Kafka's at-least-once + ordered partitions per workspace_id means search index lag stays &lt; 5 s under our 200 K peak ops/s.</td><td>Postgres LISTEN/NOTIFY (rejected: no replay, drops messages under load); Kinesis (viable; chose Kafka for self-host control and tooling).</td></tr>
+    <tr><td>WebSocket (Realtime Hub)</td><td>1 M concurrent sessions need bidirectional push under 100 ms. WebSocket's persistent conn over TLS works through every corporate proxy and lets us multiplex sub-channels per page so a 100k-block workspace doesn't spam every client.</td><td>SSE (rejected: half-duplex, client→server still HTTPS POST); long-poll (rejected: 5× more conns at our scale).</td></tr>
+    <tr><td>Elasticsearch (search)</td><td>50 B blocks × 200 B inverted entries = 10 TB index. Routing by workspace_id keeps a query to one shard, hitting our p99 800 ms page-open SLO. ACL bitmap filtering at query time avoids per-block re-indexing on permission change.</td><td>Postgres FTS (rejected: 10 TB inverted index dominates Postgres I/O); OpenSearch (viable fork; chose ES for jsonb mapping maturity).</td></tr>
+    <tr><td>Fractional indexing (block position)</td><td>Reorders are single-row UPDATEs (not N rewrites). Block insertion between two siblings yields a midpoint position with no coordination. Periodic rebalance fires when gaps shrink past 1e-9 (~50 inserts in the same gap).</td><td>Integer position + reorder (rejected: bulk reorder writes O(N) rows); linked list (rejected: tree traversals on Postgres are painful).</td></tr>
+    <tr><td>Redis (Realtime Hub pub/sub)</td><td>Workspace-affinity sockets need a sub-ms broker for fanout within a shard. Redis pub/sub at ~1 M msgs/s/node with sub-millisecond latency keeps our 100 ms p50 block-save SLO; we accept "at-most-once" since the canonical write is in Postgres.</td><td>Kafka (rejected: 5–20 ms latency, overkill for ephemeral hub fanout); NATS (viable; chose Redis for shared infra).</td></tr>
+    <tr><td>S3 (files, embeds)</td><td>Embedded images, PDFs, videos go to S3 via presigned URL, with only the URL stored in jsonb. Decouples block ops (200 K/s small writes) from file uploads (large objects), and 11 9s durability is free.</td><td>Postgres bytea (rejected: blows up shard size); GCS (viable; S3 chosen for AWS-aligned infra).</td></tr>
+    <tr><td>Logical-shard mapping table</td><td>To avoid global rehash on growth, we maintain workspace_id → logical_shard_id in a tiny lookup, then logical_shard → physical Postgres in another. Resharding moves logical shards as units (dual-write + backfill + cutover) — the only sustainable model at 50 B blocks.</td><td>Hash mod N (rejected: rehash-the-world on N change); range partitioning (rejected: hot tail workspaces).</td></tr>
+    <tr><td>Optimistic client (rebase on conflict)</td><td>Snappy UX requires applying the user's edit before server ack. Server validates baseVersion; on mismatch sends latest state and client rebases — trivial because props are independent. Rollback flicker is rare in practice (LWW conflicts are &lt; 0.1% of ops).</td><td>Pessimistic locking (rejected: kills typing latency); CRDT (rejected: tombstone cost as discussed).</td></tr>
+    <tr><td>ACL bitmap (permission filter)</td><td>Granular sharing on 50 B blocks means we can't filter at index time. A per-user ACL bitmap loaded on session start lets search filter at query time in 1–2 ms; bitmap rebuild is async on permission change with &lt; 30 s lag.</td><td>Per-block ACL row (rejected: 50 B × users = unfeasible); per-query ACL re-eval (rejected: pushes 100 ms+ to every search).</td></tr>
+  </tbody>
+</table>

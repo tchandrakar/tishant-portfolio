@@ -1,0 +1,206 @@
+<h1>Design Geo-search Nearby (top-K within radius, geohash + KD-tree)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">search</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the generic primitive that powers Uber driver lookup, Tinder matches, food-delivery couriers, scooter availability: <b>"given (lat, lng), return top-K POIs within radius r, ranked by distance/score, in &lt;30 ms p99"</b>. POIs are mobile (drivers move) so writes are 100 K+/s; reads are 10× higher; index must support filters (e.g., car_type=XL, available=true). The point of this problem is the algorithmic core: geohash, S2, R-tree, KD-tree.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Insert/update an entity's location (entity_id, lat, lng, attrs).</li>
+  <li>Delete/expire an entity.</li>
+  <li>Query top-K within radius r of (lat, lng), with attribute filters, sorted by distance.</li>
+  <li>Bulk-load (cold start) and snapshot/restore.</li>
+  <li>Range query: all entities inside a polygon (e.g., a city).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> point query p99 &lt; 30 ms; update p99 &lt; 10 ms.</li>
+  <li><b>Scale:</b> 50 M live entities, 100 K wps, 1 M rps.</li>
+  <li><b>Freshness:</b> updates visible to queries &lt; 2 s.</li>
+  <li><b>Availability:</b> 99.99% with hot-standby per shard.</li>
+  <li><b>Correctness:</b> radius queries must not miss entities at cell boundaries.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>50 M entities × 100 B (id+lat+lng+attrs) = 5 GB — fits in RAM per region.</li>
+  <li>Sharding: 12 regions × ~4 M entities each → single node serves a region from 1 GB.</li>
+  <li>Reads: 1 M rps / 12 ≈ 83 K rps per shard — comfortably handled by an in-process index.</li>
+  <li>Writes: 100 K wps; an R-tree mutation is O(log n) ≈ 25 nodes touched, ~40 µs CPU.</li>
+  <li>Memory budget: KD-tree node ≈ 40 B → 50 M × 40 B = 2 GB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/loc/upsert      {entityId, lat, lng, attrs}      → 204
+DELETE /v1/loc/{entityId}                                   → 204
+GET   /v1/loc/nearby      ?lat&amp;lng&amp;r&amp;k&amp;filter=attr=val    → [{entityId, dist}]
+POST  /v1/loc/bbox        {minLat,minLng,maxLat,maxLng}    → [entities]
+GET   /v1/loc/snapshot                                      → binary blob</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Producers]──updates──▶[Ingest API]──▶[Kafka: loc.updates]
+                                                │
+                                                ▼
+                  ┌─────────────[Geo Shard Router (S2 cell → shard)]
+                  ▼                              ▼
+         [Geo Shard 0..N]                  [Geo Shard N..]
+         ┌───────────────┐                 ┌───────────────┐
+         │ in-RAM index: │                 │ in-RAM index: │
+         │  geohash buckets │              │  KD-tree     │
+         │ + R-tree on attrs│              │ + R-tree     │
+         │ WAL → S3 every 5s│              │              │
+         └───────────────┘                 └───────────────┘
+                  ▲                              ▲
+                  └──────[Query Coordinator]──────┘
+                                  ▲
+                                  │
+                              [Clients]
+</div>
+<p>Updates are partitioned by S2 cell (level 8) so geographically close entities co-locate, making radius queries single-shard ~95% of the time. Cross-shard queries fan out to ≤4 shards (a 4-cell cover at the boundary). Every shard keeps a write-ahead log to S3 + periodic snapshot for recovery in &lt;30 s.</p>
+
+<h2>7. Data model &amp; index choices</h2>
+<h3>7.1 Geohash bucketing (simplest)</h3>
+<pre>HashMap&lt;geohash7, List&lt;Entity&gt;&gt;   // 153 m × 153 m cells
+Query: cover the search disk with 9 neighbour cells, scan, filter by haversine.</pre>
+<h3>7.2 KD-tree (best for static-ish data)</h3>
+<pre>Recursive median split on alternating lat/lng axes.
+Build O(n log n); kNN query O(log n) expected; range O(√n + k).
+Pros: tight pruning; Cons: rebalance on heavy churn.</pre>
+<h3>7.3 R-tree (good for moving entities + attribute filter)</h3>
+<pre>Bounding-box hierarchy; supports rectangles, polygons, kNN.
+Update is O(log n) but expensive on splits → use R*-tree + bulk reinsertion.</pre>
+<h3>7.4 S2 / Uber H3 (cell-id approach)</h3>
+<p>Hierarchical, equal-area cells. Index is just a sorted map cell_id → entities; a radius query computes a cell covering. This is what Uber uses for driver dispatch (H3 hex grid).</p>
+<h3>7.5 Trade-off summary</h3>
+<table>
+<thead><tr><th>Index</th><th>Update</th><th>kNN</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Geohash bucket</td><td>O(1)</td><td>O(cells × bucket)</td><td>Simple; boundary issues</td></tr>
+<tr><td>KD-tree</td><td>O(log n) but degrades</td><td>O(log n) avg</td><td>Best static; rebuild nightly</td></tr>
+<tr><td>R-tree</td><td>O(log n)</td><td>O(log n)</td><td>Best for mobile + bbox</td></tr>
+<tr><td>S2/H3 cells</td><td>O(1)</td><td>O(cover × bucket)</td><td>Industry default; equal-area cells</td></tr>
+</tbody>
+</table>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Query path</h3>
+<p>1) Compute the disk's S2 covering at level 12 (≈ a few cells for r=1 km). 2) Route to owning shard(s). 3) Each shard scans candidate buckets, applies haversine, attribute filters, then a min-heap of size K. 4) Coordinator merges results across shards — total candidates rarely &gt;1 K so the heap merge is microseconds.</p>
+<h3>8.2 Update path</h3>
+<p>Producer → Kafka (key = entity_id) so updates for one entity are ordered. Shard consumer applies in-RAM, appends to WAL. Tombstones expire after 60 s of staleness — e.g., a driver who stopped pinging is dropped from the index.</p>
+<h3>8.3 Hot-cell mitigation</h3>
+<p>Times Square at peak has 50 K entities in one S2 level-12 cell. We split overflowing cells dynamically into a child level (12→13). Queries that land on a split cell descend.</p>
+<h3>8.4 Boundary correctness</h3>
+<p>Always cover with cells <i>strictly larger</i> than the radius circumcircle. With S2 the formula is: pick level whose cell width &gt; r, then take a 4-neighbour cover. Validated unit tests at every coastline.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Re-shard during regional growth:</b> S2 cells subdivide on threshold; consistent-hash ring uses cell prefix.</li>
+  <li><b>GC pressure (Java/Go):</b> off-heap structures (chronicle map / mmapped flat files) for the entity table.</li>
+  <li><b>Write amplification:</b> coalesce updates from same entity in 1 s windows (DDIA Ch. 11 stream).</li>
+  <li><b>Snapshot consistency:</b> copy-on-write tree pointers; readers continue while a snapshot writer iterates.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>In-process RAM index</td><td>Sub-ms; simple</td><td>Recovery time on crash; capped by node RAM</td></tr>
+<tr><td>Use PostGIS instead</td><td>SQL; mature</td><td>~5-20 ms p99; fewer than 10 K wps</td></tr>
+<tr><td>Use Elasticsearch geo</td><td>Rich filters</td><td>Heavier; freshness 1 s+; expensive</td></tr>
+<tr><td>S2 cells over geohash</td><td>Equal-area, great hierarchy</td><td>Slightly more code complexity</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage &amp; Retrieval — in-memory data structures vs B-tree/LSM trade-offs.</li>
+  <li>Ch. 6 Partitioning — geographic partitioning by S2 cell, dealing with skew.</li>
+  <li>Ch. 11 Stream Processing — Kafka-keyed updates, exactly-once with idempotent upserts.</li>
+  <li>Ch. 8 Distributed Trouble — bounded staleness on update visibility.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"There's a hierarchy of answers: PostGIS for v0, Redis-GEO for v1, custom S2 in-RAM shard for v2 — say what scale we're at."</li>
+  <li>"The really interesting part is hot cells; that's where Uber published a paper splitting H3 indices dynamically."</li>
+  <li>"I'd separate <i>retrieval</i> (nearby) from <i>matching</i> (driver-rider score) — different teams, different SLAs."</li>
+  <li>"Watch boundary bugs: an off-by-one in cell covering misses entities exactly on the edge — easy interview gotcha."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>S2 cells (level 8 partitioning, level 12 query covering)</td>
+      <td>50 M moving entities at 100 K wps need geographic partitioning that keeps neighbours co-located so radius queries hit one shard 95% of the time. S2's hierarchical equal-area cells let level-8 shard routing match level-12 query covering naturally — and equal-area means a 1 km radius behaves identically in Helsinki and Singapore.</td>
+      <td>Geohash (rectangle, 2× area distortion at high latitudes); H3 (hex shape, harder radius cover math); Quadtree (no equal-area).</td>
+    </tr>
+    <tr>
+      <td>H3 (Uber-style hex grid) — alternative</td>
+      <td>Documented as the index option for ride-dispatch flavours of this problem. Hexagonal cells have uniform neighbour distance (every neighbour is exactly one ring away), which simplifies driver-rider matching where "expand search by one ring" is the dominant primitive.</td>
+      <td>S2 (square neighbours have 4 vs 8 distinct distances); custom Voronoi (heavy to maintain at 50 M churn).</td>
+    </tr>
+    <tr>
+      <td>Geohash buckets (v1 simplicity)</td>
+      <td>HashMap&lt;geohash7, List&lt;Entity&gt;&gt; gives O(1) update and 9-cell radius cover for under 200 lines of code — perfect for an MVP serving &lt;10 K wps. We document it as the v1 index because boundary issues only bite at scale.</td>
+      <td>Skip directly to S2 (overkill for v1); R-tree (more code than v1 deserves); PostGIS (operational dependency for a hot-path service).</td>
+    </tr>
+    <tr>
+      <td>KD-tree (best for static-ish data)</td>
+      <td>For workloads where churn is &lt;5%/min (e.g., POI lookup, scooter inventory), KD-tree's O(log n) kNN with tight pruning beats bucket scans. Build cost is O(n log n) so we rebuild nightly into a memory-mapped flat file and hot-swap atomically.</td>
+      <td>Ball-tree (better in high dim, but we're in 2D); Cover tree (academic, less tooling); R*-tree (better for moving data, worse for kNN on static).</td>
+    </tr>
+    <tr>
+      <td>R-tree / R*-tree (mobile entities + bbox queries)</td>
+      <td>For drivers/couriers moving at 100 K wps, R-tree mutations are O(log n) and it natively supports the "bbox over a city" range query that KD-tree handles awkwardly. R* with bulk reinsertion smooths split costs at the price of ~30% more memory.</td>
+      <td>KD-tree (degrades on churn, no bbox); plain quad-tree (worse splits under skew); BVH (overkill for axis-aligned queries).</td>
+    </tr>
+    <tr>
+      <td>Kafka (entity_id-keyed update stream)</td>
+      <td>Producer→shard fan-in at 100 K wps with strict per-entity ordering needs Kafka's per-key ordering guarantee. Keying by entity_id ensures a driver's pings stay sequential even across producer retries; idempotent upserts on the consumer side keep state correct under at-least-once delivery.</td>
+      <td>Kinesis (1 MB/s/shard, would need 100s of shards); RabbitMQ (no key-ordered partitions); SQS (no ordering).</td>
+    </tr>
+    <tr>
+      <td>In-process RAM index (per shard)</td>
+      <td>The 30 ms p99 / 10 ms update SLA leaves no budget for network hops to a separate index service. With 50 M × 100 B = 5 GB total, we can fit a region (1 GB) in process and serve 83 K rps per shard locally; an R-tree mutation touches ~25 nodes in 40 µs.</td>
+      <td>Redis GEO (~1 ms RTT plus serialisation = 3-5 ms baseline); ES (~30 ms p99); external KV with custom geo (extra hop).</td>
+    </tr>
+    <tr>
+      <td>Write-ahead log to S3 + periodic snapshots</td>
+      <td>In-process indexes lose state on crash. WAL flushed every 5 s + 60 s snapshot lets us replay &lt;65 s of history on restart, hitting the 99.99% availability target with hot-standby and a 30 s recovery window. S3 is durable, cheap, and global.</td>
+      <td>Persist on every write (kills 100 K wps latency); EBS-backed local disk (lost on instance failure); Cassandra-backed (extra hop on hot path).</td>
+    </tr>
+    <tr>
+      <td>Dynamic cell splitting (hot-cell mitigation)</td>
+      <td>Times Square's 50 K entities in a single S2 level-12 cell create a head-of-line bottleneck. Splitting overflowing cells to a finer level (12→13) keeps per-cell candidate lists bounded; Uber published H3-based papers describing the same dynamic approach.</td>
+      <td>Static finer level globally (wastes RAM in rural shards); rejection sampling (loses entities); shard hash on lat/lng directly (loses geographic locality).</td>
+    </tr>
+    <tr>
+      <td>Off-heap structures (Chronicle Map / mmap)</td>
+      <td>At 50 M entries in JVM/Go runtimes, GC pauses on the entity table can blow past the 10 ms update SLA. Off-heap or mmap-backed flat tables move the bulk allocation outside the GC root set and bring p99 GC pauses from ~50 ms to &lt;2 ms.</td>
+      <td>Plain Java HashMap (GC pauses); Native (Rust/C++) rewrite (months of work); Shenandoah/ZGC (better but still adds tail latency).</td>
+    </tr>
+    <tr>
+      <td>Min-heap top-K merge across shards</td>
+      <td>Cross-shard radius queries (≤4 shards at boundary) return ≤500 candidates each; merging into a global top-K via a bounded min-heap costs microseconds. We deliberately cap candidates per shard at 500 to bound coordinator work even when the disk lands on dense urban cells.</td>
+      <td>Sort-then-truncate (O(n log n) when O(n log K) suffices); pull-K-per-shard (loses correctness on skewed shards).</td>
+    </tr>
+    <tr>
+      <td>Tombstones with 60 s staleness expiry</td>
+      <td>Drivers who stop pinging shouldn't appear forever. A 60 s tombstone window matches typical GPS drop-out tolerances and triggers explicit removal so radius queries never surface ghost entities — a cheap correctness primitive at this scale.</td>
+      <td>Hard delete on every silence (false positives during tunnel passes); LRU eviction (no time guarantee); client-side filtering (wastes bandwidth).</td>
+    </tr>
+    <tr>
+      <td>Copy-on-write tree pointers (snapshot consistency)</td>
+      <td>Snapshots must capture a consistent view without blocking 100 K wps. CoW lets the snapshot writer iterate a frozen root while readers and writers continue against new versions — a textbook MVCC-on-an-index pattern that costs &lt;5% memory overhead.</td>
+      <td>Read-write lock during snapshot (kills latency SLA); STW pause (violates 10 ms update SLA); double-buffered indexes (2× RAM).</td>
+    </tr>
+  </tbody>
+</table>

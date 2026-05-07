@@ -1,0 +1,162 @@
+<h1>Design Pocket FM (audio series platform)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">audio-streaming</span>
+  <span class="tag">recommendation</span>
+  <span class="tag">ad-tech</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design Pocket FM, an audio-series platform where creators publish multi-episode "audio shows" (long-form serialized fiction). The product has a freemium model: the first N episodes are free with ads; later episodes are unlocked with virtual coins purchased via in-app payments. Core user flow is binge-listening one show at a time across days. The system must serve episodic catalogs, drive aggressive personalization (because retention hinges on next-episode hooks), monetize via interstitial audio ads + coin unlocks, and handle bursty traffic when a show goes viral on social media.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Browse shows by genre/language/trending; play episodes sequentially.</li>
+  <li>Sequential progress tracking per show (resume position, last-played episode).</li>
+  <li>Coin wallet: buy coins, unlock episodes, refunds, gifting.</li>
+  <li>Insert audio ads dynamically at episode boundaries for free users.</li>
+  <li>Push notifications when next episode in followed show drops.</li>
+  <li>Personalized "Made for You" rails and "Continue Listening" rail.</li>
+  <li>Creator dashboard: upload episodes, view listens, revenue split.</li>
+  <li>Multi-language support (Hindi, Tamil, English, Indonesian, Spanish).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> first byte under 250ms p99 in target geos (India SEA LATAM).</li>
+  <li><b>Scale:</b> 100M MAU, 25M DAU, 1.5M concurrent at prime time.</li>
+  <li><b>Availability:</b> 99.95% playback; 99.9% wallet (payments tier).</li>
+  <li><b>Consistency:</b> strong for coin balance/unlocks; eventual for listen counts.</li>
+  <li><b>Cost:</b> low ARPU geography &mdash; egress cost dominates, must aggressively cache and use cheap codec (Opus 64kbps).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Catalog:</b> 200K shows &times; avg 200 episodes &times; 25min &times; Opus 64kbps = ~12 MB/episode &times; 40M episodes = ~480 TB raw + 2 bitrates ~1 PB.</li>
+  <li><b>Daily listens:</b> 25M DAU &times; 4 episodes = 100M episode-plays/day = ~1.2K plays/sec avg, 6K peak.</li>
+  <li><b>Egress:</b> 100M plays &times; 12MB = 1.2 PB/day from CDN.</li>
+  <li><b>Coin txns:</b> 5M unlock events/day = 60 TPS avg, 500 TPS peak (post-show-launch surge).</li>
+  <li><b>Ad impressions:</b> 100M plays &times; 2 ads/episode &times; 70% free users = 140M impressions/day = ~1.6K QPS to ad server.</li>
+  <li><b>Notification fanout:</b> when popular show drops, 5M followers &times; push = 5M sends in 60s = 80K/sec.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/shows/trending?lang=hi                   -&gt; {shows[]}
+GET   /v1/shows/{id}                               -&gt; {meta, episodeCount, freeUntil}
+GET   /v1/shows/{id}/episodes?cursor=              -&gt; {episodes[], nextCursor}
+POST  /v1/playback/start  {episodeId, deviceId}    -&gt; {streamUrl, adBreaks[], sessionId}
+POST  /v1/unlock          {episodeId, coins}       -&gt; {balance, txnId}
+POST  /v1/wallet/topup    {sku, paymentToken}      -&gt; {balance, receiptId}
+GET   /v1/me/continue                              -&gt; {shows[], position}
+POST  /v1/follow          {showId}                 -&gt; 204
+GET   /v1/recos/foryou                             -&gt; {rails[]}
+POST  /v1/ad/impression   {adId, sessionId, posMs} -&gt; 204</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App] -- HTTPS --&gt; [CDN/POP] -- audio segments -- [Origin: S3]
+   |
+   +--&gt; [API Gateway]
+            |
+            +--&gt; [Catalog Svc] --- [MongoDB: shows, episodes]
+            +--&gt; [Playback Svc] -- [Ad Decision Svc] -- [Ad Inventory: Redis+MySQL]
+            +--&gt; [Wallet Svc]   --- [PostgreSQL: ledger, idempotent]
+            +--&gt; [Progress Svc] --- [Redis] --- async --- [Cassandra: history]
+            +--&gt; [Reco Svc]     --- [Vector DB (Milvus)] + [Feature Store]
+            +--&gt; [Notif Svc]    --- [Kafka] -- [FCM/APNs workers]
+
+[Kafka: listen-events, ad-events] -&gt; [Flink] -&gt; [ClickHouse] -&gt; creator dashboards
+</div>
+<p>Walk-through: client requests episode start; Playback service checks unlock state, calls Ad Decision for an interstitial pre-roll if user is free-tier, returns a manifest with audio + ad segments stitched. Wallet service is the only strongly consistent path. Listen events flow through Kafka into ClickHouse for creator analytics and into the feature store for next-day reco training.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Catalog (MongoDB)</h3>
+<pre>show: { _id, title, lang, genres[], creatorId, totalEpisodes,
+        freeEpisodeCount, coinPrice, coverArt }
+episode: { _id, showId, seq, title, durationMs, audioBlobId,
+           releaseTs, isFree }</pre>
+<h3>7.2 Wallet ledger (PostgreSQL, double-entry)</h3>
+<pre>CREATE TABLE wallet_txn (
+  txn_id uuid PRIMARY KEY,
+  user_id bigint, delta_coins int,
+  reason text,           -- 'topup' | 'unlock' | 'refund'
+  ref_id text,           -- episode_id or receipt_id
+  idempotency_key text UNIQUE,
+  created_at timestamptz
+);
+CREATE TABLE wallet_balance (
+  user_id bigint PRIMARY KEY,
+  balance_coins int, version bigint
+);</pre>
+<h3>7.3 Listen progress (Redis primary, Cassandra archive)</h3>
+<pre>HSET progress:{userId} {showId} "{episodeSeq}:{posMs}:{ts}"
+TTL 30 days; nightly Spark archives to Cassandra by user_id.</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Wallet &amp; unlock flow</h3>
+<p>Idempotency-key on every <code>/unlock</code>; transactional insert into <code>wallet_txn</code> + UPDATE balance with optimistic version check. On payment top-up, the IAP receipt is verified server-side with Apple/Google before crediting. Refunds use a reversing entry &mdash; never UPDATE prior rows. This double-entry ledger satisfies finance audit and prevents race-condition exploits during viral surges.</p>
+<h3>8.2 Ad decision &amp; stitching</h3>
+<p>Server-side ad insertion: the playback manifest interleaves audio segments with ad segments transcoded to identical codec/bitrate for seamless transitions. Ad selection uses a real-time auction (header bidding fallback to direct campaigns) with frequency capping in Redis. Free users see a pre-roll + mid-roll; coin-unlocked episodes are ad-free.</p>
+<h3>8.3 Recommendation engine</h3>
+<p>Show-level reco uses a two-tower model: user tower (history embedding via GRU over last 50 episode listens) and show tower (text + cover-image features). ANN search in Milvus returns top 1000 candidates; an XGBoost ranker re-orders with completion-rate features. "Continue Listening" rail is a simple Redis ZSET sorted by last-touch.</p>
+<h3>8.4 Episode-drop notification fanout</h3>
+<p>On creator publish, a Kafka topic <code>episode_published</code> drives a fanout job that batches followers (1000/batch) and dispatches to FCM/APNs. Quiet hours are enforced per-user timezone. Dedup key prevents double-sends on retries.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Viral show surge:</b> CDN absorbs reads; pre-warm POPs based on social-trend signals.</li>
+  <li><b>Wallet write hotspot:</b> shard PostgreSQL by <code>user_id</code> hash; per-user single-writer avoids deadlocks.</li>
+  <li><b>Reco cold start:</b> language + genre fallback rails for first-session users.</li>
+  <li><b>Push fanout:</b> rate-limit per provider (FCM 600K msg/min) via token bucket on dispatcher.</li>
+  <li><b>Egress cost:</b> Opus 64kbps cuts bandwidth 60% vs MP3 128 with comparable speech quality.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>MongoDB for catalog</td><td>Flexible schema for evolving show metadata</td><td>Weaker txn story than Postgres</td></tr>
+<tr><td>Server-side ad stitching</td><td>Ad-blocker resistant, smooth UX</td><td>Higher origin compute</td></tr>
+<tr><td>Coins (virtual currency) over direct purchase</td><td>Higher LTV, regional pricing</td><td>Regulatory risk in some geos</td></tr>
+<tr><td>Redis-first progress, Cassandra archive</td><td>Sub-ms reads</td><td>Loses last 30s on Redis crash</td></tr>
+<tr><td>Opus 64k vs MP3 128k</td><td>Half the egress cost</td><td>Older devices need transcoding fallback</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — async multi-region for catalog reads in low-ARPU geos.</li>
+  <li>Ch. 7 Transactions — serializable wallet ledger; idempotency keys for at-least-once retries.</li>
+  <li>Ch. 9 Consensus — Raft-backed config service for ad campaign rollouts.</li>
+  <li>Ch. 11 Stream Processing — Flink for listen-event aggregation feeding creator dashboards.</li>
+  <li>Ch. 12 Future of Data Systems — derived data: reco features built from listen-event log.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Pocket FM's economics are different from Spotify &mdash; ARPU is 10x lower, so I optimized for egress cost first (Opus, aggressive CDN, regional POPs)."</li>
+  <li>"The wallet is the riskiest component; I'd treat it as a payments-grade microservice with double-entry ledger and quarterly reconciliation against Apple/Google receipts."</li>
+  <li>"Sequential bingeing means the next-episode hook is everything &mdash; I'd A/B test mid-roll ads heavily and use completion-rate as the north-star reco metric, not CTR."</li>
+  <li>"For viral shows I'd also pre-decode coin pricing into a config service so we can dynamically discount episodes 1&ndash;5 for cohorts that drop off."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>MongoDB</b></td><td>Show metadata evolves rapidly (free-episode counts, coin price tiers, language localizations, A/B'd cover art) and 200K shows isn't huge; document model lets product ship schema changes without migrations and per-show embedded episode arrays serve catalog screens in one read.</td><td>PostgreSQL — JSONB works but rigid joins for episode lists; DynamoDB — cost-prohibitive in low-ARPU geos with our read patterns</td></tr>
+    <tr><td><b>PostgreSQL</b></td><td>The wallet ledger is payments-grade: 500 TPS peak coin unlocks need serializable transactions, double-entry semantics, and unique idempotency keys to survive retries during viral surges; sharding by <code>user_id</code> hash gives single-writer-per-user and avoids deadlocks.</td><td>MySQL — viable but PG's serializable isolation is cleaner; Cassandra — no transactions, fatal for money</td></tr>
+    <tr><td><b>Redis</b></td><td>Listen progress (resume position) needs sub-ms reads on every app open and 1B+ daily writes; storing in Redis with 30-day TTL plus nightly Cassandra archive cuts the hot dataset 100x. Also powers ad frequency caps and Continue Listening ZSETs.</td><td>Memcached — no TTL-per-field on hashes; in-process cache — no cross-device sync</td></tr>
+    <tr><td><b>Cassandra</b></td><td>Listen-history archive grows unbounded across 100M users; partition by <code>user_id</code> with time clustering gives cheap append writes and "show me my last 6 months" reads in one slice. TTL-based compaction prunes naturally.</td><td>HBase — heavier ops for our scale; S3+Athena — too slow for user-facing reads</td></tr>
+    <tr><td><b>Milvus (Vector DB)</b></td><td>Two-tower reco with 256-d show embeddings over 200K shows needs ANN at &lt;10ms p99; Milvus's HNSW index serves top-1000 candidates per request and supports per-language filter pushdown so Hindi users don't get Tamil shows.</td><td>FAISS — embedded only, no replication; pgvector — slower at our QPS; Pinecone — vendor lock + cost</td></tr>
+    <tr><td><b>Kafka</b></td><td>Listen-events and ad-events at 100M/day plus episode-published fanouts (5M push notifs in 60s) need a durable buffer; partition by <code>user_id</code> for ordered listen aggregation and by <code>show_id</code> for fanout work distribution.</td><td>RabbitMQ — no replay; Kinesis — costs more in target geos with no hosted alternative</td></tr>
+    <tr><td><b>Flink</b></td><td>Creator dashboards need near-real-time listen counts and completion rates; Flink's keyed state and event-time windows roll up listens per show every minute, sinking to ClickHouse for the dashboard read path.</td><td>Spark Streaming — micro-batch latency hurts dashboard freshness; Kafka Streams — weaker state-store at this scale</td></tr>
+    <tr><td><b>ClickHouse</b></td><td>Creators query "plays by episode by country last 30 days" interactively; columnar storage and sparse indexes return aggregates over billions of listen rows in under a second, vastly cheaper than running these on the OLTP path.</td><td>Druid — operationally heavier; BigQuery — per-query cost prohibitive for 30M creators self-serving</td></tr>
+    <tr><td><b>S3</b></td><td>1 PB of Opus 64 kbps episodes plus masters need 11-nines durability at object pricing; lifecycle rules move long-tail (shows untouched 90+ days) to Glacier — given show binging clusters around recent releases, this saves ~40% on storage.</td><td>Self-managed Ceph — ops cost; Backblaze B2 — slower CDN integration</td></tr>
+    <tr><td><b>CDN (CloudFront/Akamai)</b></td><td>1.2 PB/day egress in cost-sensitive geos demands aggressive edge caching; episode files are immutable so cache hit ratio nears 95%, slashing origin bandwidth bills which dominate ARPU economics.</td><td>Direct origin serving — economically infeasible; multi-CDN routing — added at growth stage</td></tr>
+    <tr><td><b>Opus codec (64 kbps)</b></td><td>Speech-heavy serialized fiction sounds excellent at 64 kbps Opus, half the bytes of MP3 128 kbps; this single codec choice cuts CDN egress 60% which is the dominant cost in low-ARPU markets.</td><td>MP3 128 — 2x egress; AAC-LC 64 — slightly worse at speech; HE-AAC v2 — patent thicket</td></tr>
+    <tr><td><b>FCM / APNs</b></td><td>5M push fanouts in 60 seconds when a popular show drops require provider-grade delivery; FCM handles 600K/min throttling natively and APNs is mandatory for iOS — both are free at our volumes versus building our own push.</td><td>OneSignal — middleman cost; SMS — wrong channel + cost</td></tr>
+    <tr><td><b>MySQL (ad inventory)</b></td><td>Ad campaign config (budgets, targeting, frequency caps) is small, relational, and changes infrequently; MySQL gives ops familiarity and the ad team's existing tooling integrates without new infra.</td><td>PostgreSQL — fine but team chose MySQL for tooling fit; DynamoDB — overkill</td></tr>
+    <tr><td><b>XGBoost</b></td><td>Reranker scores top-1000 ANN candidates with 50+ engineered features (completion rate, language affinity, time-of-day, recency); gradient-boosted trees beat linear models on tabular signals and train in minutes nightly on a single machine.</td><td>Deep ranker — marginal gain at 10x compute; LightGBM — equivalent, team has XGBoost ops</td></tr>
+  </tbody>
+</table>

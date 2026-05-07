@@ -1,0 +1,188 @@
+<h1>Design Online Judge (LeetCode/HackerRank — sandboxed code execution)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">misc</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a competitive programming platform that accepts user-submitted code in 15+ languages, compiles and executes it against hidden test cases inside a hardened sandbox, returns verdicts (AC, WA, TLE, MLE, RTE, CE) within seconds, and powers contests with thousands of concurrent participants. The system must be tamper-proof: malicious submissions cannot escape the sandbox, exhaust the host, or leak test data.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Submit source code for a problem; receive a verdict + runtime/memory stats.</li>
+  <li>Support C, C++, Java, Python, Go, Rust, JS, Kotlin, Swift, C#, Ruby, PHP, Scala, Haskell, TypeScript.</li>
+  <li>Run against N test cases; first failure aborts (configurable).</li>
+  <li>Display sample I/O diff on Wrong Answer; hide hidden tests.</li>
+  <li>Live contest mode: leaderboard updates, frozen scoreboard last hour.</li>
+  <li>Plagiarism detection (MOSS-style fingerprinting) on contest submissions.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 verdict in 2 s, p99 in 15 s (excluding TLE-bound problems).</li>
+  <li><b>Scale:</b> 5 M users, 200 K daily submissions, peak 2 K submissions/sec during weekly contests.</li>
+  <li><b>Isolation:</b> zero host compromise; every submission runs in a fresh micro-VM.</li>
+  <li><b>Availability:</b> 99.9% (contests demote to read-only if judge fleet degrades).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS submit: 200K/86400 ≈ 2.3/s avg, 2,000/s peak (contest start).</li>
+  <li>Avg test cases per submission: 25; avg run 500 ms ⇒ 12.5 s CPU per submission.</li>
+  <li>Peak CPU demand: 2,000 × 12.5 = 25,000 CPU-sec/sec ⇒ 25 K cores; with 30 s queue tolerance and 5× burst absorbtion via queue, steady fleet ~5,000 cores (62 × 80-vCPU boxes).</li>
+  <li>Storage: source 5 KB avg × 200 K/day × 365 = 365 GB/yr; test data ~2 TB total (S3).</li>
+  <li>Bandwidth: stdout capped 64 KB/test ⇒ 5 MB/submission max ⇒ 1 GB/s peak egress to result store.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/submissions          {problemId, lang, source}     → submissionId
+GET  /v1/submissions/{id}                                   → {verdict, runtime, memory, testsPassed}
+GET  /v1/submissions/{id}/stream  (SSE)                     → progressive verdict per test
+GET  /v1/contests/{id}/leaderboard?frozen=true              → ranked list
+POST /v1/admin/problems       {statement, tests, limits}    → problemId</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Web/IDE]──HTTPS──►[API GW]──►[Submission Svc]──►[Kafka: submissions]
+                                    │                          │
+                                    ▼                          ▼
+                              [Postgres]              [Judge Workers (autoscale)]
+                                                              │
+                                                  ┌───────────┼───────────┐
+                                                  ▼           ▼           ▼
+                                            [Firecracker] [gVisor]   [nsjail]
+                                                  │
+                                                  ▼
+                                            [Test S3]──►[Result Topic]──►[Verdict Svc]
+                                                                              │
+                                                                              ▼
+                                                                       [Leaderboard (Redis)]
+</div>
+<p>Submission goes to Kafka; judge workers pull, fetch tests from S3, run inside an isolated micro-VM, publish per-test results, and the verdict service aggregates and updates Postgres + Redis sorted set for leaderboard.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Submissions (Postgres)</h3>
+<pre>CREATE TABLE submissions (
+  id BIGSERIAL PRIMARY KEY,
+  user_id BIGINT, problem_id BIGINT, contest_id BIGINT,
+  lang TEXT, source_s3 TEXT,
+  verdict TEXT, runtime_ms INT, memory_kb INT,
+  tests_passed INT, total_tests INT,
+  submitted_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX ON submissions (contest_id, user_id, submitted_at);</pre>
+<h3>7.2 Test cases (S3 + CDN)</h3>
+<p>Per-problem tarball at <code>s3://judge-tests/p/{id}/v{n}.tar.zst</code>; signed URLs minted per submission. Workers cache locally with LRU keyed by <code>(problemId,version)</code>.</p>
+<h3>7.3 Leaderboard (Redis)</h3>
+<p>One sorted set per contest: <code>ZADD contest:42 score user:7</code>. ZREVRANGE for top-K. Per-user score recomputed on AC.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Judge worker lifecycle</h3>
+<p>Worker pulls one job, fetches source + tests, spins a Firecracker microVM (boot ~125 ms), copies code via vsock, compiles inside the VM with stricter limits (mem 512 MB, time 30 s), then iterates tests: writes stdin, reads stdout, enforces wall/CPU time + RSS via cgroup v2. On verdict, snapshot is destroyed.</p>
+<h3>8.2 Sandboxing layers</h3>
+<p>Defense in depth: (1) Firecracker microVM (KVM hardware isolation), (2) seccomp-bpf allowlist (≤40 syscalls), (3) cgroups v2 caps (CPU, memory, pids, IO), (4) rootless user with read-only rootfs, (5) network namespace = none. For Python/JS where boot cost dominates, gVisor sandbox is reused (lighter, weaker).</p>
+<h3>8.3 Backpressure &amp; queueing</h3>
+<p>Submission Kafka topic partitioned by <code>userId</code> for fairness; consumer group autoscales on lag (KEDA). A token-bucket on submission API throttles abusers (10 subs/min/user).</p>
+<h3>8.4 Plagiarism</h3>
+<p>Winnowing fingerprint (k-gram=5, w=4) stored in Postgres with GIN index on <code>int8[]</code>. Pairwise compare runs offline post-contest using count-min sketch to skip pairs below threshold — same sketch family as DDIA Ch. 11 cites for streaming top-K.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Cold-start:</b> warm-pool of 200 idle Firecracker VMs per worker keeps p99 boot &lt; 50 ms.</li>
+  <li><b>Hot problem at contest start:</b> tests pre-pulled to every worker 5 min before contest.</li>
+  <li><b>Compiler cache:</b> sccache + per-language base image with toolchain pre-installed.</li>
+  <li><b>Disk thrashing:</b> tmpfs scratch, 256 MB cap, destroyed with VM.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Firecracker microVM</td><td>Strong isolation, fast boot</td><td>Higher RAM overhead than containers</td></tr>
+<tr><td>Per-test SSE streaming</td><td>Snappy UX</td><td>Sticky connection complexity</td></tr>
+<tr><td>Kafka per-user partition</td><td>Fairness during contest spikes</td><td>Skew on whales (mitigated by sub-keys)</td></tr>
+<tr><td>Eventual leaderboard</td><td>Cheap writes, scales</td><td>Brief stale ranks (~1 s)</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — Kafka submission log, exactly-once verdict aggregation via idempotent producer + transactional writer.</li>
+  <li>Ch. 4 Encoding — Avro for submission/result events keeps schema evolution safe.</li>
+  <li>Ch. 9 Consistency — leaderboard is monotonic per user; no need for linearizability.</li>
+  <li>Sketch data structures — count-min sketch for plagiarism candidate filtering, HyperLogLog for unique-attempt counts.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with gVisor for everything to ship fast, then graduate C/C++ to Firecracker once we hit the first sandbox-escape report — defense in depth, not all at once."</li>
+  <li>"The hardest bit is fairness during a 100K-user contest start: token-bucket per user plus per-user Kafka partition keeps one fast solver from starving everyone."</li>
+  <li>"Test data is the real secret; signed S3 URLs minted only inside the worker, never reaching the user's browser."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Firecracker microVM</td>
+      <td>KVM-backed isolation with ~125 ms boot keeps p99 verdict under 15 s while running 2 K untrusted submissions/sec; warm pool of 200 idle VMs per worker drops effective boot to &lt;50 ms, far safer than container escape paths for C/C++.</td>
+      <td>runc (rejected: weak syscall isolation), Kata Containers (rejected: 600 ms boot, heavier RAM).</td>
+    </tr>
+    <tr>
+      <td>gVisor</td>
+      <td>User-space kernel intercepts syscalls cheaply (~10% overhead) for Python/JS where Firecracker's RAM cost dominates; reused across 100 execs per pod, matching our $0.0002/exec target on the 5 K-core fleet.</td>
+      <td>Bare runc (rejected: no syscall layer), Nabla (rejected: language-runtime restrictive).</td>
+    </tr>
+    <tr>
+      <td>seccomp-bpf + cgroups v2</td>
+      <td>Allowlist of ≤40 syscalls plus <code>memory.max=512M</code>, <code>pids.max=64</code>, <code>cpu.max</code> caps stop fork bombs and kernel-attack surface inside the VM; enforced per-test so a 2 s TLE problem doesn't burn 30 s of worker CPU.</td>
+      <td>AppArmor only (rejected: weaker syscall granularity), no kernel limits (rejected: forkbomb risk).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka</td>
+      <td>Submission topic partitioned by <code>userId</code> (256 partitions) provides per-user ordering and absorbs the 2 K/s contest-start burst; KEDA autoscales judge consumers on lag, draining a 30 s queue before SLA breach.</td>
+      <td>RabbitMQ (rejected: weaker partition semantics at 2 K/s), AWS SQS (rejected: no replay for re-judging).</td>
+    </tr>
+    <tr>
+      <td>PostgreSQL (submissions)</td>
+      <td>200 K submissions/day fit comfortably in a single primary; ACID matters for verdict + leaderboard recomputation correctness, and the <code>(contest_id, user_id, submitted_at)</code> index serves "my submissions" reads at &lt;5 ms p99.</td>
+      <td>Cassandra (rejected: cross-row contest queries awkward), MySQL (rejected: weaker JSON for limits config).</td>
+    </tr>
+    <tr>
+      <td>S3 + Zstd tarballs</td>
+      <td>2 TB of test data versioned per problem (<code>v{n}.tar.zst</code>) with signed URLs minted per submission; pre-pulled to all workers 5 min before contest to avoid 1 GB/s download cliff at start.</td>
+      <td>NFS (rejected: bandwidth ceiling at scale), local SSD (rejected: cache invalidation pain).</td>
+    </tr>
+    <tr>
+      <td>Redis sorted sets (ZSET)</td>
+      <td>One ZSET per contest gives O(log N) ZADD on AC and O(log N + K) ZREVRANGE for top-100 leaderboard at &lt;5 ms p99; eventual freshness (~1 s) is acceptable per the leaderboard SLA.</td>
+      <td>Postgres rank() (rejected: 50-100 ms for 100 K-row contests), Elasticsearch (rejected: overkill).</td>
+    </tr>
+    <tr>
+      <td>vsock (KVM)</td>
+      <td>Source code and stdin transferred to the microVM over vsock instead of network namespace, sidestepping veth setup latency and keeping <code>network=none</code> guarantee — no packet ever reaches the VM's network stack.</td>
+      <td>9p mount (rejected: filesystem-level escape risk), virtio-net (rejected: violates network-isolation invariant).</td>
+    </tr>
+    <tr>
+      <td>sccache + per-language base images</td>
+      <td>Compiler caching cuts repeated C++/Rust compile time from ~3 s to ~200 ms; pre-installed toolchain images amortize image-pull cost across the 200 K-submission daily volume.</td>
+      <td>ccache (rejected: weaker remote cache), build-from-scratch (rejected: 10× compile latency).</td>
+    </tr>
+    <tr>
+      <td>Server-Sent Events (SSE)</td>
+      <td>Per-test verdicts streamed progressively via SSE — natural fit for one-way server push, simpler than WebSockets, plays well with HTTP/2 multiplexing through the API gateway for the 2 K concurrent contest streams.</td>
+      <td>WebSockets (rejected: bidirectional overkill), polling (rejected: misses the snappy UX win).</td>
+    </tr>
+    <tr>
+      <td>Count-min sketch (plagiarism)</td>
+      <td>Pairwise winnowing fingerprint compare is O(n²) — 50 K contest submissions = 1.25 B pairs. CMS pre-filters candidate pairs with shared k-grams in fixed memory, cutting the heavy compare to &lt;1% of pairs.</td>
+      <td>Full pairwise (rejected: prohibitive), MinHash only (rejected: no frequency signal).</td>
+    </tr>
+    <tr>
+      <td>etcd / Kubernetes HPA + KEDA</td>
+      <td>Judge worker fleet is bursty (2 K/s contest peak vs 2.3/s average); KEDA scales on Kafka consumer lag, hitting 5 K cores within 30 s of contest start without paying for idle capacity off-peak.</td>
+      <td>Static fleet (rejected: 4× cost waste), AWS Lambda (rejected: no microVM control).</td>
+    </tr>
+  </tbody>
+</table>

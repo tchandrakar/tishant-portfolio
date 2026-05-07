@@ -1,0 +1,142 @@
+<h1>Design Restaurant Search &amp; Discovery (location + cuisine + ranking)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">food-delivery</span>
+  <span class="tag">search</span>
+  <span class="tag">maps-location</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the search and discovery layer for a food-delivery app: given a user's location and intent (free-text query, cuisine filter, "open now", price band), return a ranked list of restaurants that can deliver to them within an SLA. The system must handle text relevance, geospatial filtering, business-state filters (open, accepting orders, surge), and a learned ranker — all in &lt; 250 ms.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Free-text search across restaurant name, cuisine, dish names.</li>
+  <li>Geo radius filter (default 7 km, capped by ETA &lt; 60 min).</li>
+  <li>Filters: cuisine, dietary (veg/halal), price, rating ≥ 4, deals, "fast delivery".</li>
+  <li>Sort: relevance, distance, rating, ETA.</li>
+  <li>Type-ahead autocomplete (cuisine, dish, restaurant suggestions).</li>
+  <li>Personalisation: re-rank by user history; boost subscribed perks.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 &lt; 250 ms; autocomplete p99 &lt; 60 ms.</li>
+  <li><b>Scale:</b> 1.5 M restaurants, 50 K peak search QPS, 300 M searches/day.</li>
+  <li><b>Freshness:</b> open/closed flips visible in &lt; 30 s; price/menu &lt; 5 min.</li>
+  <li><b>Availability:</b> 99.95% with graceful degradation (drop personalisation before relevance).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 50 K peak; 80% cache-hit on (geohash5, query, filters) = 10 K to backend.</li>
+  <li>Index size: 1.5 M restaurants × ~3 KB doc = 5 GB; with replicas 30 GB.</li>
+  <li>Embedding store: 1.5 M × 256 floats = 1.5 GB.</li>
+  <li>Click-log stream: 300 M searches/day × ~1 KB ≈ 300 GB/day → S3.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET /v1/search?q=&amp;lat=&amp;lng=&amp;cuisine=&amp;sort=&amp;page= → {
+  results: [{restId, name, etaMin, distKm, rating, score}],
+  facets: {cuisine:{...}, price:{...}}
+}
+GET /v1/autocomplete?prefix=&amp;lat=&amp;lng= → suggestions[]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App] → [CDN edge cache (30s TTL)] → [API GW]
+              ↓
+        [Search Svc]
+        ├─→ [Redis: hot query cache]
+        ├─→ [Elasticsearch (geo+text)]
+        ├─→ [ANN: HNSW (FAISS/Vespa)]
+        ├─→ [Feature Store: Redis + DynamoDB]
+        └─→ [Ranker Svc (LightGBM, ONNX)]
+
+[Catalog DB (MySQL)] → Debezium → Kafka → [ES Indexer]
+[Order events] → Kafka → [Click logs / training pipeline] → [Spark] → S3
+</div>
+<p>Two-stage retrieval: ES candidate generation + ANN semantic recall; merge → re-rank with learned model.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Elasticsearch document</h3>
+<pre>{
+  "rest_id":  "r_98213",
+  "name":     "Meghana Foods",
+  "loc":      {"lat":12.93,"lng":77.62},
+  "cuisines": ["biryani","andhra"],
+  "menu":     ["chicken biryani","..."],
+  "rating":   4.4, "price_band": 2,
+  "open_hours": [...], "accepting_orders": true,
+  "embedding": [0.12, -0.04, ...256d]
+}</pre>
+<h3>7.2 Hot state (Redis)</h3>
+<p>Per-restaurant <code>open</code>/<code>busy</code>/<code>surge</code> flags updated by partner heartbeats; consulted as a post-filter to avoid re-indexing constantly.</p>
+<h3>7.3 Why ES + ANN?</h3>
+<p>ES handles geo + boolean filters with predictable performance; ANN handles "spicy chicken" → "chettinad" semantic recall. Combining both beats either alone.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Retrieval</h3>
+<p>ES query: <code>function_score</code> with <code>geo_distance</code> filter, BM25 over name/cuisines/menu, gauss decay on distance. Returns top 200. ANN parallel call with query embedding (sentence-transformer, 256d) returns top 200. Union deduped to ~300 candidates.</p>
+<h3>8.2 Ranking</h3>
+<p>LightGBM model (~150 features): BM25, ANN sim, distance, ETA, rating, price match, user-cuisine affinity, time-of-day, recent CTR, deal flag, ads bid. Inference via ONNX Runtime; batched prediction for 300 docs in &lt; 25 ms.</p>
+<h3>8.3 Autocomplete</h3>
+<p>Trie compiled per city, served by an in-memory Go service. Re-built nightly from query logs + restaurant/dish dictionaries; weighted by city + frequency.</p>
+<h3>8.4 Personalisation</h3>
+<p>User feature vector cached at session start; ranker reads from Redis (fallback: cohort-mean to keep latency).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot queries:</b> "pizza", "biryani" — 30 s edge cache cuts ES load 5x.</li>
+  <li><b>Geohash skew:</b> shard ES by geohash prefix not random; balance with virtual shards.</li>
+  <li><b>Open-flag freshness:</b> push-based via Kafka into Redis, not re-index.</li>
+  <li><b>Ranker drift:</b> shadow-deploy new model; compare NDCG@10 online.</li>
+  <li><b>Long tail of cities:</b> hot-spare ES nodes for Mumbai/Delhi; cold-tier smaller cities on shared shard.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Two-stage retrieval (ES + ANN)</td><td>Best of lexical + semantic</td><td>Two infra stacks to operate</td></tr>
+<tr><td>Post-filter open/busy in Redis</td><td>Avoids re-indexing every minute</td><td>Slight inconsistency window</td></tr>
+<tr><td>Edge cache 30 s</td><td>Massive CPU savings</td><td>Stale results during surge changes</td></tr>
+<tr><td>Learned ranker</td><td>+15-25% conversion vs heuristics</td><td>Ops burden — features, monitoring, retraining</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage &amp; Retrieval — Lucene's inverted index in ES.</li>
+  <li>Ch. 6 Partitioning — geohash-aware shard placement.</li>
+  <li>Ch. 11 Stream Processing — CDC indexer; click-log → training data flywheel.</li>
+  <li>Ch. 12 Future of Data Systems — search index as a materialised view of catalog state.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd lean on ES for the 90% case and add ANN only when query intent isn't lexical — measured by query class."</li>
+  <li>"Open/closed is the trickiest freshness problem; I solve it via a fast post-filter rather than a hot index."</li>
+  <li>"For ranking I'd start with hand-tuned weights, log labels for 4 weeks, then ship a learned ranker — never start with ML."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Elasticsearch (geo+text)</td><td>50 K peak search QPS over 1.5 M restaurants needs geo_distance + BM25 + boolean filters in one query at p99 &lt; 250 ms; ES function_score with gauss decay on distance is mature, predictable, and supports the cuisine/price facet aggregations.</td><td>Solr (older ANN story); Vespa (smaller team expertise); Postgres+PostGIS (joins on dense filters too slow at 50 K QPS).</td></tr>
+<tr><td>HNSW ANN (FAISS / Vespa)</td><td>"Spicy chicken → chettinad" semantic recall needs sub-10 ms approximate nearest neighbour over 1.5 M × 256-float embeddings (1.5 GB); HNSW gives ~95% recall@200 within the 250 ms total search budget.</td><td>IVF (lower recall at this size); ScaNN (Google-only ops); brute-force (50 K QPS impossible).</td></tr>
+<tr><td>Redis (hot query cache)</td><td>80% cache-hit on (geohash5, query, filters) cuts backend traffic from 50 K to 10 K QPS — saves CPU and lets us hit p99 on the long tail too. 30 s TTL trades surge freshness for massive cost reduction.</td><td>Memcached (no per-family TTL); CDN-only (cannot key on user filters); in-process LRU (poor hit rate across pods).</td></tr>
+<tr><td>LightGBM (ONNX Runtime)</td><td>~150 features × 300 candidates ranked in &lt;25 ms; LightGBM's leaf-wise growth + ONNX vectorised inference outperforms XGBoost and DNNs at this latency budget. Re-trains nightly on 300 M searches/day click-stream.</td><td>XGBoost (slightly slower inference); DNN (10x latency); learning-to-rank (RankNet) (smaller off-the-shelf tooling); hand-tuned (15-25% worse conversion).</td></tr>
+<tr><td>MySQL (catalog)</td><td>Source-of-truth for restaurant master data with relational menu/cuisine joins; Debezium-based CDC into Kafka feeds the ES indexer for &lt;5 min menu-freshness SLA.</td><td>Postgres (similar; chose MySQL for org consistency); MongoDB (weak join story for menu trees); DynamoDB (no JOINs).</td></tr>
+<tr><td>Apache Kafka + Debezium</td><td>CDC from catalog feeds the search indexer asynchronously, decoupling ES write path from OLTP; replay enables full reindex on schema changes for 1.5 M docs without downtime.</td><td>AWS DMS (vendor lock); Maxwell (smaller community); periodic dump+reindex (5 min freshness SLA breaks).</td></tr>
+<tr><td>Sentence-transformer (256d)</td><td>Compresses dish/cuisine semantics into a 1.5 GB ANN index — small enough to fit in RAM per shard at low cost. 256 dims is the sweet spot of recall vs index size for 1.5 M docs.</td><td>OpenAI embeddings (cost at 300 M searches/day); 768d models (3x RAM); TF-IDF only (no semantic recall for slang).</td></tr>
+<tr><td>Redis Streams (open/busy flags)</td><td>Push-based open/busy/surge flag updates from partner heartbeats avoid re-indexing 1.5 M ES docs every minute; consulted as post-filter to keep "open now" within 30 s freshness.</td><td>Re-indexing into ES (would dominate ES write load); Kafka pull-based (latency too high); DynamoDB streams (extra hop).</td></tr>
+<tr><td>Trie autocomplete (Go in-memory)</td><td>p99 &lt; 60 ms for autocomplete demands in-process data structures; trie compiled per city is 50-100 MB, fits in pod RAM, weighted by query frequency from 300 M/day stream.</td><td>ES completion suggester (200ms+ tail); Redis FT.SUGGEST (similar but extra hop); separate service per request (network overhead breaks SLA).</td></tr>
+<tr><td>DynamoDB (feature store online)</td><td>Per-user feature vectors (~5 KB) read on every search; DynamoDB single-digit-ms p99 reads at 50 K QPS with auto-scaling beats Redis on durability for warm-but-not-hot users.</td><td>Redis (volatile on failover); Cassandra (point-read p99 worse); Aurora (cost at 50 K QPS reads).</td></tr>
+<tr><td>S3 + Spark (training data)</td><td>300 GB/day click-log stream lands cheaply in S3; Spark batch trains ranker nightly with NDCG@10 evaluation. Cold storage cost &lt;$0.01/GB/month vs DB.</td><td>Snowflake (great for SQL, expensive for ML feature engineering); HDFS (operational burden); Redshift (less ML-tooling integrated).</td></tr>
+<tr><td>Geohash-aware ES sharding</td><td>Random sharding causes cross-shard scatter on geo queries (1.5 M docs × 50 K QPS = wasted CPU); geohash-prefix shards keep most queries local. Virtual shards rebalance Mumbai/Delhi hot tiers.</td><td>Random sharding (default; high scatter cost); H3-cell sharding (less ES-idiomatic); city-based (skewed distribution).</td></tr>
+<tr><td>CDN edge (30 s TTL)</td><td>Hot queries like "pizza" / "biryani" cached at edge keyed by (geohash5, query) cut origin CPU 5x; 30 s TTL is the sweet spot of freshness vs cost given ES re-rank stability.</td><td>Longer TTL (stale during surge); shorter TTL (cache miss rate kills savings); no edge cache (CPU bill 5x higher).</td></tr>
+</tbody>
+</table>
+

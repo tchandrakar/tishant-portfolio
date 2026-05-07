@@ -1,0 +1,128 @@
+<h1>Design Facebook News Feed (push/pull/hybrid fanout)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">social-network</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the News Feed for a Facebook-scale social network: when a user opens the app, return a personalized, ranked list of posts authored by friends, pages, and groups they follow. The system must ingest a sustained ~50K writes/sec of new posts and serve ~1M feed reads/sec at p99 &lt; 200 ms while feeling fresh — new posts from close friends should appear within seconds.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Compose post (text, image, video, link) with privacy scope (public, friends, custom).</li>
+  <li>Render personalized feed on app open / pull-to-refresh / infinite scroll.</li>
+  <li>Engagement actions: like, comment, share, save, hide. Each is a feedback signal.</li>
+  <li>Edge cases: muted authors, blocked users, privacy filtering at read time.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 3B MAU, 2B DAU, ~150 friends median, ~600 p95.</li>
+  <li><b>Latency:</b> feed open p99 &lt; 200 ms, post-to-visible p95 &lt; 5 s for close friends.</li>
+  <li><b>Availability:</b> 99.99% on read path; degrade gracefully to cached feed on partial outage.</li>
+  <li><b>Consistency:</b> read-your-writes for the author; eventual for everyone else.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Writes: 2B DAU * 2 posts/day / 86400 s ≈ 46K posts/sec sustained, ~150K/sec peak.</li>
+  <li>Reads: 2B DAU * 10 feed opens/day = 20B/day ≈ 230K/sec avg, ~1M/sec peak.</li>
+  <li>Fanout amplification: avg 150 followers × 46K writes = 7M timeline inserts/sec for pure push. Celebrities with 50M followers turn one post into 50M inserts — push alone is infeasible.</li>
+  <li>Storage: 2B posts/day × 1 KB metadata = 2 TB/day metadata; media goes to blob store (~500 PB lifetime).</li>
+  <li>Cache: hot timeline working set ~500M users × 800 post-IDs × 16 B = ~6 TB Redis.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/posts                  {authorId, body, mediaIds, privacy} → postId
+GET   /v1/feed?cursor=...&limit=50                               → [postId, score, reason]
+POST  /v1/feed/engagement        {postId, action: like|hide|...}
+GET   /v1/posts/{id}                                             → hydrated post
+WS    /v1/feed/live              push: new-post-available banner</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] → [Edge LB] → [API GW] → [Post Svc] → [Post DB (sharded MySQL/RocksDB)]
+                                       │                  │
+                                       ▼                  ▼
+                                  [Kafka post-events] → [Fanout Workers]
+                                                          │ push for normal users
+                                                          ▼
+                                                   [Timeline Cache (Redis ZSET)]
+                                                          ▲ pull for celeb posts
+[Feed Svc] ← [Ranker (GBDT/DNN)] ← [Feature Store] ← [Engagement Stream]
+</div>
+<p>Walk-through: a write hits Post Svc, persists, emits to Kafka. Fanout workers classify the author: normal (≤10K followers) → push post-IDs into each follower's Redis ZSET timeline. Celebrity (&gt;10K) → skip push; the Feed Svc pulls celeb posts at read time and merges. On feed open, Feed Svc reads the user's pushed timeline, merges followed-celebrity pulls, runs the ranker, and returns top-N.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Posts (sharded by authorId)</h3>
+<pre>CREATE TABLE posts (
+  post_id   bigint PRIMARY KEY,   -- Snowflake, time-sortable
+  author_id bigint, body text, media_ids json,
+  privacy   tinyint, created_at timestamp
+) PARTITION BY HASH(author_id);</pre>
+<h3>7.2 Timeline cache (Redis ZSET per user)</h3>
+<pre>ZADD timeline:{userId} {score=created_at} {postId}
+ZREVRANGEBYSCORE timeline:{userId} +inf -inf LIMIT 0 1000</pre>
+<p>Cap at 1000 entries, TTL 7 days. Cold users rebuild from Post DB on first open.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Hybrid fanout</h3>
+<p>Threshold 10K followers separates push from pull. Push gives O(1) read but pays write amplification; pull is cheap on write but expensive on read. Hybrid bounds worst case: a user with 200 friends + follows 50 celebrities pulls 50 lists at read (small) and reads 1 ZSET for normal-friend posts.</p>
+<h3>8.2 Ranker</h3>
+<p>Two-stage: candidate generation pulls ~2000 posts from timeline + celeb-pull + sponsored. Ranking model (DNN with embeddings for user, author, post) scores each in &lt;30 ms total via batched GPU inference. Features: affinity, recency decay, post-type weights, predicted P(like|comment|share). EdgeRank-style baseline: <code>score = affinity × weight × decay</code>.</p>
+<h3>8.3 Read path</h3>
+<p>Feed Svc: 1) fetch ZSET (1 Redis call), 2) parallel fetch celeb pull-lists (Redis MGET), 3) hydrate via Post Svc with batched cache, 4) rank, 5) apply privacy filter, 6) return cursor of (postId, rank-score).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Celebrity fanout:</b> pull-on-read avoids 50M writes; cached celeb-list at edge.</li>
+  <li><b>Hot key Redis:</b> shard timeline by userId murmur3, replicate hot keys.</li>
+  <li><b>Thundering herd on celeb post:</b> request coalescing + soft TTL with stale-while-revalidate.</li>
+  <li><b>Backpressure:</b> Kafka with consumer-lag SLO, autoscale fanout workers.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Hybrid push/pull</td><td>Bounds celeb amplification; fast common case</td><td>Two code paths; ranker must merge two streams</td></tr>
+<tr><td>Redis ZSET timeline</td><td>O(log n) inserts, p99 sub-ms reads</td><td>RAM-heavy; rebuild cost on cold start</td></tr>
+<tr><td>Eventual consistency</td><td>Cheap fanout, multi-DC friendly</td><td>Friend may not see post for seconds</td></tr>
+<tr><td>Async ranking offline + light online</td><td>Cheap CPU at read time</td><td>Stale ranks for fast-moving topics</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-leader for cross-region timeline writes; conflict resolution for engagement counters.</li>
+  <li>Ch. 6 Partitioning — hash partitioning of posts by authorId; rebalancing celeb-list shards.</li>
+  <li>Ch. 11 Stream Processing — Kafka post-event log; fanout as a stream consumer; exactly-once via idempotent ZADD.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with pure push, measure the celebrity tail, then introduce the pull path — premature hybrid is overengineering."</li>
+  <li>"The hardest part is the celebrity fanout problem; mitigation is the threshold-based hybrid plus pull-side caching."</li>
+  <li>"For ranking, I'd separate the candidate-gen and ranking stages so we can iterate on ML without touching infra."</li>
+  <li>"I'd discuss read-your-writes via session-pinned cache to make the author always see their own post immediately."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Sharded MySQL/RocksDB</b> (Post DB)</td><td>2 TB/day metadata across 2B posts/day needs hash-partitioning by <code>author_id</code> for write locality; MySQL gives us transactions for the privacy-scope mutation, RocksDB underneath delivers the LSM write throughput required at 46K writes/sec sustained.</td><td>Cassandra (weaker secondary indexes for moderation queries), DynamoDB (vendor lock and cost at PB scale), single MySQL (cannot shard 500 PB lifetime).</td></tr>
+    <tr><td><b>Redis</b> (Timeline ZSET cache)</td><td>p99 sub-ms <code>ZREVRANGEBYSCORE</code> reads on a 1000-entry capped ZSET per user is exactly what the 200 ms feed-open SLO needs; the ~6 TB hot working set fits across a Redis cluster with murmur3 sharding.</td><td>Memcached (no sorted-set primitive), Aerospike (overkill on durability we don't need), DynamoDB (per-op cost too high at 1M reads/sec).</td></tr>
+    <tr><td><b>Apache Kafka</b> (post-event log)</td><td>Decouples the synchronous post-write (must respond fast) from the 7M timeline-insert/sec fanout; consumer-lag SLO + replayability lets us autoscale fanout workers and recover from worker failure without losing posts.</td><td>RabbitMQ (no durable log replay), AWS SQS (no ordering or partition affinity), direct gRPC to fanout (loses backpressure semantics).</td></tr>
+    <tr><td><b>Snowflake IDs</b></td><td>Time-sortable 64-bit ID lets us use the ID itself as the ZSET score, so <code>ZADD</code> places posts in chronological order without a separate timestamp field; also supports cross-DC ID generation without coordination.</td><td>UUIDv4 (not sortable, breaks ZSET semantics), DB auto-increment (single-point bottleneck at 46K writes/sec), ULID (acceptable but Snowflake is the social-media de-facto).</td></tr>
+    <tr><td><b>Fanout workers</b> (custom service)</td><td>Hybrid push-vs-pull at the 10K-follower threshold needs application logic that classifies authors per post; idempotent <code>ZADD</code> makes at-least-once Kafka delivery safe and bounds the celeb worst case from 50M down to a pull-side merge.</td><td>Pure-push (50M inserts/celeb post is infeasible), pure-pull (every read does N MGETs even for normal users), Spark Streaming (batch granularity too coarse for 5 s SLO).</td></tr>
+    <tr><td><b>GBDT / DNN ranker</b> with embeddings</td><td>30 ms ranking budget across 2000 candidates demands batched GPU inference; a multi-task DNN scoring P(like|comment|share) blended via the EdgeRank-style <code>score = affinity × weight × decay</code> baseline gives us interpretability plus headroom.</td><td>Logistic regression (plateaus on engagement gain), pure online learning (operationally fragile), per-request ANN-only (no calibration across objectives).</td></tr>
+    <tr><td><b>Feature store</b> (online + offline)</td><td>The ranker depends on user-author affinity, recency decay, and post-type weights — all features that must match between training and serving to avoid train-serve skew at 230K RPS; a registry with shared transforms is the only way to keep them aligned.</td><td>Direct DB lookup at ranking time (blows the 30 ms budget), client-side feature compute (impossible across 3B users), no feature store (skew bugs become silent quality regressions).</td></tr>
+    <tr><td><b>WebSocket</b> (live banner)</td><td><code>WS /v1/feed/live</code> push for "new post available" requires a long-lived connection per active user; HTTP polling at 2B DAU would generate billions of wasted requests/day, while WebSocket keeps the open socket cheap on the server side.</td><td>HTTP long-polling (more bandwidth and connection churn), Server-Sent Events (less client support on older mobile), push notifications (wrong UX surface for an in-app banner).</td></tr>
+    <tr><td><b>Edge LB + API GW</b></td><td>1M reads/sec peak across multiple regions needs TLS termination and routing at the edge POP closest to the user; the API GW layer enforces auth, rate-limits abusive clients, and emits the per-route metrics the 99.99% read-availability SLO depends on.</td><td>Direct service exposure (no rate limiting), single-region LB (cross-ocean RTT blows 200 ms p99), service-mesh-only (lacks public-internet TLS+WAF features).</td></tr>
+    <tr><td><b>Blob store</b> (S3-class) for media</td><td>~500 PB lifetime media storage at 11-nines durability is impractical on attached disk; object storage with CDN-fronted reads keeps the post DB to just 1 KB metadata rows and offloads bandwidth from the app tier entirely.</td><td>Local SAN (cannot scale to PB), HDFS (designed for batch, not low-latency reads), embedded blobs in MySQL (inflates row size, kills cache density).</td></tr>
+    <tr><td><b>Consistent hashing</b> (murmur3) for Redis shards</td><td>Hot-key replication for the top 0.01% of timeline keys requires a hash that distributes evenly and supports virtual nodes for cheap rebalancing when we add capacity; murmur3 is the standard choice with non-cryptographic speed.</td><td>Modulo hashing (every resize remaps everything), MD5/SHA (slower without security benefit here), random sharding (loses key locality for replicas).</td></tr>
+    <tr><td><b>Stale-while-revalidate</b> + request coalescing</td><td>Celeb-post thundering herd is the predictable failure mode when one author has 50M followers; soft TTL with single-flight refresh prevents 50M cache-miss requests from stampeding the Post DB simultaneously.</td><td>Hard TTL (causes stampedes), longer TTL (degrades freshness past the 5 s SLO), pessimistic per-key locks at the DB (worse tail latency).</td></tr>
+  </tbody>
+</table>

@@ -1,0 +1,136 @@
+<h1>Design URL Shortener (TinyURL/Bitly — base62, click analytics)</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">misc</span>
+  <span class="tag">storage-cache</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a service that converts long URLs (up to 2 KB) into compact 7-character codes (e.g. <code>bit.ly/3xZk9Qp</code>), redirects on hit with sub-50 ms latency, and emits a click-event stream for analytics. Bitly handles roughly 600 M new shortens per month and serves ~10 B redirects/month, so reads dominate writes by ~100:1.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>POST a long URL, receive a short code; optional custom alias and expiry date.</li>
+  <li>GET <code>/{code}</code> issues 301/302 to the original URL.</li>
+  <li>Per-link analytics: total clicks, geo, referrer, device, time bucket.</li>
+  <li>Soft-delete or expire links; user dashboards with auth and team workspaces.</li>
+  <li>Spam/malware checks against Google Safe Browsing before issuing the code.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> redirect p99 &lt; 50 ms at edge; shorten p99 &lt; 200 ms.</li>
+  <li><b>Scale:</b> 600 M writes/month (~230 wps avg, 2 K wps peak), 10 B reads/month (~3.8 K rps avg, 40 K rps peak).</li>
+  <li><b>Availability:</b> 99.99% on the redirect path (revenue-critical).</li>
+  <li><b>Durability:</b> never lose a mapping; codes are forever-stable.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>5 yr retention: 600 M × 12 × 5 = 36 B rows. Row ~500 B → ~18 TB primary, 36 TB with replicas.</li>
+  <li>Code space: 62^7 = 3.5 × 10^12, plenty for decades of growth at current rate.</li>
+  <li>Hot cache: top 20% of codes serve 80% of traffic — ~7 B keys × 200 B = 1.4 TB Redis cluster (sharded).</li>
+  <li>Click events: 10 B/month × 300 B = 3 TB/month into the analytics warehouse.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/shorten           {longUrl, customAlias?, expiresAt?}  → {code, shortUrl}
+GET  /{code}                                                    → 301 Location: longUrl
+GET  /v1/links/{code}/stats?from=&amp;to=&amp;bucket=hour              → time-series
+DELETE /v1/links/{code}                                         → 204
+POST /v1/bulk-shorten      {urls[]}                             → {results[]}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] -- HTTPS --&gt; [Anycast CDN/Edge] --&gt; [Redirect Svc] --&gt; [Redis] --&gt; [DynamoDB/MySQL]
+                                                  |
+                                                  +--&gt; [Kafka click-events] --&gt; [Flink] --&gt; [ClickHouse]
+                                                                                       |
+[Dashboard] &lt;-- [Analytics API] &lt;-------------------------------------------------------+
+                                                  ^
+[Shorten Svc] &lt;-- [API GW] &lt;-- [Client]           |
+       |                                          |
+       +--&gt; [ID Generator (Snowflake/zk-counter)] +
+       +--&gt; [Safe-Browsing checker]
+</div>
+<p>Walk-through: redirect path is a single Redis GET; on miss, fall through to the KV store and back-fill cache. Writes go through a stateless Shorten Service that pulls a 64-bit ID, base62-encodes it, double-checks for collision (custom aliases only), and persists. Click events are fire-and-forget into Kafka — never block the 302.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Mappings (DynamoDB)</h3>
+<pre>Table: links
+  PK: code (string)        -- e.g. "3xZk9Qp"
+  long_url: string
+  owner_id: string         -- GSI for "list my links"
+  created_at: number
+  expires_at: number       -- TTL attribute
+  status: enum(active, disabled, malware)</pre>
+<h3>7.2 Why DynamoDB?</h3>
+<p>Single-key lookup, predictable single-digit-ms p99, native TTL for expiry, on-demand scaling for the 40 K rps peak. Multi-region global tables give us active-active redirects. MySQL would work but partitioning 36 B rows manually is painful — see DDIA Ch. 6.</p>
+<h3>7.3 Click events (ClickHouse)</h3>
+<pre>CREATE TABLE clicks (
+  ts DateTime, code String, country LowCardinality(String),
+  referrer String, ua_bucket LowCardinality(String)
+) ENGINE = MergeTree PARTITION BY toYYYYMM(ts) ORDER BY (code, ts);</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 ID generator and base62</h3>
+<p>A Snowflake-style 64-bit ID (timestamp || worker-id || seq) is base62-encoded — 11 chars max, but we trim to 7 by allocating from a sharded counter where each shard hands out 1 M-block ranges to workers (tracked in ZooKeeper). This keeps codes short and roughly k-sortable for partition affinity.</p>
+<h3>8.2 Custom aliases</h3>
+<p>Optimistic insert with a conditional <code>attribute_not_exists(code)</code> check; on conflict return 409. Reserved-word blocklist guards against impersonation (<code>/login</code>, <code>/admin</code>).</p>
+<h3>8.3 Redirect service</h3>
+<p>Stateless Go service, 1 ms cache hit budget. Serves 302 by default (so we can change targets and revoke); 301 only when caller opts in. Response includes <code>Cache-Control: private, max-age=90</code> so browsers do not poison shared caches.</p>
+<h3>8.4 Analytics pipeline</h3>
+<p>Kafka topic <code>clicks</code> partitioned by code-hash (64 partitions). Flink job sessionizes by <code>(code, country, hour)</code> and writes pre-aggregated rollups into ClickHouse. Raw events kept 30 days for ad-hoc.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot codes (viral links):</b> consistent-hash + per-key local LRU on the redirect host shields Redis; CDN edge cache for ultra-hot links with 30 s TTL.</li>
+  <li><b>Thundering herd on cache miss:</b> request coalescing (singleflight) at the redirect tier.</li>
+  <li><b>Custom alias contention:</b> in-memory bloom filter at the API tier rejects 99% of duplicates before hitting DynamoDB.</li>
+  <li><b>Geographic latency:</b> active-active multi-region with last-write-wins on writes (acceptable since codes are immutable post-creation).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>302 vs 301 redirect</td><td>Revocable, accurate analytics</td><td>Browsers re-hit on every click</td></tr>
+<tr><td>Counter-based codes</td><td>Short, no collision check</td><td>Predictable — enumerable scrape</td></tr>
+<tr><td>Hash(longUrl) codes</td><td>Idempotent shorten</td><td>Collisions, longer codes</td></tr>
+<tr><td>DynamoDB vs MySQL</td><td>Auto-shard, multi-region</td><td>No joins, vendor lock-in</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — hash partitioning on <code>code</code>, hot-key mitigation.</li>
+  <li>Ch. 5 Replication — multi-leader for global active-active, conflict resolution on aliases.</li>
+  <li>Ch. 11 Stream Processing — Kafka + Flink for click rollups.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with a Snowflake-ID + DynamoDB MVP and only add ZooKeeper-coordinated counters when collision rate on custom aliases crosses 1%."</li>
+  <li>"The hardest part is unbounded growth of analytics — I separate hot path (Redis + Kafka) from cold path (ClickHouse) so a warehouse outage never breaks redirects."</li>
+  <li>"For abuse, I lean on Safe-Browsing at write time plus per-IP rate limits; revocation must propagate in &lt; 60 s, hence 302 over 301."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>DynamoDB (links table)</td><td>Single-key GET on <code>code</code> is the entire hot path; on-demand scaling absorbs the 40 K rps redirect peak with predictable single-digit-ms p99, and global tables give us active-active for the 99.99% redirect SLO across 36 B rows.</td><td>MySQL (manual sharding past 5 TB); Cassandra (overkill for KV with no range scans).</td></tr>
+    <tr><td>Snowflake-style 64-bit ID</td><td>K-sortable IDs preserve B-tree locality and base62-encode to 7 chars, fitting the Bitly-like 600 M shortens/month budget for decades inside the 62^7 = 3.5×10^12 code space.</td><td>UUIDv4 (random kills locality, 22 chars); MD5(longUrl) prefix (collisions force length growth).</td></tr>
+    <tr><td>Base62 encoding</td><td>62 chars (a-zA-Z0-9) avoid URL-unsafe symbols, max URL length stays small, and 7 chars is the sweet spot users will type — 62^7 covers 5+ years of Bitly's 600 M/month rate.</td><td>Base64 (slashes/plus need escaping); Base32 (longer codes for same entropy).</td></tr>
+    <tr><td>Redis Cluster (1.4 TB hot)</td><td>Top 20% of codes serve 80% of the 10 B reads/month; sharded Redis keeps the redirect tier under its 1 ms cache-hit budget and scales horizontally as the long-tail working set grows.</td><td>Memcached (no replication, lossy on failover); local LRU only (cold-start penalty too high).</td></tr>
+    <tr><td>Anycast CDN edge cache</td><td>Viral codes can spike to 100 K rps on one key; a 30 s edge TTL absorbs the spike well below the redirect-origin tier and keeps p99 under 50 ms globally.</td><td>Origin-only (capacity blowup on viral links); long edge TTLs (breaks 60 s revocation SLO).</td></tr>
+    <tr><td>Apache Kafka (clicks topic)</td><td>10 B click events/month at 3.8 K rps avg need a durable, replayable spine that decouples redirects from analytics; 64 partitions keyed by <code>code-hash</code> give per-code ordering for sessionization.</td><td>SQS (no replay, expensive at 10 B/month); Kinesis (24 h retention vs Kafka's 7 day).</td></tr>
+    <tr><td>Apache Flink (sessionizer)</td><td>Stateful streaming with watermarks handles late mobile-network events while emitting (code, country, hour) rollups continuously — exactly what the dashboard 1-minute freshness requires.</td><td>Spark Streaming (micro-batch latency); Kafka Streams (state-store rebalance pain at 10 B/month).</td></tr>
+    <tr><td>ClickHouse (analytics warehouse)</td><td>Click-event scans are the canonical "wide-MergeTree column store" workload; <code>ORDER BY (code, ts)</code> gives sub-second per-link drilldown over 3 TB/month ingest with 10× compression on low-cardinality columns.</td><td>BigQuery (cost prohibitive at 3 TB/month); Druid (operationally heavier, fewer SQL features).</td></tr>
+    <tr><td>ZooKeeper (counter shards)</td><td>When custom-alias contention forces sharded counters, ZK's sequential ephemeral nodes hand out 1 M-block ranges to workers with strong consistency — exactly the "small, infrequent coordination" workload it's designed for.</td><td>etcd (fine but team already runs ZK); centralized DB ticket server (SPOF, write hotspot).</td></tr>
+    <tr><td>Bloom filter (alias dedup)</td><td>In-memory bloom at the API tier rejects 99% of duplicate custom-alias attempts before hitting DynamoDB, saving the conditional-put round-trip on the most common write contention pattern.</td><td>Cuckoo filter (more complex, marginal benefit); always-DDB (5× write cost on conflicts).</td></tr>
+    <tr><td>Go (redirect service)</td><td>1 ms cache-hit budget at 40 K rps peak demands cheap goroutines, low GC tail latency, and a fast HTTP/2 stack — Go hits all three with predictable p99 under the SLO.</td><td>Java (GC pauses break p99); Node (single-threaded ceiling).</td></tr>
+    <tr><td>Google Safe Browsing API</td><td>Mandatory before issuing a code: blocks malware/phishing at write time, satisfies the abuse SLO without us building a classifier; cached negative responses keep latency under the 200 ms shorten budget.</td><td>VirusTotal (rate-limited free tier); in-house ML (years to bootstrap label data).</td></tr>
+  </tbody>
+</table>

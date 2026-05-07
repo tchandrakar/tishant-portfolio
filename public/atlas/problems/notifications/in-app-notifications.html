@@ -1,0 +1,147 @@
+<h1>Design In-app Notifications (real-time inbox, read/unread, badge counts)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">notifications</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the in-app notification feed: a per-user inbox showing notifications (likes, mentions, system messages), a real-time push of new items via WebSocket/SSE, accurate unread badge counts that update across devices, and read/seen state synchronized in seconds. Targets: 300M MAU, 50M DAU concurrent across web and mobile, 10B feed items/day.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Append a notification item to a user’s inbox.</li>
+  <li>List inbox with pagination, ordered by time DESC.</li>
+  <li>Real-time delivery to currently connected clients.</li>
+  <li>Mark single/all as read/seen; sync across devices in &lt;5 s.</li>
+  <li>Badge count: unread total per user, per category.</li>
+  <li>Server-side TTL/archival of old items.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> publish to client under 1 s p95; read-state sync under 5 s p95.</li>
+  <li><b>Scale:</b> 10B items/day, 115k writes/sec, 5M concurrent WebSocket connections per region.</li>
+  <li><b>Availability:</b> 99.95%; degrade to polling if WebSocket fleet is unhealthy.</li>
+  <li><b>Consistency:</b> eventual on feed order; monotonic on badge count (never decreases unexpectedly).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Writes: 10B/86,400 ≈ 115k/sec; peak 4× = 460k/sec.</li>
+  <li>Inbox storage: 10B × 1 KB × 90-day retention = 900 TB; tiered (hot 7d in Cassandra, cold in S3).</li>
+  <li>Connection fleet: 5M conns × 100 KB mem each = 500 GB → ~50 nodes × 100k conns each.</li>
+  <li>Fanout msgs: 50M DAU × 50 notifs/day = 2.5B WebSocket pushes/day = 29k/sec avg.</li>
+  <li>Badge cache: 300M users × 16 B counter = 5 GB → Redis cluster.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/inbox/items                {userId, type, payload}    -> itemId
+GET  /v1/inbox?cursor=...           paginate                  -> [items], next
+POST /v1/inbox/read                 {itemIds[]} or {all:true}
+GET  /v1/inbox/badge                                          -> {total, byCategory}
+WS   /v1/realtime/inbox             (auth via JWT)            -> stream</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Producer Svc] -> [Kafka: inbox.events]
+                          |
+                          v
+              [Inbox Writer Workers]
+                  |             |
+                  v             v
+        [Inbox Store        [Redis: badge counts
+         Cassandra]          INCR per user]
+                          |
+                          v
+                  [Pub/Sub: user.{id}]
+                          |
+                          v
+                [WebSocket Edge Fleet]
+                          |
+                          v
+                       [Clients]
+
+[Read API] -> [Read-state writer] -> Cassandra + Redis (DECR badge)
+                                  -> publish read-event to Pub/Sub for cross-device sync
+</div>
+<p>Producers emit logical events; an inbox writer materializes per-user rows with a timestamp+ulid sort key, increments the unread badge atomically, then publishes to a per-user Pub/Sub channel that the WebSocket edge translates into a frame.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Inbox (Cassandra)</h3>
+<pre>CREATE TABLE inbox (
+  user_id text, item_id timeuuid,
+  category text, payload text,
+  read boolean, seen boolean,
+  created_at timestamp,
+  PRIMARY KEY (user_id, item_id)
+) WITH CLUSTERING ORDER BY (item_id DESC)
+  AND default_time_to_live = 7776000;  -- 90 days</pre>
+<h3>7.2 Badge counters (Redis)</h3>
+<pre>HINCRBY badge:{userId} total 1
+HINCRBY badge:{userId} cat:{category} 1
+-- on read:
+HINCRBY badge:{userId} total -N (with floor at 0 via Lua script)</pre>
+<h3>7.3 Connection registry (Redis)</h3>
+<pre>SADD conn:{userId} {edgeNodeId}:{connId}  EX 60</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 WebSocket edge</h3>
+<p>Stateful nodes terminate WebSocket; on connect, a node registers <code>(userId, nodeId, connId)</code> in Redis and subscribes to <code>user.{id}</code> on the pub/sub layer. Heartbeats every 30 s; idle timeout at 90 s. On scale-out, sticky load balancing via consistent hashing on userId minimizes re-registrations.</p>
+<h3>8.2 Read-state synchronization</h3>
+<p>Marking read is a write to Cassandra (<code>read=true</code>) and an atomic Redis Lua script that decrements the badge with a non-negative floor. A read-event is also published to the user’s pub/sub channel so other connected devices update their badge instantly. Conflict: if device A and B mark the same item simultaneously, the second write is a no-op (CAS on read flag).</p>
+<h3>8.3 Badge correctness</h3>
+<p>Counters can drift under failures. A nightly reconciler scans inbox rows where <code>read=false</code> per user and rewrites the Redis counter. Cheap because we only run reconcile for users with reported drift (client sends server count + local count; mismatches enqueue a fix).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Celebrity follow events:</b> 1M followers receiving the same producer event → fan-out via Kafka with per-user keys; throttle low-priority categories.</li>
+  <li><b>Reconnect storms:</b> after edge restart, 100k clients reconnect within 1 s — use jittered exponential backoff and admission control on the edge.</li>
+  <li><b>Hot users:</b> 10k items/day for power accounts; cap inbox at 10k rows + spillover archive, paginate with cursor.</li>
+  <li><b>Pub/Sub fan-out:</b> Redis pub/sub doesn’t scale to 300M channels; use NATS or a sharded pub/sub keyed by user-shard.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Cassandra inbox per user</td><td>Cheap reads in time order</td><td>Wide partitions for power users</td></tr>
+<tr><td>Redis badge counters</td><td>O(1) read/write, atomic</td><td>Drift under failures; needs reconcile</td></tr>
+<tr><td>WebSocket primary, polling fallback</td><td>Real-time + resilient</td><td>Two paths to maintain</td></tr>
+<tr><td>Per-user pub/sub channel</td><td>Simple multi-device sync</td><td>Channel explosion at scale</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — partition inbox by userId; pick clustering key to keep recent reads cheap.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — monotonic reads on badge counter via Lua atomicity.</li>
+  <li>Ch. 11 Stream Processing — Kafka topics for inbox events feed materialized views (Cassandra rows + Redis counters); the stream processor pattern handles fan-out and downstream pub/sub.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd build the inbox first as a polling-only feed, then add WebSocket push as a thin overlay because polling correctness is the safety net."</li>
+  <li>"The hardest part is badge consistency across devices and crashes — I rely on Redis for fast path and a reconciler against Cassandra as the truth."</li>
+  <li>"At 300M users, Redis pub/sub doesn’t cut it; I'd shard channels or use NATS JetStream."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>WebSocket (RFC 6455) edge</td><td>5M concurrent connections per region with sub-1s push latency requires persistent bidirectional channels; WebSocket frames have ~2-byte overhead vs SSE's HTTP framing and survive on mobile background-tab better than long-poll.</td><td>SSE (one-way only, costs more bytes per message); HTTP long-polling (5M concurrent half-open requests strains LB).</td></tr>
+<tr><td>Cassandra (inbox storage)</td><td>10B writes/day = 115k/s avg with 460k/s peak; <code>PRIMARY KEY (user_id, item_id)</code> with descending clustering gives O(1) cursor pagination of newest-first inbox and built-in TTL=90d auto-archives without batch jobs.</td><td>DynamoDB (cost at 900 TB hot tier prohibitive); Postgres (115k/s sustained writes saturate WAL on a single primary).</td></tr>
+<tr><td>Redis (badge counters with HINCRBY)</td><td>300M users × 16 B counter = 5 GB easily fits a Redis cluster; HINCRBY on <code>badge:{userId}</code> gives O(1) atomic per-category bumps and a Lua floor-at-zero script handles the read decrement without races.</td><td>Cassandra counter columns (looser consistency, drift); Postgres counter (write contention at 460k/s peak).</td></tr>
+<tr><td>Redis pub/sub sharded by user-shard</td><td>Per-user channel pattern fans out to the right WebSocket edge node; sharding 300M channels across N Redis pub/sub clusters by hash(userId) avoids the single-Redis bottleneck where 300M channels would melt one node.</td><td>Single Redis pub/sub (300M channels overwhelm a single instance); Kafka per-user topic (topic explosion).</td></tr>
+<tr><td>NATS JetStream (alternative pub/sub)</td><td>NATS subject-based routing scales beyond Redis pub/sub limits with built-in persistence; at 29k WebSocket pushes/sec average it provides "at-least-once" semantics so a brief edge-node restart doesn't lose deliveries that arrived during reconnect.</td><td>Redis pub/sub (no persistence, lost messages during reconnect); RabbitMQ (per-channel overhead at 300M channels).</td></tr>
+<tr><td>Apache Kafka (inbox.events)</td><td>Producers push 115k events/sec with peak 460k; Kafka's partitioned log keyed by userId preserves per-user ordering for celebrity follow events while allowing 1M-follower fan-out via downstream workers without backpressuring producers.</td><td>SQS (out-of-order kills monotonic feed); Kinesis (shard rebalance lag during follower-spike).</td></tr>
+<tr><td>Consistent hashing (LB → edge nodes)</td><td>Sticky LB on userId means a user's WebSocket lands on the same edge node across reconnects, so the connection registry SADD doesn't churn and the pub/sub subscription is stable; minimizes re-registration on the 50-node fleet.</td><td>Round-robin LB (each reconnect rebuilds subscriptions); IP-hash (NAT/CGNAT collapses to few nodes).</td></tr>
+<tr><td>JWT auth on /v1/realtime/inbox</td><td>WebSocket upgrade can't carry per-message auth headers; signed JWT issued at login carries userId + scopes so the edge can authenticate 5M connections without per-request DB lookup.</td><td>Session cookie (stale revocation on logout); per-message OAuth (latency/CPU killer at 29k pushes/sec).</td></tr>
+<tr><td>Redis SADD connection registry (60s TTL)</td><td>Multi-device sync needs to know which edge node holds a user's connections; <code>SADD conn:{userId} {nodeId}:{connId}</code> with 60s TTL self-heals on edge crashes when heartbeats stop refreshing the entry.</td><td>Permanent registry rows (stale entries after edge crash); ZooKeeper ephemeral nodes (5M ephemerals overwhelms ZK).</td></tr>
+<tr><td>Lua atomic floor-at-zero (read decrement)</td><td>Marking 50 items read requires a single round-trip atomic decrement that doesn't dip below 0 — Lua scripts on Redis run inside the single-threaded loop so the badge count stays monotonic across simultaneous A/B device reads.</td><td>WATCH/MULTI optimistic txn (more retries under load); client-side check-then-decrement (race condition).</td></tr>
+<tr><td>Nightly reconciler (Cassandra → Redis)</td><td>Counter drift is inevitable under failures; a reconciler scans <code>read=false</code> rows for users with reported drift and rewrites Redis counters — only running for clients that report mismatch keeps it cheap (drift &lt; 0.1% of users daily).</td><td>Per-write reconciliation (write amplification at 115k/s); never reconcile (drift accumulates user complaints).</td></tr>
+<tr><td>Tiered storage (hot Cassandra 7d, cold S3 90d)</td><td>900 TB at 90-day retention in Cassandra would cost ~$200k/mo in instances; spilling 7-day-old items to S3+Parquet cuts hot tier to 70 TB and keeps the cold tier at $0.023/GB-month, paginated via cursor when the user scrolls past day 7.</td><td>All in Cassandra (cost prohibitive); all in S3 (read latency for the hot path unacceptable).</td></tr>
+<tr><td>Polling fallback endpoint (degrade path)</td><td>WebSocket fleet outages must not lose the inbox UX; a 30-second client poll on <code>GET /v1/inbox?cursor=</code> guarantees the inbox always works, and clients auto-promote back to WebSocket when the edge fleet recovers.</td><td>WebSocket-only (full outage on edge failure); always-poll (5M × 30s polls = wasted backend QPS).</td></tr>
+</tbody>
+</table>

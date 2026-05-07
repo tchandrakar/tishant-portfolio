@@ -1,0 +1,205 @@
+<h1>Design Distributed Cron / Scheduler (Quartz at scale, exactly-once trigger)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">misc</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a horizontally scalable scheduler that fires millions of jobs per minute on cron expressions or one-shot timestamps, dispatches them to user-defined workers (HTTP webhook, Kafka, gRPC), and guarantees at-least-once with effectively-once semantics — even across host failures, network partitions, and clock drift. Think AWS EventBridge + Quartz + Airflow's scheduler.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Create/update/delete schedules with cron expression or epoch timestamp.</li>
+  <li>Targets: HTTP, Kafka topic, gRPC, AWS SQS, custom adapter.</li>
+  <li>Exactly-once trigger semantics from the user's perspective (idempotent dispatch).</li>
+  <li>Per-job retry policy with exponential backoff and DLQ.</li>
+  <li>Pause/resume jobs; backfill missed runs.</li>
+  <li>Tenant isolation: 100 K jobs per tenant, no cross-tenant interference.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Trigger accuracy:</b> p99 within 1 s of scheduled instant.</li>
+  <li><b>Scale:</b> 10 M scheduled jobs total, 500 K firings/minute steady, 5 M/min burst.</li>
+  <li><b>Durability:</b> survive AZ failure with zero job loss.</li>
+  <li><b>Availability:</b> 99.99%; partial degradation acceptable but no missed fires.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>10 M jobs × 500 B row = 5 GB hot working set (fits in RAM across shards).</li>
+  <li>500 K firings/min ≈ 8.3 K/s; with 1 ms write per fire-event ⇒ 8 K writes/s, well under sharded Postgres limits.</li>
+  <li>Horizon scan window 60 s; per shard (256 shards) avg 33 due jobs/s.</li>
+  <li>Audit log: 500 K × 1 KB × 60 = 30 GB/hr ⇒ rolled to S3 hourly.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/jobs        {name, cron, target, retry, payload}   → jobId
+PATCH /v1/jobs/{id}  {paused: true}
+GET  /v1/jobs/{id}/runs?from=...                             → [{runId, firedAt, status, attempts}]
+POST /v1/jobs/{id}/trigger                                   → manual fire
+DELETE /v1/jobs/{id}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──►[API GW]──►[Job Service]──►[Postgres (sharded by tenant)]
+                                            │
+                                            ▼
+                                   [Schedule Index (per-shard)]
+                                            │
+                          ┌─────────────────┼─────────────────┐
+                          ▼                 ▼                 ▼
+                   [Scheduler-1]      [Scheduler-2]     [Scheduler-N]   (leases via etcd)
+                          │                 │                 │
+                          └────────►[Kafka: due-jobs (256 partitions)]
+                                            │
+                                            ▼
+                                   [Dispatcher Workers]
+                                            │
+                          ┌─────────────────┼─────────────────┐
+                          ▼                 ▼                 ▼
+                       [HTTP]            [Kafka]            [gRPC]
+                                            │
+                                            ▼
+                                   [Run Log (Cassandra)]
+</div>
+<p>Schedulers own a slice of shards (etcd lease); each scans its index for jobs due in the next 10 s, emits a "due" record to Kafka keyed by <code>jobId</code>, and updates <code>nextFireAt</code> atomically. Dispatcher consumers fire targets idempotently.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Jobs (Postgres, sharded by tenant)</h3>
+<pre>CREATE TABLE jobs (
+  job_id UUID PRIMARY KEY,
+  tenant_id UUID NOT NULL,
+  cron TEXT, next_fire_at TIMESTAMPTZ NOT NULL,
+  target JSONB, payload BYTEA, retry JSONB,
+  paused BOOLEAN DEFAULT false,
+  version BIGINT NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_due ON jobs (next_fire_at) WHERE paused = false;</pre>
+<h3>7.2 Run log (Cassandra, time-bucketed)</h3>
+<pre>CREATE TABLE runs (
+  job_id UUID, fire_bucket bigint, run_id timeuuid,
+  status text, attempts int, response int, error text,
+  PRIMARY KEY ((job_id, fire_bucket), run_id)
+) WITH default_time_to_live = 7776000;  -- 90 days</pre>
+<h3>7.3 Why Postgres for schedule, Cassandra for runs?</h3>
+<p>Schedule needs ACID UPDATE+SELECT for "claim and advance"; B-tree on <code>next_fire_at</code> is ideal. Run log is append-only at huge volume — Cassandra wins on write throughput and TTL.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Atomic claim &amp; advance</h3>
+<p>To prevent two schedulers firing the same job, the scheduler uses optimistic concurrency: <code>UPDATE jobs SET next_fire_at = $new, version = version+1 WHERE job_id = $id AND version = $v</code>. Only the winner emits the Kafka due-record. The Kafka record key = <code>jobId:fireEpoch</code>; downstream uses this as the idempotency key.</p>
+<h3>8.2 Effectively-once dispatch</h3>
+<p>Dispatcher writes <code>(jobId, fireEpoch) → INSERT-IF-NOT-EXISTS</code> into a <code>fire_log</code> table (Cassandra LWT) before invoking the target. Duplicate Kafka messages no-op. Target HTTP call carries <code>Idempotency-Key: jobId:fireEpoch</code> for the customer to dedupe end-to-end.</p>
+<h3>8.3 Sharding &amp; rebalance</h3>
+<p>256 logical shards mapped to physical schedulers via Rendezvous hashing. Lease in etcd with 10 s TTL; on lease loss, scheduler stops claiming. Total claim window ≤ 5 s ahead, so a 10 s outage leaves jobs late by ≤ 15 s p99 — recovered by the new lease holder running its first scan immediately.</p>
+<h3>8.4 Cron expansion</h3>
+<p>Standard 5-field plus optional seconds; expansion uses ical-rrule semantics. <code>nextFireAt</code> recomputed from <code>fireEpoch</code> after each fire to avoid drift.</p>
+<h3>8.5 Backfill &amp; catch-up</h3>
+<p>If a job missed N fires (e.g., paused), policy chooses: <code>skip</code>, <code>fire-once-with-latest-payload</code>, or <code>fire-each-with-bounded-rate</code>. Bounded-rate uses a token bucket per job to avoid thundering herd.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot minute (00:00):</b> millions of jobs fire same instant. Solution: jitter cron parses by ≤ 30 s if user opts in; load-shed via per-target rate limit at dispatcher.</li>
+  <li><b>Postgres index hot spot:</b> partial index <code>WHERE paused=false</code> + per-shard table keeps B-tree small.</li>
+  <li><b>Clock drift:</b> all schedulers use monotonic clocks for "due now" checks (DDIA Ch. 8); wall clock only for cron expansion.</li>
+  <li><b>Long-running webhooks:</b> dispatcher hands off to async worker pool with 30 s timeout; outcome reconciled by status callback.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Optimistic CAS on next_fire_at</td><td>No global lock</td><td>Wasted scheduler work on contention</td></tr>
+<tr><td>Kafka between scheduler &amp; dispatcher</td><td>Decouples; absorbs bursts</td><td>One more hop; ordering only per-key</td></tr>
+<tr><td>LWT for fire_log</td><td>Effectively-once</td><td>Cassandra LWT is 4× normal write cost</td></tr>
+<tr><td>Etcd leases for shard ownership</td><td>Strong consistency on ownership</td><td>Etcd cluster becomes critical dep</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 9 Consistency &amp; Consensus — etcd leases for single-leader-per-shard; CAS on <code>version</code> for fence tokens.</li>
+  <li>Ch. 11 Stream Processing — Kafka partitioned by <code>jobId</code> gives per-job ordering; idempotent producer + transactional dispatcher achieves effectively-once.</li>
+  <li>Ch. 8 Distributed Systems — clock drift &amp; bounded delay; we use monotonic clocks for elapsed measurements and accept ≤1s wall-clock skew across regions.</li>
+  <li>Sketch data structures — count-min sketch tracks per-tenant fire rates for fairness without per-job counters.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"True exactly-once across user webhooks is impossible; what we sell is at-least-once with a stable idempotency key the customer can dedupe on."</li>
+  <li>"The schedule store is the heart — I'd benchmark Postgres vs CockroachDB early; the cron index is small per-shard, so Postgres scales further than people expect."</li>
+  <li>"For the 00:00 thundering herd I'd push optional jitter at job-create time; otherwise the dispatcher must throttle and we miss SLA."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Quartz scheduler (engine)</td>
+      <td>Battle-tested cron-expression parser with iCal-rrule semantics — the parsing layer is the boring 5% you don't want to reinvent; we wrap it with our own claim-and-advance store rather than its JDBC backend, which doesn't scale past one node.</td>
+      <td>cron4j (rejected: thinner ecosystem), home-grown parser (rejected: edge cases around DST and 29 Feb).</td>
+    </tr>
+    <tr>
+      <td>PostgreSQL (sharded)</td>
+      <td>10 M jobs × 500 B = 5 GB working set fits in RAM across 256 shards; partial B-tree index <code>WHERE paused=false</code> on <code>next_fire_at</code> serves the every-second "due now" scan in &lt;5 ms with hot pages cached, and CAS on <code>version</code> gives lock-free claim semantics.</td>
+      <td>CockroachDB (rejected: 5× write latency for the CAS path), DynamoDB (rejected: cron-range scan unfriendly).</td>
+    </tr>
+    <tr>
+      <td>etcd (lease-based shard ownership)</td>
+      <td>Strong consistency on lease ownership prevents two schedulers from claiming the same shard during a partition — the only place we accept an external Raft dependency, because exactly-one-leader-per-shard is the safety boundary for "no missed fires".</td>
+      <td>ZooKeeper (rejected: heavier operationally), Redis (rejected: no real Raft, lease bugs at scale).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka (256 partitions)</td>
+      <td>Decouples scheduler from dispatcher and absorbs the 5 M/min burst at midnight; partition by <code>jobId</code> preserves per-job ordering, key <code>jobId:fireEpoch</code> lets downstream LWT dedupe — same record key flowing through the whole effectively-once chain.</td>
+      <td>RabbitMQ (rejected: ordering across partitions weaker), SQS (rejected: 256-partition fan-out cumbersome).</td>
+    </tr>
+    <tr>
+      <td>Cassandra LWT (fire_log)</td>
+      <td>INSERT-IF-NOT-EXISTS keyed on <code>(jobId, fireEpoch)</code> achieves effectively-once dispatch; LWT's 4× write cost is acceptable here because we only LWT 8.3 K times/sec on the dispatcher, not on the hot ingestion path.</td>
+      <td>Postgres unique constraint (rejected: cross-region replication awkward), Redis SETNX (rejected: not durable enough).</td>
+    </tr>
+    <tr>
+      <td>Cassandra (run log)</td>
+      <td>500 K firings/min × 1 KB = 30 GB/hr append-only writes with 90-day TTL — LSM trees, time-bucketed clustering keys, native TTL all match perfectly; partition <code>(job_id, fire_bucket)</code> keeps wide-partition risk bounded.</td>
+      <td>Postgres TOAST (rejected: vacuum cost at 30 GB/hr), Elasticsearch (rejected: cost-per-byte).</td>
+    </tr>
+    <tr>
+      <td>Rendezvous hashing</td>
+      <td>Maps 256 logical shards to N schedulers with minimal disruption on rebalance — only ~1/N of shards move when a scheduler joins/leaves, vs ~half with naïve modulo; lets us add capacity without missing a 1 s trigger SLA during the rebalance window.</td>
+      <td>Modulo hashing (rejected: massive churn on resize), consistent hashing (rejected: equivalent here, more code).</td>
+    </tr>
+    <tr>
+      <td>Optimistic CAS (version column)</td>
+      <td>Lock-free claim-and-advance — losing schedulers retry without holding row locks, so a 256-partition scan completes in &lt;100 ms even under contention; eliminates a lock manager, which is critical at 8 K writes/s shared across schedulers.</td>
+      <td>SELECT FOR UPDATE (rejected: lock contention spikes), advisory locks (rejected: no fence token).</td>
+    </tr>
+    <tr>
+      <td>Monotonic clocks (Java <code>System.nanoTime</code>)</td>
+      <td>Wall-clock skew across schedulers can mis-decide "due now"; monotonic clocks for elapsed measurements + a single authoritative wall-clock per scheduler at boot gives us the 1 s p99 trigger accuracy without trusting NTP sync.</td>
+      <td>System.currentTimeMillis (rejected: NTP slew artifacts), TrueTime (rejected: cloud lock-in).</td>
+    </tr>
+    <tr>
+      <td>Token bucket (per-job, per-target)</td>
+      <td>Bounded-rate backfill catches the user who paused 100 K jobs and resumed them at midnight; per-target limit at the dispatcher prevents a customer's webhook endpoint from being DDoS'd by their own backfill — same lever for the 00:00 thundering herd.</td>
+      <td>Leaky bucket (rejected: less burst-friendly), no rate cap (rejected: customer outages).</td>
+    </tr>
+    <tr>
+      <td>Count-min sketch (per-tenant fairness)</td>
+      <td>10 M jobs across 100 K tenants: tracking exact per-tenant fire rates needs a hash map keyed on tenant; CMS gives the same fairness signal in &lt;2 MB per scheduler with O(1) lookups, allowing weighted-fair queueing without a heavy counter store.</td>
+      <td>Exact counters (rejected: memory + GC pressure), sampling (rejected: misses small tenants).</td>
+    </tr>
+    <tr>
+      <td>S3 (audit log archive)</td>
+      <td>Run-log Cassandra rows roll to S3 hourly (30 GB/hr) for 7-year compliance retention; 100× cheaper than keeping it in Cassandra and the rare-read pattern (post-incident forensics) tolerates S3 latency easily.</td>
+      <td>Cassandra long-term (rejected: cost), Glacier-only (rejected: investigation latency).</td>
+    </tr>
+    <tr>
+      <td>OpenTelemetry + Prometheus</td>
+      <td>Trigger-accuracy SLA requires per-job latency histograms (fire-time minus scheduled-time); OTel traces follow a job from API to scheduler claim to dispatcher to webhook ack, so we can prove which hop ate the 1 s budget when SLA breaches.</td>
+      <td>Logs only (rejected: no histograms), proprietary APM (rejected: lock-in).</td>
+    </tr>
+  </tbody>
+</table>

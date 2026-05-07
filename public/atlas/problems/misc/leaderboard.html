@@ -1,0 +1,199 @@
+<h1>Design Real-time Leaderboard (gaming, top-K via Redis sorted set + sharding)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">misc</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a real-time leaderboard for a global mobile game with 50 M MAU. Players submit scores after each match; the system must show the global top-100, the player's rank, friends-leaderboard, and per-region/per-time-window views (daily, weekly, all-time) with sub-second latency at peak. Anti-cheat is part of the path: scores must be validated before counting.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Submit score; idempotent per match.</li>
+  <li>Get top-K (typical K=100) globally, regionally, by time window.</li>
+  <li>Get my rank (exact for top-1K, approximate beyond).</li>
+  <li>Get friends leaderboard (intersect friend list with sorted set).</li>
+  <li>Tournament mode: time-boxed leaderboard with reset.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> top-K read p99 &lt; 50 ms; rank-of-user p99 &lt; 100 ms.</li>
+  <li><b>Scale:</b> 50 M MAU, 5 M DAU, peak 100 K score-submits/sec during weekend events.</li>
+  <li><b>Freshness:</b> top-K reflects writes within 1 s.</li>
+  <li><b>Availability:</b> 99.95%; degrade to slightly-stale top-K under partition.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>50 M players × 64 B per ZSET entry ≈ 3.2 GB per leaderboard; 5 leaderboards (global, daily, weekly, monthly, tournament) ⇒ ~16 GB hot data.</li>
+  <li>Writes: 100 K/s × 5 ZSET updates = 500 K Redis ops/s ⇒ shard across 16 Redis nodes (~31 K ops/s each, well within 100 K cap).</li>
+  <li>Reads: 5 M DAU × 10 leaderboard views/day = 50 M/day ≈ 600/s avg, 10 K/s peak — easily served by replicas.</li>
+  <li>Long-term storage in Cassandra: 100 K writes/s × 200 B = 1.7 TB/day, TTL 90 days ⇒ ~150 TB rolling.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/scores                {matchId, userId, score, region}  → ackRank
+GET  /v1/leaderboard/global?limit=100                            → [{userId, score, rank}]
+GET  /v1/leaderboard/region/{r}?window=weekly&amp;limit=100         → [...]
+GET  /v1/leaderboard/me                                          → {rank, percentile, score}
+GET  /v1/leaderboard/friends   {userId}                          → [...]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Game Client]──►[API GW]──►[Score Ingest Svc]──►[Anti-cheat]──►[Kafka: validated-scores]
+                                                                      │
+                                       ┌──────────────────────────────┼──────────────┐
+                                       ▼                              ▼              ▼
+                                [Redis Cluster]              [Cassandra (audit)]   [Flink job]
+                                (16 shards, ZSET)                                 (windowed agg)
+                                       ▲
+                                       │
+                                [Read API]──►[Replica nodes]
+</div>
+<p>Score path: validate → publish → fan-out consumers update sharded Redis ZSETs and a Cassandra audit log. Reads go to Redis replicas; cross-shard top-K merged in the read API via a heap.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Redis sorted sets</h3>
+<pre># Global all-time
+ZADD lb:global  {score} {userId}
+ZREVRANGE lb:global 0 99 WITHSCORES   # top-100
+ZREVRANK   lb:global {userId}          # my rank
+
+# Sharded global (16 shards)
+ZADD lb:global:s{hash(userId) % 16}  {score} {userId}
+
+# Time-windowed
+ZADD lb:daily:2026-05-06   {score} {userId}    EX 172800</pre>
+<h3>7.2 Audit (Cassandra)</h3>
+<pre>CREATE TABLE score_events (
+  user_id BIGINT, match_id UUID,
+  score BIGINT, region TEXT, ts TIMESTAMP,
+  PRIMARY KEY ((user_id), ts)
+) WITH default_time_to_live = 7776000;</pre>
+<h3>7.3 Why Redis ZSET?</h3>
+<p>Skip-list under the hood: O(log N) insert/rank/range. Cluster mode shards by key hash; replicas serve reads. Persistence via AOF every-second strikes the right durability/perf trade.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Sharded top-K</h3>
+<p>Single global ZSET hits a Redis hot key under 100 K writes/s. We shard by <code>hash(userId) % 16</code>. To compute global top-100: query top-100 from each shard (16 × 100 = 1,600 entries), merge in a min-heap of size 100 in the read API. Cost: 16 parallel ZREVRANGE calls; p99 ≈ 5 ms with pipelining.</p>
+<h3>8.2 Approximate rank for the masses</h3>
+<p>Exact rank is O(log N) per query but loads Redis. For users beyond top-1K we maintain a per-leaderboard histogram (DDIA Ch. 11 sketch family — t-digest) of score distribution; rank = N × percentile lookup. Updated every 10 s via Flink.</p>
+<h3>8.3 Friends leaderboard</h3>
+<p>Friend list (≤ 500 typically) fetched from the social graph; <code>ZSCORE lb:global {friendId}</code> in a pipelined batch — 500 calls in one round trip ~3 ms. Sort in app layer.</p>
+<h3>8.4 Time-windowed leaderboards</h3>
+<p>Daily/weekly/monthly are separate ZSETs with Redis TTL. Tournaments use a key like <code>lb:tour:{id}</code> created at start, frozen at end, then snapshotted to Cassandra and deleted from Redis.</p>
+<h3>8.5 Anti-cheat</h3>
+<p>Score ingest service validates server-side replay token, checks score against per-game upper bound, and runs a CountMinSketch of recent-score-frequency to flag impossible streaks. Only validated events hit Kafka.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Celebrity score storm:</b> a streamer's match doesn't fan-out (single user); not a hot key.</li>
+  <li><b>Tournament start:</b> create the ZSET on all 16 shards eagerly; pre-warm replicas.</li>
+  <li><b>Cross-region:</b> per-region ZSETs in regional Redis; global view stitched async by Flink and stored in a separate "global-rolling" key.</li>
+  <li><b>Cold start of replica:</b> RDB snapshot replication; takes &lt; 60 s for 3 GB shard.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Redis ZSET vs Postgres index</td><td>10–100× faster, sub-ms</td><td>RAM cost; Postgres free if you have it</td></tr>
+<tr><td>Sharded ZSETs</td><td>Removes hot key</td><td>Top-K = scatter-gather, more code</td></tr>
+<tr><td>t-digest for long-tail rank</td><td>Constant memory, fast</td><td>Approximate rank only</td></tr>
+<tr><td>Kafka in the path</td><td>Decouples, replayable</td><td>Adds ~5 ms write latency</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — Kafka-based score event log, Flink windowed aggregations for periodic top-K snapshots, exactly-once via Kafka transactions.</li>
+  <li>Ch. 5 Replication — Redis primary-replica with AOF; we tolerate up to 1 s replication lag on read replicas.</li>
+  <li>Ch. 6 Partitioning — hash partitioning by userId; secondary leaderboards by region as separate keyspaces.</li>
+  <li>Sketch data structures — t-digest for percentile rank, count-min sketch for anti-cheat anomaly detection, HyperLogLog for unique-player counts per leaderboard.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The classic interview answer is a single ZSET; what they're testing is whether you spot the hot key at 100 K/s and shard."</li>
+  <li>"Exact rank for everyone is unnecessary — players past rank 1,000 don't care about the difference between 47,221 and 47,304. t-digest is the right hammer."</li>
+  <li>"For tournaments I'd freeze the final ZSET into Cassandra and serve historical leaderboards from there — Redis is for the hot present."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Redis sorted sets (ZSET)</td>
+      <td>Skip-list-backed ZSET gives O(log N) ZADD/ZREVRANK and O(log N + K) ZREVRANGE for top-100 — directly hits the &lt;50 ms p99 read SLA on a 50 M-player set; ZINCRBY for atomic score updates avoids any read-modify-write race at 100 K/s peak.</td>
+      <td>Postgres + window function (rejected: 50-100 ms per rank query), Elasticsearch (rejected: ~300 ms for ranks).</td>
+    </tr>
+    <tr>
+      <td>Sharded ZSETs (16 shards)</td>
+      <td>Single ZSET pegs a Redis shard at ~100 K ops/s — exactly our 100 K writes/s × 5 leaderboards = 500 K ops/s ceiling; hashing by <code>userId % 16</code> spreads load to 31 K ops/s per shard with comfortable headroom.</td>
+      <td>One ZSET (rejected: hot key meltdown), 64 shards (rejected: scatter-gather overhead).</td>
+    </tr>
+    <tr>
+      <td>Min-heap merge (top-K scatter-gather)</td>
+      <td>Cross-shard top-100: pull top-100 from each of 16 shards (1,600 candidates), merge in a size-100 min-heap in the read API — O(1,600 log 100) ≈ 11 K comparisons; with pipelined ZREVRANGE the whole call is &lt;5 ms p99.</td>
+      <td>Full union sort (rejected: O(N log N) overkill), broker-side merge (rejected: no native Redis op).</td>
+    </tr>
+    <tr>
+      <td>t-digest (long-tail rank)</td>
+      <td>Exact rank for player #4M loads Redis pointlessly; t-digest holds the score percentile distribution in ~5 KB and answers "your rank ≈ percentile × N" in O(1) — accurate to 0.1% for the bulk of users who don't care about #47,221 vs #47,304.</td>
+      <td>Histogram (rejected: poor tail accuracy), exact ZREVRANK on ZSETs (rejected: load).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka</td>
+      <td>Score events keyed by userId on a 256-partition topic decouple anti-cheat validation from ZSET updates; 100 K/s ingest absorbed into per-partition batches, replayable for tournament reconstruction without touching Cassandra audit log.</td>
+      <td>Direct Redis writes (rejected: anti-cheat coupling), RabbitMQ (rejected: replay weakness).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink (windowed agg)</td>
+      <td>Daily/weekly leaderboards are tumbling-window aggregations over the score stream; Flink's keyed state + watermarks correctly handle late events from regional latency, and the cluster-aware top-K snapshots Cassandra at window close.</td>
+      <td>Spark Streaming (rejected: micro-batch lag), Kafka Streams (rejected: weaker watermarking).</td>
+    </tr>
+    <tr>
+      <td>Cassandra (audit / cold store)</td>
+      <td>100 K writes/s × 200 B = 1.7 TB/day with 90-day TTL = 150 TB rolling — pure append-only, partitioned by user_id; LSM trees handle the write rate that would shred any B-tree, and frozen tournament leaderboards land here permanently.</td>
+      <td>Postgres (rejected: vacuum at 1.7 TB/day), DynamoDB (rejected: cost at this volume).</td>
+    </tr>
+    <tr>
+      <td>Redis AOF (every-second fsync)</td>
+      <td>Every-second AOF gives ≤1 s data loss on shard failure with negligible perf hit — the right durability point for a leaderboard where a missed score is recoverable from Cassandra; full fsync-per-write would halve our 100 K ops/s ceiling.</td>
+      <td>RDB only (rejected: minute-level loss), AOF always (rejected: 50% throughput loss).</td>
+    </tr>
+    <tr>
+      <td>Redis replicas (read scaling)</td>
+      <td>5 M DAU × 10 reads/day ≈ 600/s avg, 10 K/s peak — replicas eat this whole load while the primary stays free for the 100 K/s write path; ≤1 s replication lag is acceptable per our 1 s freshness SLA.</td>
+      <td>Primary-only reads (rejected: write-side starvation), DAX (rejected: not Redis).</td>
+    </tr>
+    <tr>
+      <td>Count-min sketch (anti-cheat)</td>
+      <td>Tracks recent-score frequency per user/match in &lt;1 MB without per-user maps; flags impossible streaks (e.g., 50 perfect scores in 60 s) before scores reach the ZSET — keeps the cheat-suppression hot path off Cassandra.</td>
+      <td>Per-user counters (rejected: 50 M-key memory blow-up), no anti-cheat (rejected: leaderboard credibility).</td>
+    </tr>
+    <tr>
+      <td>HyperLogLog (unique players)</td>
+      <td>Counting unique active players per leaderboard at &lt;0.81% error in 12 KB — order of magnitude cheaper than a SET of 50 M userIds, used for "5 M people are competing" UI without any per-user storage.</td>
+      <td>Redis SET (rejected: GBs of memory), Bloom filter (rejected: false positives skew counts).</td>
+    </tr>
+    <tr>
+      <td>Pipelined ZSCORE (friends LB)</td>
+      <td>500 friends × ZSCORE in one Redis pipeline round-trip = ~3 ms vs 500 ms serially; small enough that no pre-aggregation is needed, big enough that naïve per-call latency would blow the SLA.</td>
+      <td>Per-friend GET (rejected: round-trip storm), pre-materialized friends ZSET (rejected: write amplification).</td>
+    </tr>
+    <tr>
+      <td>Redis TTL (time-windowed keys)</td>
+      <td>Daily keys <code>lb:daily:2026-05-06 EX 172800</code> auto-expire 48 hr later — no cleanup cron, no orphaned keys; the 2-day overlap covers timezone reporters who want "yesterday" for their region.</td>
+      <td>Manual sweep (rejected: cron drift), no expiry (rejected: unbounded RAM growth).</td>
+    </tr>
+    <tr>
+      <td>Per-region Redis clusters</td>
+      <td>Cross-region writes at 100 K/s would saturate inter-region links; regional clusters localise the hot path and Flink stitches a global "rolling" view async — accepting eventual consistency in exchange for keeping regional p99 &lt;50 ms.</td>
+      <td>Single global cluster (rejected: latency + bandwidth), CRDT replication (rejected: ZSET CRDTs immature).</td>
+    </tr>
+  </tbody>
+</table>

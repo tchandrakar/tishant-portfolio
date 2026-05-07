@@ -1,0 +1,64 @@
+<h1>Message queues: Kafka vs RabbitMQ vs SQS — when to use which</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">queues</span>
+  <span class="tag">kafka</span>
+  <span class="tag">rabbitmq</span>
+  <span class="tag">sqs</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>A message queue decouples producers from consumers so they can run at different speeds, fail independently, and scale on different axes. The three workhorses each made a different bet: Kafka treats the queue as a <i>durable replayable log</i>, RabbitMQ treats it as a <i>smart router</i> with rich exchange semantics, and SQS treats it as a <i>fully managed dumb pipe</i> with at-least-once delivery and visibility timeouts. Picking the wrong one is a quiet but expensive mistake — you find out months later when you can't replay, can't fan out, or can't keep up.</p>
+
+<h2>Why it matters</h2>
+<p>Almost every distributed system has a queue at the center: order pipelines, analytics ingestion, email sending, audit logs, search indexing. Whether you can do exactly-once, replay last week's traffic, or push 1M msgs/sec depends entirely on which broker is sitting there. Interviewers ask about this because the answer reveals whether you understand <b>throughput vs routing vs ops cost</b>.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Kafka:</b> LinkedIn activity stream, Uber trip events, any event-sourcing or stream-processing pipeline. High throughput, ordered per partition, retained for days.</li>
+  <li><b>RabbitMQ:</b> Task queues for background jobs (think Celery/Sidekiq workloads), RPC-style request/reply, complex routing where one event needs to land in five different queues with different filters.</li>
+  <li><b>SQS:</b> AWS-native glue between Lambda, EC2 workers, and S3 events. Standard queues for at-least-once; FIFO queues for ordered, deduplicated processing at lower throughput.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  Kafka (log)              RabbitMQ (router)         SQS (managed pipe)
+  ┌──────────────┐         ┌──────────────┐          ┌──────────────┐
+  │ P1 P2 P3 P4 …│ ←offset │ exch ─► queue│          │   queue      │
+  │ retained 7d  │         │      ─► queue│          │ visibility   │
+  │ replay any   │         │      ─► queue│          │ timeout      │
+  └──────────────┘         └──────────────┘          └──────────────┘
+   pull, ordered            push, routed              poll, opaque
+   per partition            via bindings              at-least-once
+</div>
+<p>Kafka stores; consumers track their own offset and can rewind. RabbitMQ delivers and forgets — once acked the message is gone. SQS hides the broker entirely: you poll, process within the visibility timeout, and delete; if you don't delete, the message reappears.</p>
+
+<h2>How to choose</h2>
+<ul>
+  <li><b>Need replay or stream processing?</b> Kafka. Offsets + retention give you a time machine.</li>
+  <li><b>Need rich routing (topic + headers + per-message TTL + priority)?</b> RabbitMQ. Exchanges and bindings express what you'd otherwise hand-code.</li>
+  <li><b>Need zero ops on AWS?</b> SQS. Pay-per-message, infinite scale on standard queues, no brokers to babysit.</li>
+  <li><b>Throughput target &gt; 100k msgs/sec sustained?</b> Kafka, by a wide margin. RabbitMQ tops out around 50k/node before you start fighting it.</li>
+  <li><b>Strict per-key ordering?</b> Kafka (partition by key) or SQS FIFO (group id). RabbitMQ ordering breaks once you add competing consumers.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Using Kafka for a 100-msg/day job queue. You'll spend more on ZooKeeper/KRaft than on the work itself.</li>
+  <li>Using RabbitMQ as an event log — nothing stops a consumer from acking and losing the only copy.</li>
+  <li>Forgetting SQS visibility timeout. If your worker takes 60s but timeout is 30s, the message gets redelivered and you process it twice.</li>
+  <li>Treating "exactly-once" as a checkbox. It's a property of producer + broker + consumer + sink together, not the broker alone.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're building a payment-event pipeline. Auditors require replaying any day in the last 90 days into a new fraud model. Risk team wants to fan the same event out to four downstream systems. Which broker, and how do you lay out topics/partitions?
+  <br/>
+  <b>Hint:</b> Replay + fanout + 90-day retention is one broker's home turf. Partition by what gives you ordering where it matters (account id) without creating hot keys.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-event-collector">Design an event collector</a> — high-throughput ingestion where Kafka shines.</li>
+  <li><a href="#problem/design-idempotent-payments">Design idempotent payments</a> — why broker choice doesn't save you from double-charging.</li>
+  <li><a href="#problem/design-twitter-trending">Design Twitter trending</a> — fanout topology and replay for analytics windows.</li>
+</ul>

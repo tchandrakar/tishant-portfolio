@@ -1,0 +1,219 @@
+<h1>Design Distributed Transactions (2PC, Saga, XA, Spanner-style TrueTime)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">database-ddia</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Coordinate atomic, isolated, durable updates across multiple shards, services, or databases — the canonical "transfer money from account A on shard X to account B on shard Y" or "place an order that decrements inventory, charges payment, and records ledger entries." The interview wants you to compare the four main techniques: classic <b>2PC/XA</b>, <b>Saga</b> with compensations, <b>Percolator-style</b> snapshot-isolation 2PC, and <b>Spanner's TrueTime</b> external-consistency approach (DDIA Ch. 7 "Distributed Transactions" and "Atomic Commit").</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>All-or-nothing across N participants (atomicity).</li>
+  <li>Configurable isolation: read-committed -&gt; snapshot -&gt; serializable / external consistency.</li>
+  <li>Durable commit even if any participant or coordinator crashes.</li>
+  <li>Bounded blocking on coordinator failure (or escape via timeouts/heuristics).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Commit latency:</b> 2-3 RTT for 2PC; 1 RTT + clock-wait for Spanner; async for Saga.</li>
+  <li><b>Throughput:</b> 10-50k cross-shard tx/s with batching; far higher for sagas.</li>
+  <li><b>Availability:</b> tolerate any single participant failure; coordinator HA via Raft/Paxos.</li>
+  <li><b>Recovery:</b> in-doubt transactions resolve within seconds, not days.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>10k commits/s * 5 participants = 50k participant-fsyncs/s.</li>
+  <li>Coordinator log: 200 B/record * 10k = 2 MB/s; 1 day = ~170 GB.</li>
+  <li>Lock memory at participants: avg 200 B/lock * 10k concurrent tx * 5 keys = 10 MB.</li>
+  <li>Spanner-style commit-wait: ~7 ms with TrueTime epsilon = 7 ms; bounded by GPS+atomic clock.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// 2PC / XA
+xa_start(xid)        on each participant
+xa_prepare(xid)      vote yes/no
+xa_commit(xid)       or xa_rollback(xid)
+
+// Saga
+beginSaga()
+step1.execute(); step1.compensate = ...
+step2.execute(); step2.compensate = ...
+on failure: run compensations in reverse
+
+// Spanner
+beginTxn(readTimestamp)         // read at TT.now().latest
+commit() -&gt; commitTs;            // s = TT.now().latest at coordinator
+                                 // wait until TT.now().earliest &gt; s</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram"> ---------------------- 2PC ----------------------
+   Coordinator                    Participants
+        |                              |
+        |--- prepare ---&gt;              |
+        |&lt;-- vote yes/no ---            |  (durable prepare log)
+        |                              |
+        |--- commit / abort ---&gt;       |
+        |&lt;-- ack -----------            |  (apply, release locks)
+
+ ---------------------- Saga ----------------------
+   Orchestrator    SvcA      SvcB      SvcC
+        |--exec--&gt; |          |          |
+        |&lt;--ok-----|          |          |
+        |--exec----+---------&gt;|          |
+        |          |&lt;--FAIL---|          |
+        |--comp----+---&gt;|     |          |
+        |          |&lt;--ok----|           |   (no isolation; compensations)
+
+ ------------------ Spanner Commit ------------------
+   Coordinator (Raft group leader)
+        | Paxos-prepare on all groups
+        | choose s = TT.now().latest after prepare phase
+        | wait until TT.now().earliest &gt; s   (commit-wait)
+        | apply at s, release locks</div>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Coordinator log (2PC)</h3>
+<pre>{xid, participants[], state, commitTs, lastUpdate}
+states: STARTED -&gt; PREPARED -&gt; COMMITTED | ABORTED</pre>
+<p>Coordinator force-writes <code>PREPARED</code> before sending commit messages; this is the durability commitment that makes the protocol blocking-safe (DDIA Ch. 7 "Three-Phase Commit" notes that 3PC tries to remove the blocking property but is unsafe under network partitions).</p>
+<h3>7.2 Saga state</h3>
+<p>Saga orchestrator persists <code>{sagaId, currentStep, status, completedSteps[], compensationsRun[]}</code>. Each step's command and compensation are idempotent and stored in the workflow definition (Temporal, Cadence, Camunda, AWS Step Functions).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Two-phase commit (2PC)</h3>
+<p>Phase 1 — Prepare: coordinator asks each participant to validate constraints, write a prepare record, and lock the rows. A "yes" vote is a durable promise to commit if asked. Phase 2 — Decide: if all yes, coordinator durably writes COMMIT and tells everyone; if any no, ABORT. <b>The blocking problem:</b> if the coordinator crashes after some participants prepare but before deciding, those participants hold locks until the coordinator recovers — they cannot unilaterally abort (they promised). Mitigations: HA coordinator via Raft, heuristic decisions with reconciliation, escalation to operators after timeout.</p>
+<h3>8.2 XA transactions</h3>
+<p>The X/Open standard: a transaction manager (TM) drives 2PC across resource managers (RMs — DBs, MQs). Plagued by historical issues: heuristic outcomes leaving inconsistent state, "in-doubt" transactions blocking shutdowns, prepared-state recovery files. DDIA Ch. 7 explicitly warns that XA is widely deployed but operationally painful; modern systems prefer in-protocol consensus.</p>
+<h3>8.3 Saga pattern</h3>
+<p>Decompose a long-lived business transaction into local transactions S1..Sn each with a compensation C1..Cn. On failure at step k, run Ck-1..C1 in reverse. <b>No isolation between sagas</b> — interleaving exposes intermediate states; mitigations: semantic locks (reservation/confirm), commutative updates (CRDTs), business-level invariants. Two flavors: <i>orchestrated</i> (central coordinator, easier to reason about — Temporal) or <i>choreographed</i> (event-driven, looser coupling — Kafka events). Sagas trade strict ACID for availability and decoupling and are the dominant pattern in microservice architectures.</p>
+<h3>8.4 Percolator (snapshot-isolation 2PC)</h3>
+<p>Used by Google ads, TiKV, CockroachDB. Uses a global timestamp oracle for ordering. Prewrite places intent records and locks on each row; primary-key write commits the whole transaction atomically (a single Bigtable cell flip). Other participants observe the committed primary and roll forward. Lock cleanup is lazy and safe. Achieves serializable / SI semantics over a sharded KV store without needing a heavyweight TM.</p>
+<h3>8.5 Spanner &amp; TrueTime</h3>
+<p>Spanner gives <i>external consistency</i> (linearizability for transactions) by combining Paxos per shard with TrueTime — an API exposing <code>[earliest, latest]</code> bounds on real time. The coordinator picks a commit timestamp <code>s</code> after acquiring locks and acknowledging prepare from all groups; it then performs <i>commit wait</i> until <code>TT.now().earliest &gt; s</code> so no future transaction can pick a smaller timestamp. The wait absorbs the clock-uncertainty epsilon (~7 ms thanks to GPS + atomic clocks). Locks are released after the wait, but reads at any timestamp before <code>s</code> are immediately consistent. Reads use <i>safe time</i> on each Paxos group, allowing globally consistent snapshot reads across shards without locking.</p>
+<h3>8.6 Choosing a strategy</h3>
+<ul>
+  <li><b>Within one DB cluster:</b> use the engine's native distributed tx (Spanner, CockroachDB, YugabyteDB).</li>
+  <li><b>Across heterogeneous services:</b> Saga with idempotent steps and outbox pattern.</li>
+  <li><b>Across two DBs in same DC:</b> XA still viable if availability tolerates blocking; otherwise wrap in Saga.</li>
+  <li><b>Cross-region strict consistency:</b> Spanner-style or accept higher latency for 2PC + consensus per participant.</li>
+</ul>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Coordinator hotspot:</b> shard coordinators by transaction id; co-locate with leading participant.</li>
+  <li><b>Lock holding during prepare:</b> minimize keys per tx, batch reads before lock acquisition (read-only tx use SI without locks).</li>
+  <li><b>Long sagas:</b> use durable workflow engines so steps survive process restarts.</li>
+  <li><b>Outbox pattern:</b> avoid dual-write inconsistency by writing local DB + event in one local tx, then having a relay publish to the bus (CDC).</li>
+  <li><b>TrueTime epsilon:</b> bigger epsilon -&gt; longer commit-wait; invest in time infrastructure.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Approach</th><th>Consistency</th><th>Availability</th><th>Complexity</th></tr></thead>
+<tbody>
+<tr><td>2PC / XA</td><td>Strong (atomic)</td><td>Blocks on coordinator failure</td><td>Medium; ops-heavy</td></tr>
+<tr><td>Saga (orchestrated)</td><td>Eventual; no isolation</td><td>High</td><td>High at the app layer</td></tr>
+<tr><td>Percolator</td><td>SI / SSI over KV</td><td>High</td><td>Medium; needs TS oracle</td></tr>
+<tr><td>Spanner / TrueTime</td><td>External consistency</td><td>High via Paxos</td><td>Very high; needs TT</td></tr>
+<tr><td>Outbox + idempotent consumers</td><td>Eventual</td><td>Highest</td><td>Low at the boundary</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 7 "Atomic Commit and Two-Phase Commit" — the canonical 2PC walkthrough and its blocking problem.</li>
+  <li>Ch. 7 "Distributed Transactions in Practice" — XA pitfalls, heuristic decisions, in-doubt recovery.</li>
+  <li>Ch. 7 "Serializable Snapshot Isolation" — the basis for Percolator-style SI commits.</li>
+  <li>Ch. 8 "Unreliable Clocks" — why TrueTime's bounded epsilon is required and what happens without it.</li>
+  <li>Ch. 9 "Distributed Transactions and Consensus" — 2PC reduces to consensus on the commit decision.</li>
+  <li>Ch. 11 "Exactly-Once Message Processing" — outbox + dedupe achieves "effectively once" without 2PC.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"For payments I'd push toward Saga + ledger + idempotency keys: 2PC across a payment processor and a bank ledger is operationally fragile, and money systems already think in terms of authorize/capture/refund — that <i>is</i> a saga."</li>
+  <li>"If the interviewer pushes back with 'but I want strict consistency,' I'd describe Spanner: TrueTime + commit-wait gives external consistency without giving up scale, but it requires real clock infrastructure."</li>
+  <li>"The single biggest reliability lesson is the outbox pattern — never dual-write a database and a message bus; let CDC turn one durable write into both."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Two-phase commit (2PC) with HA coordinator</td>
+      <td>The canonical atomic-commit protocol for heterogeneous participants — DDIA Ch. 7 prescribes it when you genuinely need all-or-nothing across systems that don't share a transaction layer. The PREPARED durability promise is what makes the protocol blocking-safe even though it's blocking on coordinator failure.</td>
+      <td>Three-phase commit (DDIA Ch. 7 explicitly warns 3PC is unsafe under network partitions despite removing blocking); Paxos commit (more complex; rarely worth the engineering for a 2-3 participant case).</td>
+    </tr>
+    <tr>
+      <td>Coordinator backed by Raft/Paxos</td>
+      <td>The DDIA Ch. 9 insight: 2PC reduces to consensus on the commit decision. Replicating the coordinator log via Raft eliminates the single-coordinator SPOF that historically made 2PC operationally fragile, so a coordinator failover takes seconds not hours of operator intervention.</td>
+      <td>Single-node coordinator (in-doubt transactions block participants until the coordinator returns — XA's classic pain point); pair-of-nodes failover (split-brain risk without consensus).</td>
+    </tr>
+    <tr>
+      <td>Saga (orchestrated) for cross-service business transactions</td>
+      <td>Microservice architectures rarely share a TM and locking across services for the duration of a 2PC is a liveness disaster. Sagas trade isolation for availability and are the right fit when steps map naturally to existing API operations (authorize/capture/refund) — DDIA Ch. 11's "compensations are normal in business processes."</td>
+      <td>Cross-service 2PC/XA (locks held across HTTP latencies; one slow service stalls all participants); choreographed saga (event-driven but harder to reason about — debugging is a nightmare).</td>
+    </tr>
+    <tr>
+      <td>Saga orchestrator (Temporal / Cadence / Step Functions)</td>
+      <td>Durable workflow engines persist saga state and survive process restarts, providing exactly-once-effectively semantics on each step via idempotency keys. Without durable orchestration, a coordinator crash mid-saga leaves the system in an inconsistent state.</td>
+      <td>App-managed saga state in DB (every team rebuilds workflow primitives, badly); choreography via Kafka events (no central state — debugging requires correlating cross-service logs).</td>
+    </tr>
+    <tr>
+      <td>Percolator-style snapshot-isolation 2PC for sharded KV</td>
+      <td>Used by Google Ads, TiKV, CockroachDB. A primary-key intent flip commits the whole transaction atomically over a sharded KV store, with lazy lock cleanup that's safe under crashes. Achieves SI/SSI without a heavyweight TM and scales horizontally with the underlying KV store.</td>
+      <td>Classical 2PC + global lock manager (the lock manager becomes the scaling bottleneck); Spanner-style TrueTime (requires real clock infrastructure).</td>
+    </tr>
+    <tr>
+      <td>Spanner + TrueTime (external consistency at geo scale)</td>
+      <td>Combines Paxos per shard with a clock API exposing [earliest, latest] real-time bounds. Commit-wait until TT.now().earliest &gt; s ensures no future tx picks a smaller timestamp — gives linearizability across shards without distributed locking. The DDIA Ch. 8/9 reference for "doing strict consistency at planet scale."</td>
+      <td>NTP timestamps + 2PC (clock skew breaks ordering — DDIA Ch. 8); 2PC + global lock service (lock service becomes a global bottleneck).</td>
+    </tr>
+    <tr>
+      <td>TrueTime-class infrastructure (GPS + atomic clocks) or AWS TimeSync</td>
+      <td>Bounded epsilon (~7 ms) is what makes commit-wait short enough to be practical. The smaller the epsilon, the lower the commit-wait — directly trades hardware investment for transaction latency.</td>
+      <td>NTP only (epsilon measured in seconds — kills throughput); Marzullo's algorithm on commodity NTP (no real bound on skew).</td>
+    </tr>
+    <tr>
+      <td>Global timestamp oracle (TSO) for Percolator</td>
+      <td>Hands out monotonic timestamps to give transactions a total order. Single-machine TSO scales to millions of timestamps/second via batched allocation; replicated via Raft for HA. Avoids the clock-skew problem TrueTime solves with hardware by centralizing time-allocation.</td>
+      <td>Per-shard timestamps (no cross-shard ordering); Lamport/HLC clocks (fine for ordering but don't give SI snapshots cheaply).</td>
+    </tr>
+    <tr>
+      <td>Outbox pattern + CDC relay</td>
+      <td>The canonical fix for the "dual-write to DB + message bus" anti-pattern. Write the row + outbox event in one local transaction; a CDC relay (Debezium, Maxwell) tails the WAL and publishes to the bus. Turns one durable write into both with no distributed transaction needed — the DDIA Ch. 11 "exactly-once via dedupe" pattern in production form.</td>
+      <td>Direct dual-write (one side may fail — silent inconsistency); 2PC across DB + broker (XA over Kafka is rare and operationally heavy); transactional outbox without CDC (requires a poller — duplicate work).</td>
+    </tr>
+    <tr>
+      <td>Idempotency keys at every step</td>
+      <td>Every saga step (and every retry of a 2PC participant) must be idempotent because crashes/timeouts cause replays. Idempotency keys (client-supplied UUIDs stored in a dedupe table) make "exactly-once-effectively" achievable without 2PC — Stripe/AWS API style.</td>
+      <td>Best-effort dedupe by content (collisions cause incorrect dedupe); no dedupe (replays double-charge or double-credit — money bugs).</td>
+    </tr>
+    <tr>
+      <td>Semantic locks (reservation/confirm) inside sagas</td>
+      <td>Sagas have no isolation, so concurrent sagas can observe intermediate states. A two-step "reserve seat" / "confirm seat" with TTL on the reservation gives application-level isolation — the standard pattern for inventory and seat-booking workflows.</td>
+      <td>Pessimistic locks across the whole saga (saga can take seconds to minutes — locks are too long-lived); ignore (overselling, race conditions).</td>
+    </tr>
+    <tr>
+      <td>Heuristic decision recording for in-doubt 2PC</td>
+      <td>If the coordinator is permanently lost, an operator can force commit/abort on a participant — the XA standard's escape hatch. The participant records that the decision was heuristic so reconciliation can detect the divergence later (DDIA Ch. 7 explicitly calls this out as XA's safety-vs-liveness trade-off).</td>
+      <td>Block forever waiting for coordinator (locks held indefinitely — operational disaster); auto-abort on timeout (violates the prepare promise — corrupts atomicity).</td>
+    </tr>
+    <tr>
+      <td>Read-only transactions via SI without locks</td>
+      <td>Snapshot-isolation reads at a fixed timestamp need no locks and no 2PC participation; serve them from any replica with safe-time ≥ snapshot. Eliminates the lock-holding cost flagged in §9 for the read-mostly fraction of the workload.</td>
+      <td>2PC even for read-only (acquires locks on every shard — wasteful); pessimistic reads (blocks writers — kills throughput).</td>
+    </tr>
+    <tr>
+      <td>Outbox + Kafka topic per aggregate (DDIA "stream as truth")</td>
+      <td>Long sagas span minutes/hours; a durable event log lets steps survive process restarts and lets new consumers replay history for analytics or fraud detection. Aligns with DDIA Ch. 11's "databases and streams" — the WAL/event log becomes the source of truth.</td>
+      <td>Stateless message queue (events lost on consumer crash); RabbitMQ-style ack queues (no replay for new consumers).</td>
+    </tr>
+  </tbody>
+</table>

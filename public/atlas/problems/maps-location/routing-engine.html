@@ -1,0 +1,212 @@
+<h1>Design Routing Engine (Dijkstra → contraction hierarchies for road graphs)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">maps-location</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Compute the shortest/fastest A→B path on the global road graph (~150 M nodes, ~400 M edges) for 10 B requests/day. Naive Dijkstra is O(E log V) — too slow. Walk through the algorithmic ladder: Dijkstra → bidirectional Dijkstra → A* → ALT → Contraction Hierarchies (CH) → Customizable Contraction Hierarchies (CCH). Discuss live-traffic-aware re-weighting, turn restrictions, multi-modal extensions, and how to keep p99 query &lt; 100 ms with sub-second updates after live-traffic changes.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Driving / walking / cycling / transit modes; each is a separate weighted graph.</li>
+  <li>Alternative routes (top-3) with detour ratio constraints.</li>
+  <li>ETA with live traffic; arrival-time-dependent routing (rush hour models).</li>
+  <li>Turn restrictions, one-ways, vehicle restrictions (truck weight, EV charging).</li>
+  <li>Re-route on deviation in &lt;200 ms.</li>
+  <li>Bulk waypoint optimisation (delivery TSP up to 25 stops).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 route compute &lt; 100 ms, isochrone &lt; 500 ms.</li>
+  <li><b>Scale:</b> 10 B routes/day ≈ 115 K rps avg, 400 K peak.</li>
+  <li><b>Freshness:</b> traffic edge updates visible to queries &lt; 60 s.</li>
+  <li><b>Footprint:</b> CH-augmented graph 80 GB/continent in RAM.</li>
+  <li><b>Correctness:</b> bit-exact equivalence with plain Dijkstra under static weights (validation suite).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Plain Dijkstra on 400 M edges: ~10 s/query — ✗.</li>
+  <li>Bidirectional Dijkstra: ~1 s — ✗.</li>
+  <li>A* with great-circle heuristic: ~200 ms cross-country — borderline.</li>
+  <li>CH: ~1 ms typical, ~10 ms continental — ✓.</li>
+  <li>Pre-compute: CH on a continent ≈ 6 h on a 32-core box; output ≈ 2× edge memory.</li>
+  <li>Servers: 400 K rps / 1 K rps per node = 400 nodes (CH does ~3 K rps per core).</li>
+  <li>Memory: 80 GB graph + 4 KB per concurrent search = 80 GB + 16 GB workspace.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/route         {origin, dest, mode, depart_at, alt:3} → routes[]
+POST  /v1/matrix        {origins[N], dests[M]}                  → N×M ETA matrix
+POST  /v1/isochrone     {center, time_budget_s}                 → polygon
+POST  /v1/snap          {points[]}                              → snapped to road network
+POST  /v1/optimize      {stops[]}                               → ordered TSP solution</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──▶[Route API GW]──▶[Region Router]
+                                  │
+                ┌─────────────────┼─────────────────┐
+                ▼                 ▼                 ▼
+         [CH Shard NA]    [CH Shard EU]      [CH Shard ASIA]
+         ┌──────────┐    ┌──────────┐       ┌──────────┐
+         │CH graph  │    │CH graph  │       │CH graph  │
+         │+ traffic │    │+ traffic │       │+ traffic │
+         │overlay   │    │overlay   │       │overlay   │
+         └──────────┘    └──────────┘       └──────────┘
+                ▲              ▲                ▲
+                │              │                │
+         [Live Traffic Pub/Sub: edge_id → speed_factor]
+                ▲
+                │
+         [Probe Aggregator (Flink)]
+                ▲
+                │
+         [Kafka: probe pings]
+
+[Cross-region Overlay Graph (~5K boundary nodes)] ── used for inter-shard routes
+</div>
+<p>The graph is partitioned by continent; cross-region trips use a small "overlay" of well-chosen border nodes whose pairwise CH distances are precomputed. Live traffic is a pub/sub topic that updates an edge-multiplier table; the CH stays valid because we re-rank only candidate routes via on-the-fly recomputation against the multiplier (Customizable CH).</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Static graph (file-format on RAM)</h3>
+<pre>nodes  : node_id u32 → (lat f32, lng f32, country u8)
+edges  : edge_id u32 → (src u32, dst u32, len_m u16, speed_class u8, restrict u16)
+fwd_csr / rev_csr : compressed-sparse-row adjacency for cache locality</pre>
+<h3>7.2 CH augmentation</h3>
+<pre>ch_rank[node_id] u32          // contraction order
+shortcuts: array of (u, v, weight, via_node)  // added during preprocessing</pre>
+<h3>7.3 Live traffic overlay</h3>
+<pre>edge_factor[edge_id] f16      // multiplicative slowdown, 1.0 = free flow
+mmap'd, atomic per-edge writes; readers see consistent snapshot via epoch counter</pre>
+<h3>7.4 Why this layout?</h3>
+<p>Graph algorithms are memory-latency bound: CSR + 32-bit ids + sequential traversal saturate L2 cache lines. We deliberately avoid pointer-chasing object graphs.</p>
+
+<h2>8. Detailed algorithm walk-through</h2>
+<h3>8.1 Bidirectional Dijkstra</h3>
+<p>Search forward from s and backward from t simultaneously; stop when their settled sets meet. Halves visited nodes vs unidirectional. Foundation for CH.</p>
+<h3>8.2 A* with landmarks (ALT)</h3>
+<p>Pick K landmarks (~16); precompute distance from every node to each landmark. h(v,t) = max_l |d(l,v) − d(l,t)| satisfies triangle inequality. Speedup ~10×, but landmarks weak in long routes.</p>
+<h3>8.3 Contraction Hierarchies (CH)</h3>
+<p>Pre-compute: order nodes by importance; iteratively "contract" lowest-importance node by adding shortcut edges between its neighbours that preserve shortest paths. Query: bidirectional Dijkstra that <i>only relaxes upward</i> in the hierarchy. Result: 1000× speedup, 1-2 ms typical query on a continent.</p>
+<h3>8.4 Customizable CH (CCH)</h3>
+<p>Pre-compute hierarchy <i>structure</i> independent of weights; "customisation" stage applies fresh weights in ~5 s. Lets us push live-traffic edge factors and re-customise every 1-2 minutes — keeps CH valid under dynamic weights.</p>
+<h3>8.5 Turn restrictions</h3>
+<p>Edge-based graph: nodes become (edge, turn) pairs. Doubles graph size; required for "no left turn" rules. Done before CH.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Cross-continent routes:</b> overlay graph of 5 K border nodes; CCH within each continent + Dijkstra on overlay.</li>
+  <li><b>Customisation cost:</b> 5 s per continent every minute = continuous churn; we pipeline two graph copies (active + warming).</li>
+  <li><b>Memory bandwidth:</b> NUMA-aware allocation per socket; pin threads.</li>
+  <li><b>Long routes (NYC→LA):</b> CH search visits ~1 K shortcuts; still &lt; 10 ms.</li>
+  <li><b>Time-dependent routing:</b> store departure-time profiles per edge; query becomes time-dependent CH (TCH).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>CH (static weights)</td><td>1-2 ms, 1000× speedup</td><td>6 h pre-compute; weights frozen</td></tr>
+<tr><td>CCH (customisable)</td><td>Live traffic in 5 s</td><td>Slightly slower queries; more memory</td></tr>
+<tr><td>A* / ALT</td><td>Online, no pre-compute</td><td>200 ms p99; landmark choice tricky</td></tr>
+<tr><td>Edge-based graph</td><td>Real turn restrictions</td><td>2× graph size, 2× memory</td></tr>
+<tr><td>Region sharding</td><td>Horizontal scale</td><td>Cross-region stitching complexity</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage &amp; Retrieval — CSR layout = "log-structured-ish" sequential locality.</li>
+  <li>Ch. 6 Partitioning — geographic partitioning of the road graph; overlay for cross-shard.</li>
+  <li>Ch. 10 Batch Processing — nightly CH pre-compute as Spark job.</li>
+  <li>Ch. 11 Stream Processing — Kafka-driven traffic updates, CCH customisation as a stream job.</li>
+  <li>Ch. 7 Transactions — atomic graph swap with epoch counter (single-writer, many-readers).</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I always anchor the discussion at Dijkstra so we agree on correctness, then optimise — never lead with CH and bury the assumptions."</li>
+  <li>"The crucial nuance is monotone vs non-monotone weight changes; CH only handles the former, CCH handles arbitrary."</li>
+  <li>"For the MVP I'd use OSRM (open source, CH-based) on a single beefy box per continent — ship in a month, optimise in year 2."</li>
+  <li>"Best ML angle: predicting <i>arrival speed profile</i> per edge 30 min ahead and feeding it as forecasted weights."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Contraction Hierarchies (CH) — query algorithm</td>
+      <td>Plain Dijkstra on 400 M edges is ~10 s/query, bidirectional ~1 s, A*+ALT ~200 ms — none meet the 100 ms p99 at 400 K rps peak. CH precomputes shortcuts that cut visited nodes 1000× to 1-2 ms typical, fitting 80 GB/continent into RAM and serving ~3 K rps/core.</td>
+      <td>Plain Dijkstra (10 s); bidirectional Dijkstra (1 s); A* with great-circle heuristic (200 ms); Hub Labels (faster but 10× memory).</td>
+    </tr>
+    <tr>
+      <td>Customisable Contraction Hierarchies (CCH)</td>
+      <td>Pure CH freezes weights, but live traffic shifts edge times every minute. CCH separates structure pre-compute from a 5 s "customisation" pass that re-applies fresh weights, letting us push traffic factors continuously without redoing 6 h of preprocessing.</td>
+      <td>CH + edge multipliers only (breaks shortcut validity under non-monotone changes); recomputing CH from scratch (6 h, impossible per minute); A* online (200 ms, blows SLA).</td>
+    </tr>
+    <tr>
+      <td>ALT (A* + Landmarks + Triangle inequality)</td>
+      <td>Documented as a fallback for graphs too dynamic for CCH. Pre-computing distances from 16 landmarks lets the heuristic h(v,t)=max_l |d(l,v)−d(l,t)| satisfy admissibility, giving ~10× speedup over plain A* without preprocessing the entire hierarchy.</td>
+      <td>Plain A* (heuristic too weak across continents); CH (preprocessing inflexible); arc-flags (similar speedup, harder to update on traffic changes).</td>
+    </tr>
+    <tr>
+      <td>Bidirectional Dijkstra (foundation)</td>
+      <td>Halves visited nodes vs unidirectional and is the algorithmic foundation CH builds on. We keep it as the validation oracle: under static weights, CH must produce bit-exact results matching bidirectional Dijkstra — that test catches preprocessing bugs.</td>
+      <td>Unidirectional (2× slower); A* alone (heuristic-dependent); IDA* (memory wins don't matter when we have 80 GB RAM).</td>
+    </tr>
+    <tr>
+      <td>CSR (compressed sparse row) graph layout</td>
+      <td>Routing is memory-latency bound — every shortcut relax is a cache-line load. CSR packs neighbours sequentially so a ~5-neighbour-per-node iteration prefetches cleanly into L2; combined with 32-bit node IDs, the working set per query stays under 4 KB.</td>
+      <td>Adjacency-list-of-pointers (cache misses on every hop); adjacency matrix (1.6×10¹⁷ entries, impossible); halfedge mesh (overkill for 1D edges).</td>
+    </tr>
+    <tr>
+      <td>RocksDB + RAM (graph storage)</td>
+      <td>The routing graph is read-heavy and rarely mutated; RocksDB serves the cold-load path (initial mmap from SSD) while the hot CH-augmented graph stays in RAM as flat arrays. This split keeps cold-start under 60 s on a 80 GB shard while query path stays sub-ms.</td>
+      <td>Spanner (50-100 ms write latency, expensive); pure on-disk (kills query latency); LevelDB (single-writer bottleneck under preprocessing churn).</td>
+    </tr>
+    <tr>
+      <td>Spark (nightly CH preprocessing)</td>
+      <td>Computing CH on a continent's 400 M-edge graph takes ~6 h on a 32-core box. Spark parallelises the importance ordering and shortcut generation across hundreds of nodes, cutting wall time to ~1 h and integrating with the OSM-derived feature pipeline.</td>
+      <td>Single-node OSRM build (6 h, no parallelism); custom MapReduce (reinvent the wheel); Flink batch (less mature for graph algorithms).</td>
+    </tr>
+    <tr>
+      <td>Kafka + Flink (CCH customisation pipeline)</td>
+      <td>Probe aggregation produces edge_factor updates that must be customised into the CH every 1-2 min. Flink's keyed state per edge_id, exactly-once checkpoints, and integration with Kafka tiered storage give us replayable customisation without losing updates during a customiser restart.</td>
+      <td>Spark Streaming (microbatch latency); custom ZeroMQ pipeline (no exactly-once); Kinesis (1 MB/s/shard cap awkward at our scale).</td>
+    </tr>
+    <tr>
+      <td>Edge-based graph (turn restrictions)</td>
+      <td>"No left turn" rules cannot be expressed on node-based graphs. We expand each (edge, turn) into a node, doubling graph size to ~800 M edges, but enabling correct routing through real-world intersections — a non-negotiable correctness requirement.</td>
+      <td>Node-based with turn cost penalties (incorrect for hard restrictions); post-hoc filtering (route may not exist after filtering).</td>
+    </tr>
+    <tr>
+      <td>Atomic graph swap with epoch counter</td>
+      <td>CCH customisation produces a new edge_factor table every minute; query threads must see a consistent snapshot. A single-writer / many-readers epoch counter lets readers grab a stable pointer at query start and lets the writer atomically flip to the new graph without locking — DDIA Ch. 7 single-shot transactions.</td>
+      <td>Read-write locks (10s of µs added per query); double-buffered swap (2× memory at 80 GB cost); copy-on-write structures (complex for CSR).</td>
+    </tr>
+    <tr>
+      <td>Region sharding + overlay graph (cross-continent routes)</td>
+      <td>NYC→LA naively spans both NA shards' 80 GB graphs. We precompute pairwise CH distances for ~5 K boundary nodes; cross-region queries do CH within each continent + Dijkstra on the overlay, keeping query under 10 ms even for trans-continental paths.</td>
+      <td>Single global graph (320 GB+, doesn't fit); naive cross-region Dijkstra (seconds); transit-node routing (better but heavier preprocessing).</td>
+    </tr>
+    <tr>
+      <td>Time-dependent CH (TCH) — for departure-time queries</td>
+      <td>Rush-hour ETAs need departure-time-aware weights: a 9am edge in Manhattan is 3× slower than 3am. TCH stores piecewise-linear speed profiles per edge and runs CH against the time-dependent function — the only way to honour "depart at 5 PM Friday" correctly.</td>
+      <td>Static weights with rush-hour multiplier (loses intra-hour shape); per-hour CH copies (24× memory); rerouting at run-time (latency hit).</td>
+    </tr>
+    <tr>
+      <td>OSRM (MVP off-the-shelf)</td>
+      <td>Documented as the v1 path: open-source CH-based routing engine running on a single beefy box per continent ships in a month. We move custom only after proving real workload patterns — premature optimisation on routing engines wastes 6 months easily.</td>
+      <td>GraphHopper (similar, less driving-mode tuning); Valhalla (great for multimodal, slower for cars); custom from scratch (engineer-years).</td>
+    </tr>
+    <tr>
+      <td>NUMA-aware memory pinning</td>
+      <td>An 80 GB graph spans multiple NUMA sockets; uncontrolled allocation causes 2× memory-latency penalty on cross-socket loads. Pinning shards to local NUMA nodes and binding worker threads to the same socket keeps per-query CSR scans on local memory, recovering ~30% throughput.</td>
+      <td>Default OS allocator (cross-socket penalty); single-socket per node (limits throughput per box); larger boxes with single NUMA (rarely available, cost prohibitive).</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,195 @@
+<h1>Design Cold-start Recommender (new users / new items)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the cold-start path for a recommender that serves both new users (no history) and new items (no engagement signal) without degrading the For You experience. Targets: 1B users with ~5M new signups/day, 500M items with ~5M new uploads/day, sub-100 ms recommendation latency at 580K QPS, while ramping new items toward steady-state distribution within hours, not days.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>For new user: produce a personalized first-session feed using onboarding signals (locale, language, interests, device).</li>
+  <li>For new item: ensure exposure to a diverse exploration audience to gather initial labels.</li>
+  <li>Smooth handoff from cold-start path to steady-state two-tower stack as signal accrues.</li>
+  <li>Honor safety filters (age, region, integrity) on cold items.</li>
+  <li>Allow per-segment policies (e.g. teens get different exploration mix).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 under 100 ms even on the cold path.</li>
+  <li><b>Time-to-warm:</b> a new user has full personalization within 10 sessions; a new item has reliable CTR estimate within 1000 impressions.</li>
+  <li><b>Coverage:</b> at least 80% of new items receive 100 impressions in the first 24 hours.</li>
+  <li><b>Availability:</b> 99.95%; cold-start fallback always available.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>New users: 5M/day -&gt; 60/sec; first-session feed served from a precomputed catalog of trending-by-locale (1000 items per locale * 200 locales = 200K total).</li>
+  <li>New items/day: 5M; need average 100 free impressions each = 500M exploration impressions/day = 5800/sec, ~3% of total feed traffic.</li>
+  <li>Content embeddings on upload: 5M items * 200ms GPU = 1000 GPU-seconds, ~12 GPU nodes peak.</li>
+  <li>Cold-item index: 5M items * 2 days kept hot = 10M-vector "fresh" index; HNSW 5 GB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/recs/feed   {userId, ctx}     -> [items]
+   (router decides cold vs warm path)
+POST /v1/onboarding/interests  {userId, topicIds[]}
+GET  /v1/explore/budget/{itemId}       -> {remaining_impressions}
+POST /v1/coldstart/score   {userId, itemId} -> score    (internal)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">                [Rec Orchestrator]
+                       |
+            cold? -----+----- warm?
+              |                  |
+              v                  v
+   [Cold-start path]      [Two-tower + ranker]
+       |
+       +-- [Onboarding feature builder]
+       +-- [Content-based ANN (item-item)]
+       +-- [Trending-by-locale cache]
+       +-- [Exploration bandit (Thompson)]
+       |
+       v
+   [Safety filter] -> top-N -> client
+
+Item ingest:
+[Upload] -> [Content emb svc (GPU)] -> [Fresh ANN index]
+                                          |
+                                          +-> [Explore quota mgr]
+                                                (impressions budget per item)
+</div>
+<p>Walk-through: orchestrator inspects user signal (impressions in last 7d). If below threshold, takes cold path: builds embedding from declared interests + content-based item ANN + trending-by-locale, plus exploration injection. Otherwise warm path. Both paths share safety filter.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Onboarding profile (Redis)</h3>
+<pre>KEY  onboard:user:{userId}   VAL {locale, langs[], topicIds[], device, signupTs}
+                              TTL 30 days (or until promoted to full profile)</pre>
+<h3>7.2 Trending-by-locale (precomputed)</h3>
+<pre>KEY  trending:{locale}:{topic}  VAL [itemId,score][] top-1000  TTL 15 min
+Job: streaming top-K maintained in Flink with sliding 1-hour window.</pre>
+<h3>7.3 Exploration budget (Cassandra)</h3>
+<pre>CREATE TABLE explore_budget (
+  item_id uuid PRIMARY KEY,
+  budget_remaining counter,         -- decrement on impression
+  cold_until timestamp);
+TTL 48h after item upload.</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 New-user path</h3>
+<p>User embedding bootstrapped as average of clicked-interest topic embeddings. Retrieval: content-based ANN (item content tower trained from hashtags/audio/visual, no engagement signal needed). Re-ranked by a meta-learning model (MAML-flavored) trained to fit thin-history users in a few gradient steps. Switches to standard two-tower after 50 engagement events.</p>
+<h3>8.2 New-item path</h3>
+<p>Two-stage exploration. Stage 1 (first 100 impressions): random injection into ~5% of feed slots for matched-locale users. Stage 2 (next 900 impressions): Thompson-sampling bandit on the cold item with prior from content-based predicted CTR. After 1000 impressions, item enters main two-tower index.</p>
+<h3>8.3 Handoff logic</h3>
+<p>Per-user cold flag falls when (engagements &gt;= 50) AND (sessions &gt;= 5). Per-item cold flag falls when (impressions &gt;= 1000) OR (age &gt; 48h). A shadow log compares cold-path predictions to warm-path on borderline users to detect handoff regressions.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Bot abuse of exploration budget:</b> rate-limit, weight by user trust score; otherwise spammers steal cold-start surface.</li>
+  <li><b>Locale skew:</b> long-tail locales have thin trending caches; fall back to language-level.</li>
+  <li><b>Onboarding bias:</b> declared interests rarely predict real engagement; weight engagement signals stronger after first session.</li>
+  <li><b>Fairness:</b> exploration budget must not over-favor large creators; per-creator cap of 1000 free impressions/day.</li>
+  <li><b>Latency on cold path:</b> content-based ANN over full corpus is expensive; restrict to fresh + trending shards.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Onboarding interests</td><td>Cheap, immediate signal</td><td>Stated != revealed preferences</td></tr>
+<tr><td>Random exploration</td><td>Unbiased estimator</td><td>Hurts session metrics</td></tr>
+<tr><td>Thompson bandit</td><td>Faster convergence</td><td>Needs prior calibration</td></tr>
+<tr><td>Content tower</td><td>Works on day 0</td><td>Misses collab patterns</td></tr>
+<tr><td>Soft handoff</td><td>Stable transition</td><td>Two pipelines to maintain</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — Flink maintains trending-by-locale top-K with sliding windows.</li>
+  <li>Ch. 10 Batch Processing — nightly retraining of content tower and meta-learner over Iceberg event log.</li>
+  <li>Ch. 7 Transactions — exploration-budget decrement uses Cassandra counters; tolerable inconsistency.</li>
+  <li>Ch. 12 Future of Data Systems — feedback loops in recommenders amplify bias if cold-start is mistuned.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Cold-start is two problems with one name. New users need warm content; new items need warm audiences. The pipelines are different."</li>
+  <li>"Free exploration is a tax the warm system pays so the catalog stays alive. I'd budget it explicitly, around 3-5% of feed slots."</li>
+  <li>"The biggest mistake is conflating onboarding-stated interests with engagement signal. They diverge fast."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>HNSW (fresh ANN index)</td>
+      <td>Cold-item index is small (~10M vectors over 2 days kept hot, 5 GB) but needs &gt;0.95 recall and zero training step so newly-uploaded items are searchable in minutes; HNSW's incremental insert is ideal vs IVF-PQ which requires periodic retrain on the centroids.</td>
+      <td>FAISS IVF-PQ (centroid retrain hurts freshness); brute force (5 GB scan too slow at 580K QPS).</td>
+    </tr>
+    <tr>
+      <td>Content tower (no engagement signal)</td>
+      <td>5M new items/day have zero engagement labels on day 0; a tower trained on hashtags/audio/visual produces a usable embedding from upload metadata alone, the only viable retrieval source for items in their first 100 impressions.</td>
+      <td>Collaborative filtering (no signal until labels arrive); pure popularity (kills personalization).</td>
+    </tr>
+    <tr>
+      <td>Thompson Sampling bandit</td>
+      <td>Stage-2 exploration (impressions 100-1000) needs to converge a CTR estimate fast on each cold item; Thompson is regret-optimal with content-derived prior (Beta(alpha,beta) seeded from predicted CTR), beating epsilon-greedy on time-to-warm.</td>
+      <td>Epsilon-greedy (wastes pulls); UCB (similar; TS picked for natural Bayesian prior integration).</td>
+    </tr>
+    <tr>
+      <td>MAML-style meta-learner</td>
+      <td>New users with &lt;50 events have too thin a history for the 200-feature DLRM ranker to fit; meta-learning trained to adapt in a few gradient steps gives reasonable scores on 5-event users where the warm model would overfit or default.</td>
+      <td>Warm model with default features (severe quality drop); pure popularity (ignores onboarding signal).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink (trending top-K)</td>
+      <td>Trending-by-locale with sliding 1-hour window across 200 locales must refresh every 15 minutes; Flink's keyed sliding-window aggregation per (locale, topic) maintains top-1000 lists in stream with bounded state, cited per DDIA Ch.11.</td>
+      <td>Spark Streaming (micro-batch coarser than 1-min refresh); Kafka Streams (sliding-window state larger).</td>
+    </tr>
+    <tr>
+      <td>Redis (onboarding profile + trending cache)</td>
+      <td>200 locales * 1000 trending items + 5M new users/day onboarding state: small footprint, sub-1ms read needed inside the 100ms cold-path budget. TTL 30 days on onboarding lets state auto-expire when promoted to full profile.</td>
+      <td>Memcached (no native cluster mode); DynamoDB (10ms tail violates budget).</td>
+    </tr>
+    <tr>
+      <td>Cassandra (exploration budget)</td>
+      <td>5M new items/day each tracking impression budget with per-impression decrement at peak rates needs a counter primitive that tolerates partition tolerance over strict consistency; Cassandra counters with TTL 48h are a textbook fit per DDIA Ch.7.</td>
+      <td>Redis INCR (no auto-TTL on counters cleanly); DynamoDB atomic counters (cost at this write rate).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka</td>
+      <td>5M new uploads/day stream into the embedding service; partitioned by item_id so the embedding GPU pool consumes evenly across 12 nodes during peak. Decision/reward events for the bandit also flow through Kafka for replay.</td>
+      <td>Kinesis (per-shard cap); SQS (no replay, no partition order).</td>
+    </tr>
+    <tr>
+      <td>NVIDIA T4 GPUs (embedding service)</td>
+      <td>5M items/day * 200ms inference = 1000 GPU-seconds, 12 T4 nodes peak; T4's INT8 path doubles throughput vs FP16 for content-tower inference and is cost-optimal at this rate vs A100.</td>
+      <td>A100 (overprovisioned for 60 items/sec); CPU (would need 300+ nodes).</td>
+    </tr>
+    <tr>
+      <td>Apache Spark (nightly retraining)</td>
+      <td>Content tower and meta-learner retrain over the Iceberg event log nightly; Spark's wide shuffles handle the 30-day join between new-item content features and accrued engagement labels, per DDIA Ch.10.</td>
+      <td>Beam (vendor lock); ad-hoc Python (cannot scale to PB-level joins).</td>
+    </tr>
+    <tr>
+      <td>Apache Iceberg on S3</td>
+      <td>Long-term event log for nightly content-tower training plus shadow-log comparisons at handoff boundaries; Iceberg's schema evolution lets us add new content features (audio fingerprints, etc.) without rewriting history.</td>
+      <td>Raw Parquet (no atomic commits); Hudi (similar; Iceberg picked for engine neutrality).</td>
+    </tr>
+    <tr>
+      <td>Bloom filter (already-seen on cold path)</td>
+      <td>Even cold-path users must not see duplicates; the per-user 12 KB bloom from the warm pipeline is reused so handoff is seamless and the cold path doesn't ship a parallel dedupe structure.</td>
+      <td>Exact set (10x memory); no dedupe (hurts session metrics on returning cold users).</td>
+    </tr>
+    <tr>
+      <td>Per-creator rate limiter</td>
+      <td>Exploration budget at 500M free impressions/day must not over-favor large creators; a token-bucket rate limiter at 1000 free impressions/day per creator enforces fairness without rejecting all of a hot creator's uploads.</td>
+      <td>No cap (large-creator monopoly); strict equal split (under-utilizes budget on quality creators).</td>
+    </tr>
+  </tbody>
+</table>

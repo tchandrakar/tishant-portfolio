@@ -1,0 +1,71 @@
+<h1>Distributed transactions: 2PC, Saga, Outbox</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">transactions</span>
+  <span class="tag">saga</span>
+  <span class="tag">outbox</span>
+  <span class="tag">2pc</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>A single-database transaction is easy: BEGIN, do stuff, COMMIT, all-or-nothing. Once your "transaction" spans two services or two databases, atomicity stops being free. Three patterns dominate how real systems get out of this hole: <b>two-phase commit (2PC)</b> coordinates a synchronous all-or-nothing across participants, <b>Saga</b> replaces the rollback with explicit compensating actions, and the <b>Outbox</b> pattern guarantees that "DB write + message publish" happens together by sneaking the message into the same DB transaction.</p>
+
+<h2>Why it matters</h2>
+<p>Every microservice system eventually needs "create order AND charge card AND reserve inventory AND send email" to behave like one operation. Get this wrong and you get ghost charges, double-shipped orders, or rows that swear an event was published when it never was. These three patterns are the toolkit; choosing between them is a tradeoff of latency, blast radius, and operational complexity.</p>
+
+<h2>Two-phase commit (2PC)</h2>
+<p>A coordinator asks every participant: "can you commit?" — phase 1 (prepare). If all say yes, it tells everyone "commit" — phase 2. If any says no, "abort". Strong: real atomic semantics. Weak: <b>blocking</b> — if the coordinator dies after participants prepared, they hold locks until it returns. Latency = max(participants) × 2 round trips.</p>
+<ul>
+  <li><b>Use it:</b> small fixed set of participants, same data center, low rate, when you genuinely need ACID across services (rare).</li>
+  <li><b>Don't use it:</b> across the public internet, with flaky participants, or above ~100 tps.</li>
+</ul>
+
+<h2>Saga</h2>
+<p>A saga is a sequence of local transactions where each step has a compensating action. If step 4 fails, you run compensations for steps 3, 2, 1 in reverse. There are two flavors: <b>orchestration</b> (a central state machine drives the steps) and <b>choreography</b> (each service reacts to the previous step's event). No locks, no coordinator outage — but you give up isolation: other transactions can see intermediate state.</p>
+<ul>
+  <li><b>Use it:</b> long-running business workflows (booking a trip, onboarding a customer), cross-service flows where blocking is unacceptable.</li>
+  <li><b>Watch out for:</b> compensation isn't always possible (you can't un-send an email). Design idempotent steps and "semantic" compensations (refund instead of un-charge).</li>
+</ul>
+
+<h2>The Outbox pattern</h2>
+<p>Problem: you want to "update the orders table AND publish OrderCreated to Kafka" atomically. Two systems, two failure modes. Outbox solves it by writing the event into an <code>outbox</code> table in the <i>same DB transaction</i> as the order. A separate poller (or CDC stream like Debezium) reads the outbox and publishes to the broker, marking rows as sent. The event is never lost and never published without the row.</p>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  2PC                          Saga (orchestrated)            Outbox
+  coord ──prepare──► A,B,C     orch ──step1──► svc A           tx{
+        ◄──yes/no───            ◄──ok──                          INSERT order;
+        ──commit/abort─►        ──step2──► svc B                 INSERT outbox;
+                                ◄──fail──                       }
+   blocks if coord dies         compensate step1                relay → broker
+   strong atomicity             eventual + idempotent           at-least-once
+</div>
+
+<h2>How to choose</h2>
+<ul>
+  <li><b>Need real atomicity, few participants, ok with locks?</b> 2PC.</li>
+  <li><b>Long workflow, need to stay available, ok with eventual + compensations?</b> Saga.</li>
+  <li><b>Just need "DB write + event publish" to be reliable?</b> Outbox. (Often combined with Saga.)</li>
+  <li><b>Truly stateless cross-service writes?</b> Often you don't need a transaction at all — just idempotent retries.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Reaching for 2PC across services when a Saga + Outbox would do, then watching the system stall whenever the coordinator hiccups.</li>
+  <li>Writing compensations that aren't idempotent — replays double-refund customers.</li>
+  <li>Publishing to Kafka first, then writing the DB. If the DB write fails, you've leaked a phantom event.</li>
+  <li>Forgetting to mark outbox rows processed atomically — the relay republishes on restart and downstream sees duplicates without dedup.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> A checkout flow needs to: (1) charge the card, (2) decrement inventory, (3) create the order row, (4) send confirmation email. Each is a different service. Sketch the transaction strategy — which pattern, what are the compensations, where does the outbox live?
+  <br/>
+  <b>Hint:</b> An orchestrated saga over (charge → reserve → create → email), with the orchestrator's state in its own DB and an outbox in the order service for the OrderCreated event. Compensation for charge is refund; for inventory is release; email has no rollback so it goes last.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-paypal">Design PayPal</a> — saga + outbox for payment workflows that span ledgers.</li>
+  <li><a href="#problem/design-idempotent-payments">Design idempotent payments</a> — why outbox + idempotency keys go together.</li>
+  <li><a href="#problem/design-ecommerce-checkout">Design e-commerce checkout</a> — the canonical multi-service saga.</li>
+</ul>

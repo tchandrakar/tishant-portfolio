@@ -1,0 +1,169 @@
+<h1>Design SoundCloud (UGC audio + waveform)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">audio-streaming</span>
+  <span class="tag">file-storage</span>
+  <span class="tag">social-network</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design SoundCloud, a user-generated-content audio platform where any creator (DJ, podcaster, musician) uploads tracks, others stream/comment/repost. Distinct from Spotify: there is no curated label catalog &mdash; the catalog is the upload pipeline. The signature feature is an interactive waveform with timestamped comments. The system must handle high-throughput uploads (long DJ sets up to 6 hours), efficient transcoding to multiple formats, abuse and copyright detection (audio fingerprinting), social graph (follow/repost), and a "Stream" timeline of recent posts from followed users.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Upload audio (MP3, WAV, FLAC, up to 4 GB / 6 hours).</li>
+  <li>Server-side transcode to streaming formats; auto-generate waveform PNG/JSON.</li>
+  <li>Stream tracks with adaptive bitrate; embeddable player on third-party sites.</li>
+  <li>Timestamped comments anchored to waveform position.</li>
+  <li>Like, repost, follow, share to social.</li>
+  <li>Personalized "Stream" timeline of new posts from followed creators.</li>
+  <li>Search by track, user, tag.</li>
+  <li>Copyright fingerprint scan on every upload.</li>
+  <li>Creator analytics: plays, geo, referrers.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> first byte under 250ms; waveform JSON under 100ms.</li>
+  <li><b>Scale:</b> 175M MAU, 30M creators, 12 hours of audio uploaded per minute.</li>
+  <li><b>Availability:</b> 99.95% playback; 99.9% upload.</li>
+  <li><b>Durability:</b> 11 nines for original uploads; transcodes are reproducible.</li>
+  <li><b>Fairness:</b> small creators must surface in feeds; not a winner-take-all algorithm.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Uploads:</b> 12 hours/min &times; 60 = 720 hr/hr = 17K hr/day &times; ~50MB/hr (192kbps WAV/MP3 mix average post-trim) = ~850 GB/day raw + 3 transcodes ~3.4 TB/day.</li>
+  <li><b>Catalog:</b> 320M tracks, ~2 PB raw, ~6 PB total with transcodes.</li>
+  <li><b>Daily plays:</b> 80M DAU &times; 15 plays = 1.2B plays/day = ~14K plays/sec avg, 60K peak.</li>
+  <li><b>Egress:</b> 1.2B &times; ~3MB avg = 3.6 PB/day.</li>
+  <li><b>Comments:</b> 80M DAU &times; 0.5 comments/day = 40M/day = ~500 writes/sec.</li>
+  <li><b>Stream timeline:</b> avg 80 follows; fanout-on-write = 40M posts &times; 80 = 3.2B inserts/day &mdash; too many; use hybrid (see below).</li>
+  <li><b>Fingerprint scans:</b> 720K uploads/day, ~1 sec CPU per minute of audio.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/upload/init        {filename, sizeBytes}      -&gt; {uploadId, partUrls[]}
+PUT   {partUrl} (S3 multipart)
+POST  /v1/upload/complete    {uploadId, parts[]}        -&gt; {trackId, status:'transcoding'}
+GET   /v1/tracks/{id}                                   -&gt; {meta, waveformUrl, streamUrl}
+GET   /v1/tracks/{id}/waveform                          -&gt; PNG or JSON samples[]
+POST  /v1/tracks/{id}/comments {posMs, body}            -&gt; {commentId}
+POST  /v1/tracks/{id}/like                              -&gt; 204
+POST  /v1/tracks/{id}/repost                            -&gt; 204
+GET   /v1/me/stream?cursor=                             -&gt; {posts[], nextCursor}
+GET   /v1/search?q=&amp;type=                               -&gt; {tracks, users}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Creator] --multipart--&gt; [S3 Upload Bucket] --event--&gt; [Transcode Workers (FFmpeg on K8s)]
+                                                          |
+                                                          +--&gt; [S3 Streaming Bucket] (HLS variants)
+                                                          +--&gt; [Waveform Generator] -- [S3 waveform JSON]
+                                                          +--&gt; [Fingerprint Svc] -- [Postgres index]
+                                                          +--&gt; emit Kafka 'track_published'
+
+[Listener] --&gt; [CDN] -- audio -- [S3 Streaming]
+              |
+              +--&gt; [API GW] --&gt; [Track Svc] -- [Cassandra: track meta]
+                              --&gt; [Comment Svc] -- [Cassandra: comments by track]
+                              --&gt; [Social Svc]   -- [Postgres: graph]
+                              --&gt; [Feed Svc]     -- [Redis: pre-built timelines]
+                              --&gt; [Search Svc]   -- [Elasticsearch]
+</div>
+<p>Walk-through: creator uploads multipart to S3, S3 event triggers a transcode job that emits 4 HLS renditions + a waveform JSON (1024 peaks per minute). When done, a Kafka event lands; the Feed service decides per-follower whether to fanout (active followers) or leave in pull-on-read (inactive). Fingerprint runs in parallel; on positive match the track is shadow-banned pending review.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Track metadata (Cassandra)</h3>
+<pre>CREATE TABLE tracks (
+  track_id timeuuid PRIMARY KEY,
+  user_id bigint, title text, tags set&lt;text&gt;,
+  duration_ms int, hls_master_url text, waveform_url text,
+  visibility text, created_at timestamp
+);
+CREATE TABLE user_tracks (
+  user_id bigint, created_at timestamp, track_id timeuuid,
+  PRIMARY KEY (user_id, created_at, track_id)
+) WITH CLUSTERING ORDER BY (created_at DESC);</pre>
+<h3>7.2 Comments (Cassandra, partitioned by track_id)</h3>
+<pre>CREATE TABLE comments (
+  track_id timeuuid, pos_ms int, comment_id timeuuid,
+  user_id bigint, body text,
+  PRIMARY KEY (track_id, pos_ms, comment_id)
+);</pre>
+<h3>7.3 Social graph (PostgreSQL, sharded)</h3>
+<pre>follows(follower_id, followee_id, created_at) -- bi-directional indexes</pre>
+<h3>7.4 Feed/timeline (Redis)</h3>
+<pre>ZSET feed:{user_id}  score=created_at_ms  member=track_id
+Trim to 5000 entries, TTL 30 days for inactive users.</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Upload + transcode pipeline</h3>
+<p>Resumable multipart S3 upload with 5MB parts. On <code>/upload/complete</code> a Kafka job dispatches FFmpeg workers (K8s autoscaled on queue depth). Outputs: HLS at 64/128/256kbps AAC + master MP3. Transcoding for a 1-hour track ~3 minutes on a c6i.2xlarge. Idempotent on <code>upload_id</code>.</p>
+<h3>8.2 Waveform generation</h3>
+<p>FFmpeg pipes raw PCM into a downsampler that emits 1024 peak amplitudes per minute, packed as a JSON array (or a 1px-tall PNG for cheap rendering). Stored to S3, served via CDN, ~5KB per track.</p>
+<h3>8.3 Hybrid feed (fanout)</h3>
+<p>Pure fanout-on-write at 3.2B/day is too expensive. Hybrid: active users (logged in past 7 days) get fanout-on-write; inactive users get fanout-on-read at next login (gather posts from N most-recently followed). Celebrity accounts (&gt;100K followers) skip fanout entirely &mdash; readers pull their content via a separate "celebrity timeline merge" at read time.</p>
+<h3>8.4 Audio fingerprinting</h3>
+<p>Chromaprint-style: extract 30s sliding chromagram, hash to 32-bit codes, query a fingerprint index (Postgres + GIN, 50M reference fingerprints from majors). Match threshold = 70% overlap. Positive matches go to a manual review queue + revenue share to rights holder via ContentID-style flow.</p>
+<h3>8.5 Timestamped comments</h3>
+<p>Comments are partitioned by <code>track_id</code> with <code>pos_ms</code> as clustering key, so a <code>SELECT WHERE track_id = ? ORDER BY pos_ms</code> returns the entire timeline in one query. Client renders dots above the waveform in O(N) on draw.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Transcode queue surge:</b> autoscale on Kafka lag; spot instances for ~70% cost cut.</li>
+  <li><b>Hot tracks (going viral):</b> CDN absorbs; pre-shard popular HLS playlists across 10 cache keys.</li>
+  <li><b>Feed celebrity fanout:</b> hybrid avoids 100M-write hits when a megastar posts.</li>
+  <li><b>Fingerprint hot index:</b> shard by hash prefix; in-memory bloom filters cut 80% of negative lookups.</li>
+  <li><b>Comment hot tracks:</b> rate-limit + Redis write-buffer; flush in batches to Cassandra.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Hybrid fanout (write+read)</td><td>Bounded write cost</td><td>Complex code, harder to reason about</td></tr>
+<tr><td>Cassandra for comments</td><td>Predictable reads ordered by pos_ms</td><td>Tombstones if mass-deletes</td></tr>
+<tr><td>Async fingerprinting</td><td>Fast publish</td><td>Track may be playable before takedown</td></tr>
+<tr><td>HLS over progressive MP3</td><td>Adaptive, embed-friendly</td><td>More files, more CDN keys</td></tr>
+<tr><td>Server-side waveform</td><td>Consistent rendering</td><td>~5KB extra per track in storage</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — Cassandra QUORUM reads for comments to tolerate node loss.</li>
+  <li>Ch. 6 Partitioning — clustering keys for feed-by-user, comments-by-track ordering.</li>
+  <li>Ch. 7 Transactions — Postgres txn for follow/unfollow + counter updates.</li>
+  <li>Ch. 11 Stream Processing — Kafka 'track_published' fans out to feed builders, search indexers, fingerprinters.</li>
+  <li>Ch. 12 Future of Data Systems — derived data: search index and feed are read-models built from the canonical event log.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"UGC platforms live or die on the upload-to-publish latency &mdash; I'd target &lt;60s for a 5-min track and surface a 'processing' state in UI rather than blocking."</li>
+  <li>"Hybrid fanout is the only feed strategy that survives both Justin Bieber and a million inactive users; pure pull or pure push fails one extreme."</li>
+  <li>"Copyright is the existential business risk. I'd treat fingerprint as a first-class pipeline with SLAs and human review, not a side-job."</li>
+  <li>"For embeds on third-party sites, CSP and CORS get nasty &mdash; I'd ship a sandboxed iframe player with a stable cross-origin postMessage API."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Cassandra</b></td><td>320M tracks and 40M comments/day need cheap append-mostly writes; partitioning comments by <code>track_id</code> with <code>pos_ms</code> as clustering key returns the entire timestamped timeline in one CQL slice — a perfect fit for the waveform-comments UI.</td><td>DynamoDB — vendor lock and 400KB item limit awkward; HBase — heavier ops</td></tr>
+    <tr><td><b>PostgreSQL</b></td><td>Social graph (follow/unfollow) and counter updates need ACID semantics so a failed unfollow can't leave dangling rows; sharding by user_id keeps each shard manageable and bi-directional indexes serve both "who I follow" and "my followers" cheaply.</td><td>Cassandra — no transactional follow+counter update; Neo4j — overkill for our graph depth</td></tr>
+    <tr><td><b>Redis</b></td><td>Pre-built feed timelines as ZSETs scored by <code>created_at_ms</code> serve "Stream" reads in &lt;5ms; trim to 5000 entries per user with 30-day TTL bounds memory, and the same instances buffer comment writes for batch flush to Cassandra.</td><td>Memcached — no sorted sets; in-process LRU — no cross-server consistency</td></tr>
+    <tr><td><b>S3</b></td><td>2 PB raw uploads and 6 PB transcoded variants need 11-nines durability plus multipart upload (5 MB parts) for resumable 4 GB uploads on flaky creator connections; S3 events trigger transcoding without a poller.</td><td>GCS — fine but AWS gravity; self-hosted MinIO — capex at PB scale</td></tr>
+    <tr><td><b>S3 Multipart Upload</b></td><td>Long DJ sets up to 4 GB / 6 hours need resumable upload — a dropped Wi-Fi at 90% can't restart from zero; 5 MB part size balances retry granularity vs request overhead and parallel parts max out creator uplink.</td><td>tus protocol on custom servers — re-implementing S3; single PUT — fails on large files</td></tr>
+    <tr><td><b>FFmpeg on Kubernetes</b></td><td>720K transcode jobs/day with bursty arrival need autoscaling on Kafka lag; K8s with HPA on queue depth plus spot-instance node pools cuts ~70% on compute cost — a 1-hour track transcodes in ~3 min on c6i.2xlarge.</td><td>AWS MediaConvert — 5x more expensive at our scale; Lambda — 15-min timeout kills 6-hour DJ sets</td></tr>
+    <tr><td><b>Kafka</b></td><td><code>track_published</code> events fan out to feed builders, search indexers, and fingerprinters — a single log lets each pipeline evolve and replay; partitioning by <code>track_id</code> distributes work evenly across consumer groups.</td><td>RabbitMQ — no replay for backfilling search index; Kinesis — vendor lock</td></tr>
+    <tr><td><b>Elasticsearch</b></td><td>Full-text search over 320M tracks plus user/tag suggestions needs an inverted index with completion suggester; near-real-time indexing (1s refresh) means newly published tracks are searchable almost immediately, important for creator UX.</td><td>Solr — weaker cloud autoscaling; Algolia — cost prohibitive at this catalog size</td></tr>
+    <tr><td><b>Postgres + GIN (fingerprint index)</b></td><td>Chromaprint hashes need fast set-overlap lookup over 50M reference fingerprints; Postgres GIN indexes on <code>int[]</code> hash arrays handle this naturally, and the fingerprint team already operates Postgres so no new infra.</td><td>Custom locality-sensitive hash store — reinventing; Elasticsearch — weaker for set overlap</td></tr>
+    <tr><td><b>Bloom filters</b></td><td>80% of fingerprint queries miss (long-tail unique uploads); per-shard in-memory bloom filters reject negatives before hitting Postgres, cutting GIN load by 5x with negligible false-positive cost (re-check is cheap).</td><td>No prefilter — Postgres saturates; cuckoo filter — marginal gain at higher complexity</td></tr>
+    <tr><td><b>HLS</b></td><td>Adaptive bitrate (64/128/256 kbps AAC) over <code>HLS</code> is required for embed players on third-party sites with mixed network quality; Apple devices need HLS natively and modern players support it everywhere via hls.js.</td><td>Progressive MP3 — no adaptive switching; <code>DASH</code> — second player needed for iOS</td></tr>
+    <tr><td><b>CDN</b></td><td>3.6 PB/day egress with viral track surges (a track on TikTok can 100x in hours) needs edge absorption; pre-sharding popular HLS playlists across 10 cache keys spreads load across edge nodes and prevents single-key thundering herds.</td><td>Origin-only — saturates on viral; single cache key — hot-spot bottleneck</td></tr>
+    <tr><td><b>Chromaprint</b></td><td>Industry-standard 32-bit chromagram hashes are robust to compression, EQ, and pitch tweaks — the exact attack surface uploaders use to evade copyright; the open-source library means no per-scan licensing fee at 720K daily uploads.</td><td>AcoustID licensed API — per-call cost; custom CNN fingerprint — unproven at our scale</td></tr>
+    <tr><td><b>WebSocket / postMessage</b></td><td>Embeddable player on third-party domains needs a stable cross-origin API for play/pause and progress events; <code>postMessage</code> over a sandboxed iframe is the only mechanism that works under modern CSP without exposing tokens.</td><td>JSONP — deprecated, leaks tokens; Flash — dead</td></tr>
+  </tbody>
+</table>

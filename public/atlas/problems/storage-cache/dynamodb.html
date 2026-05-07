@@ -1,0 +1,198 @@
+<h1>Design DynamoDB-style KV store (consistent hashing, vector clocks, gossip)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">storage-cache</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a Dynamo-style, AP, leaderless key-value store: always-writable, multi-DC, single-digit ms latency, with tunable consistency via N/R/W quorums. Deliver 10M+ ops/sec, p99 1-Pearl ms reads inside region, durable with 3x replication, and self-healing via hinted handoff, read-repair, and Merkle-tree anti-entropy.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Operations: put(key, ctx, value), get(key) → {value, ctx}, delete(key, ctx).</li>
+  <li>Tunable N (replicas), R (read quorum), W (write quorum).</li>
+  <li>Conflict resolution via vector clocks; client receives siblings on read.</li>
+  <li>Membership via gossip + seed nodes; no central coordinator.</li>
+  <li>Multi-region async replication with optional CRDT counters.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 1 ms, p99 5 ms intra-region with N=3, R=W=2.</li>
+  <li><b>Availability:</b> 99.999% — accept writes during partial partitions (AP from CAP).</li>
+  <li><b>Durability:</b> 11 nines via cross-AZ replicas + commit-log replication.</li>
+  <li><b>Throughput:</b> 200k ops/sec/node, 500-node ring = 100M ops/sec.</li>
+  <li><b>Object size:</b> &lt; 400 KB (Dynamo limit).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>5B keys * 1 KB = 5 TB raw, *3 replicas = 15 TB; 50 nodes * 300 GB SSD covers it with headroom.</li>
+  <li>Write QPS: 1M peak * 3 (replication factor) = 3M physical writes/s.</li>
+  <li>Gossip overhead: O(log N) rounds * 1 KB packet = ~100 KB/s/node at 500 nodes.</li>
+  <li>Anti-entropy: Merkle leaf = 4 KB hash per partition; 1024 partitions * 32 B = 32 KB tree, sync once per minute.</li>
+  <li>Hinted handoff backlog: 10 min outage * 100k writes/s/node = 60M hints * 1 KB = 60 GB local SSD reserved.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>PUT /v1/{key}    body=value, headers: X-Vclock, X-W=2, X-N=3 → 200 + new vclock
+GET /v1/{key}    headers: X-R=2                 → 200 value | 300 [siblings] | 404
+DEL /v1/{key}    body=tombstone, X-Vclock       → 204
+ADMIN gossip /ring → ring view JSON
+ADMIN repair /key-range &lt;low,high&gt; → triggers Merkle sync</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">           coordinator (any node)
+                │
+   client ─────►│  hash(key) → token range → preference list [A,B,C]
+                │
+        ┌───────┼─────────────┐
+        ▼       ▼             ▼
+   ┌────────┐┌────────┐┌────────┐    gossip mesh (every 1s)
+   │ Node A ││ Node B ││ Node C │◄──────────────────────────►others
+   │ vnodes ││ vnodes ││ vnodes │
+   │ commit ││ commit ││ commit │
+   │ log    ││ log    ││ log    │
+   │ memTbl ││ memTbl ││ memTbl │  → flush → SSTables → compaction
+   │ hints  ││ hints  ││ hints  │
+   └────────┘└────────┘└────────┘
+   Anti-entropy: per-range Merkle tree, exchange root hashes hourly.
+</div>
+<p>Any node can coordinate. It computes the preference list (next N healthy nodes on the ring), forwards to all N, waits for W acks, returns. Reads fan out to N, return first R, repair stale replicas in background.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Per-node engine</h3>
+<pre>commit_log → memtable (skiplist, 64 MB) → SSTable (sorted, immutable)
+SSTables compacted via leveled (LCS) or size-tiered (STCS).
+Bloom filter per SSTable: ~10 bits/key, 1% FP.
+Index: sparse, every 128 KB.</pre>
+<p>Storage engine is LSM-tree (DDIA Ch.3 "SSTables and LSM-Trees"). Writes are sequential and crash-safe via WAL.</p>
+<h3>7.2 Vector clocks</h3>
+<pre>vclock = { (nodeA, 3), (nodeB, 5) }
+PUT with concurrent ancestor → store both siblings
+Client merges on next PUT, increments its own counter.</pre>
+<p>If clocks diverge → return both; client app does merge (last-write-wins, set union, CRDT, or business logic).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Consistent hashing with vnodes</h3>
+<p>Each physical node owns ~256 vnode tokens uniformly on the 2^160 SHA-1 ring (DDIA Ch.6 "Partitioning by Hash"). Add a node → it steals 1/N of tokens from each peer; rebalance moves only ~1/N of data.</p>
+<h3>8.2 Quorums &amp; consistency</h3>
+<p>R+W&gt;N gives strong-ish consistency (DDIA Ch.5 "Quorums for Reading and Writing"). Common: N=3, R=2, W=2. R=1, W=1 = max availability + lowest durability. Sloppy quorums (write to fallback nodes during partition) trade C for A.</p>
+<h3>8.3 Failure handling</h3>
+<p><b>Hinted handoff:</b> if replica B is down, coordinator stores write at fallback D with hint "for B"; D replays when B is back. <b>Read-repair:</b> on read, divergent versions trigger background PUT of newest. <b>Anti-entropy:</b> Merkle-tree compare per partition range; sync deltas only.</p>
+<h3>8.4 Multi-region</h3>
+<p>Per-region ring + async cross-region replication via mutation log shipping. CRDT counters for monotonic semantics; LWW for blob fields with NTP-skew window of 100 ms tolerated.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot partition:</b> single key getting 100k QPS; mitigate with adaptive replication factor (more vnodes for hot keys) or app-level shard suffix.</li>
+  <li><b>Compaction storm:</b> LCS doubles disk I/O; throttle with token bucket and prefer SSDs with &gt;500 MB/s write.</li>
+  <li><b>Gossip convergence:</b> O(log N) rounds; 1000 nodes converge in ~10s, acceptable.</li>
+  <li><b>Tombstone GC:</b> deletes leave tombstones for gc_grace_seconds (default 10 days); risk of resurrected deletes if a replica misses the tombstone.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Leaderless (Dynamo)</td><td>Always-writable, no failover</td><td>Conflict resolution leaks to app (DDIA Ch.5)</td></tr>
+<tr><td>Vector clocks</td><td>Detects true concurrency</td><td>Sibling explosion on misuse; size grows with actors</td></tr>
+<tr><td>LSM vs B-tree</td><td>Write-optimized, sequential I/O</td><td>Read-amp via bloom misses; compaction CPU/IO</td></tr>
+<tr><td>Sloppy quorum</td><td>Survives partitions</td><td>Stale reads; "monotonic reads" violated</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch.3 Storage and Retrieval — LSM-trees, SSTables, compaction strategies, bloom filters.</li>
+  <li>Ch.5 Replication — leaderless writes, quorums, sloppy quorums, read repair, anti-entropy.</li>
+  <li>Ch.6 Partitioning — consistent hashing with vnodes; secondary index strategies.</li>
+  <li>Ch.8 Trouble — partial failures, unreliable clocks, why timeouts matter.</li>
+  <li>Ch.9 Consistency — eventual consistency anomalies; why R+W&gt;N is not linearizable.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd default to N=3, R=W=2 for a good A/C balance, and switch to R=3, W=1 for read-mostly catalogs to halve write tail latency."</li>
+  <li>"Vector clocks are powerful but operationally expensive — modern Dynamo (DynamoDB) uses LWW + Paxos per key range, sacrificing some availability for simpler app logic."</li>
+  <li>"The biggest hidden cost is compaction; I'd separate disks for WAL and SSTables and monitor pending_compactions as a leading indicator."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>LSM-tree storage engine (RocksDB-style)</td>
+      <td>Sequential WAL + memtable flush sustains 200k writes/sec/node on commodity SSDs (DDIA Ch.3 SSTables and LSM-Trees). Random B-tree writes would saturate SSD IOPS at 1/4 the throughput. Compactions are predictable and tunable.</td>
+      <td>B-tree (random I/O bottleneck at 3M phys writes/s); append-only log (no efficient point reads).</td>
+    </tr>
+    <tr>
+      <td>Consistent hashing on 2^160 ring with vnodes (~256/node)</td>
+      <td>Adding a node steals 1/N tokens uniformly so only ~1/N of 5 TB data moves on rebalance (DDIA Ch.6). 256 vnodes/node smooths skew below 5% across 500 nodes — flat hash would have ~30% worst-case imbalance.</td>
+      <td>Range partitioning (manual splits, hot ranges); modulo hashing (full reshuffle on add).</td>
+    </tr>
+    <tr>
+      <td>SHA-1 partition hash</td>
+      <td>160-bit output gives uniform distribution across 500 nodes * 256 vnodes = 128k tokens with negligible collision risk. Cryptographic strength isn't required, but the wide output space prevents accidental clustering of related keys.</td>
+      <td>MurmurHash (32/64-bit, more collisions at 128k tokens); SHA-256 (slower, no upside).</td>
+    </tr>
+    <tr>
+      <td>Vector clocks for conflict detection</td>
+      <td>AP system means concurrent writes to the same key happen during partitions; vector clocks detect true concurrency vs causal ordering (DDIA Ch.5) so we can return siblings instead of silently losing data. Cap actor list at ~10 to avoid sibling explosion.</td>
+      <td>Last-Write-Wins on wallclock (silent data loss on skew); Lamport clocks (no concurrency detection).</td>
+    </tr>
+    <tr>
+      <td>Quorum reads/writes (R+W&gt;N)</td>
+      <td>N=3, R=W=2 gives "strong-ish" consistency: at least one read replica sees every committed write. Tunable per-call so read-mostly catalogs can use R=3,W=1 to cut write p99 in half (DDIA Ch.5 quorums for reading and writing).</td>
+      <td>Single-leader Paxos (CP, lower availability); R=W=N (no fault tolerance).</td>
+    </tr>
+    <tr>
+      <td>Sloppy quorum + hinted handoff</td>
+      <td>During AZ partition the coordinator writes to fallback node D with hint "for B"; D replays when B returns. Preserves availability during the most common failure mode (partial partition) — without it we'd reject writes and miss the 99.999% target.</td>
+      <td>Strict quorum (rejects writes during partition); leader leases (CP not AP).</td>
+    </tr>
+    <tr>
+      <td>Read-repair on read path</td>
+      <td>When R replicas return divergent versions, coordinator picks newest by vclock and async-PUTs to stale replicas. Costs a few extra writes per read but converges keys touched by user traffic — passively heals 90%+ of inconsistency without explicit repair runs.</td>
+      <td>No repair (drift accumulates); synchronous repair (read tail latency 2-3x).</td>
+    </tr>
+    <tr>
+      <td>Merkle-tree anti-entropy</td>
+      <td>Per-partition tree of hashes (~32 KB/range) lets two replicas compare just root hashes; only divergent subtrees ship over the wire. At 1024 partitions/node, full sync runs hourly and ships KB-not-GB — affordable on intra-region links.</td>
+      <td>Full SSTable diff (TBs over network); timestamp-based gossip (misses tombstones).</td>
+    </tr>
+    <tr>
+      <td>Bloom filter per SSTable (~10 bits/key)</td>
+      <td>1% false-positive rate eliminates 99% of SSTable disk reads on negative lookups. Without bloom, point reads at 200k QPS would scan all SSTable levels and miss the p99 5 ms budget. Cheap memory tradeoff at 10 bits/key.</td>
+      <td>No bloom (50x more disk reads); cuckoo filter (better FP, more complex).</td>
+    </tr>
+    <tr>
+      <td>Gossip protocol (1s rounds)</td>
+      <td>O(log N) rounds means 1000 nodes converge in ~10s — well within failover SLA (DDIA Ch.8). 1 KB packet * O(log N) is ~100 KB/s/node at 500 nodes, negligible bandwidth. Failure detection without a central coordinator (single point of failure).</td>
+      <td>ZooKeeper-based membership (extra dep, partition risk); SWIM (similar but custom).</td>
+    </tr>
+    <tr>
+      <td>Leveled Compaction (LCS) for hot keysets</td>
+      <td>Tighter read-amp (1-2 SSTables hit per lookup) preserves the p99 5 ms read at the cost of 2x write-amp. Right tradeoff for a read:write ratio &gt;1:1; throttle compaction with a token bucket so the compaction storm doesn't starve foreground I/O.</td>
+      <td>Size-tiered (lower write-amp, worse read-amp); time-window (only good for time series).</td>
+    </tr>
+    <tr>
+      <td>CRDT counters for cross-region</td>
+      <td>Counters merge commutatively (DDIA Ch.5 CRDTs) so multi-master writes during cross-region partition converge without conflict. Avoids vector-clock siblings on counters specifically — the most common "monotonic semantics" requirement at multi-region scale.</td>
+      <td>LWW counters (lost increments); Paxos counters (cross-region RTT every increment).</td>
+    </tr>
+    <tr>
+      <td>Async cross-region replication via mutation log shipping</td>
+      <td>NTP skew window of 100 ms tolerated on LWW blob fields. Async link saves the 50-150 ms cross-region RTT on the critical write path while still hitting durability (11 nines via cross-AZ + region archive).</td>
+      <td>Sync multi-region (latency too high); manual export/import (no continuous replication).</td>
+    </tr>
+    <tr>
+      <td>Tombstones with gc_grace_seconds (10d)</td>
+      <td>Deletes need to outlive the longest possible replica downtime; 10 days bounds resurrected-delete risk if a replica was offline. Trade: 10 days of tombstone disk overhead. We monitor tombstone density per partition since 10k+ tombstones/partition kills read latency.</td>
+      <td>Immediate purge (resurrects on stale replica catch-up); infinite tombstones (disk bloat).</td>
+    </tr>
+  </tbody>
+</table>

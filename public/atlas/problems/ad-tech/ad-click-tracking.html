@@ -1,0 +1,140 @@
+<h1>Design Ad Click Tracking (clickstream → idempotent counter)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ad-tech</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a click-tracking pipeline that ingests every ad click, deduplicates retries and replay attacks, filters bot traffic, attributes the click to the original auction, decrements the advertiser's budget, and emits accurate billing-grade aggregates. The pipeline must be idempotent end-to-end: a redirect retry, a Kafka rewind, or a downstream re-run must never double-count.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Click endpoint that issues a 302 redirect to the advertiser landing page.</li>
+  <li>Sign click URLs so they cannot be forged or replayed.</li>
+  <li>Deduplicate on (auctionId, userId) within a 24-hour window.</li>
+  <li>Bot filtering (signature-based + ML-based, both online and offline).</li>
+  <li>Decrement campaign budget; settle billing daily against the audit log.</li>
+  <li>Hourly and daily aggregates per campaign, ad-group, creative, geo.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> redirect p99 &lt; 50 ms (user is waiting on the browser).</li>
+  <li><b>Scale:</b> 100 B impressions/day, ~2 B clicks/day, ~25k clicks/sec peak.</li>
+  <li><b>Durability:</b> zero data loss on click; impressions sampled 100% but tolerant.</li>
+  <li><b>Accuracy:</b> billing aggregate within 0.01% of audit log.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 25k clicks/sec, 1.2 M impressions/sec.</li>
+  <li>Storage: 2 B clicks × 1 KB = 2 TB/day raw; 100 B impressions × 0.5 KB = 50 TB/day.</li>
+  <li>Kafka: 200 MB/s sustained on click topic, 5 GB/s on impression topic.</li>
+  <li>Dedup state: 2 B keys × 64 B = 128 GB Bloom filter (24 h TTL).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET  /clk?aid=...&amp;auc=...&amp;u=...&amp;sig=HMAC   → 302 to landing
+GET  /imp?aid=...&amp;auc=...&amp;u=...&amp;sig=HMAC   → 1×1 GIF
+POST /v1/click/replay  (internal)             → reprocesses from S3 with idempotency
+GET  /v1/reports/clicks?campaign=...&amp;range  → aggregated counts</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Browser] ─302──► [Click Edge (Go/Rust)] ──► [Kafka: click_raw]
+                       │ HMAC verify                  │
+                       ▼                              ▼
+                 [Redirect]                  [Flink: dedup + bot]
+                                                     │
+                                            ┌────────┴────────┐
+                                            ▼                 ▼
+                                    [Kafka: click_clean]   [Kafka: dlq_bot]
+                                            │
+                              ┌─────────────┼─────────────┐
+                              ▼             ▼             ▼
+                       [Budget Dec]  [Druid Realtime]  [S3 Parquet]
+                                                              │
+                                                              ▼
+                                                       [Billing batch]
+</div>
+<p>The edge tier does only HMAC verification and Kafka write before redirecting — it must be brutally simple to hit 50 ms p99. All filtering, dedup, and aggregation happen downstream where they don't block the user.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Click event (Avro on Kafka)</h3>
+<pre>{
+  "click_id":  "uuid-v7",
+  "auction_id":"...",
+  "ad_id":"...", "campaign_id":"...",
+  "user_id":"...", "ip":"...", "ua":"...",
+  "ts_ms":1714,  "geo":"US-CA",
+  "sig_valid":true, "edge_pop":"sjc-3"
+}</pre>
+<h3>7.2 Dedup state (RocksDB in Flink)</h3>
+<p>Key = (auctionId, userId). TTL = 24 h. Backed by RocksDB state with incremental checkpoints to S3.</p>
+<h3>7.3 Aggregates (Druid + S3 Parquet)</h3>
+<p>Druid for sub-second dashboards (last 30 days). Parquet on S3 partitioned by date for billing and historical analytics.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 HMAC-signed URLs</h3>
+<p>Click URL contains a signature: <code>sig = HMAC_SHA256(secret, auctionId|adId|userId|ts)</code>. Edge verifies signature and freshness (≤ 30 min). Forged or replayed-after-TTL clicks rejected pre-Kafka.</p>
+<h3>8.2 Idempotent dedup</h3>
+<p>Flink keyed stream by clickId; first occurrence emits to click_clean, subsequent are dropped. clickId is a UUIDv7 generated at edge → monotonic, sortable, no central coordinator.</p>
+<h3>8.3 Bot filtering</h3>
+<p>Stage 1 (online, in Flink): rule list — bad UAs, datacenter IP ranges, click cadence &gt; 10/s. Stage 2 (offline, hourly): GBM model on session features → backfill suspicion scores, recompute aggregates.</p>
+<h3>8.4 Exactly-once budget decrement</h3>
+<p>Flink → Kafka transactional sink (read-process-write). Budget service consumes click_clean with consumer group offsets committed in the same Kafka transaction as the budget Redis Lua decrement (idempotency token = clickId).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot campaigns:</b> partition click_raw by hash(adId) — 256 partitions; rebalance via cooperative sticky assignor.</li>
+  <li><b>Late events:</b> Flink watermark with 5-minute allowed lateness; very-late events go to a side output for nightly correction.</li>
+  <li><b>Edge GC:</b> stack-allocated parsers, no JSON; protobuf only, pre-allocated buffers.</li>
+  <li><b>Reprocessing:</b> S3 raw is the source of truth; full pipeline can replay deterministically.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>UUIDv7 clickId at edge</td><td>No central coordinator, sortable</td><td>128-bit; slight bandwidth cost</td></tr>
+<tr><td>Two-stage bot filtering</td><td>Catches both fast and slow attacks</td><td>Aggregates restated next day</td></tr>
+<tr><td>Druid + S3 dual sink</td><td>Real-time + audit</td><td>Two systems to operate</td></tr>
+<tr><td>Async budget decrement</td><td>Doesn't block redirect</td><td>Brief overspend window</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — Kafka log replication for durability of click events.</li>
+  <li>Ch. 11 Stream Processing — exactly-once via Kafka transactions, idempotent consumers, watermarks for late data.</li>
+  <li>Ch. 12 Future of Data Systems — derived data (aggregates) recomputed from immutable click log.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Edge tier does the minimum: verify, log, redirect. Anything more would risk the 50 ms p99."</li>
+  <li>"Idempotency comes from a stable clickId generated at the edge. Without it, retries and replays poison the count."</li>
+  <li>"Billing differs from the dashboard by design — billing waits for the offline bot model; dashboards show the real-time view."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Go / Rust click edge</td><td>50 ms p99 redirect requires zero GC stalls and minimal allocation; Go's goroutines or Rust's tokio handle 25k clicks/sec per box without the JVM warmup or GC pauses that make Java unfit for this redirect-critical hot path.</td><td>Java (rejected: GC pauses risk 50 ms p99); Node.js (single-thread bottleneck); nginx + Lua (less observable).</td></tr>
+<tr><td>HMAC-SHA256 signed URLs</td><td>Forged or replayed clicks must be rejected pre-Kafka or they pollute aggregates; HMAC-SHA256 (~1 µs verify) over (auctionId|adId|userId|ts) with a 30-min freshness window blocks tampering at the edge before any state is written.</td><td>JWT (rejected: heavier, JWS attack surface); plaintext tokens (forge-able); RSA sigs (~100 µs, too slow at 25k QPS).</td></tr>
+<tr><td>UUIDv7 (clickId at edge)</td><td>Time-ordered 128-bit UUIDs let the edge generate idempotency keys with zero coordination — no Snowflake server, no DB sequence — and downstream Flink dedup gets sortable keys for efficient RocksDB iteration.</td><td>UUIDv4 (rejected: random, kills RocksDB locality); Snowflake IDs (extra service hop); DB sequence (round-trip kills 50 ms budget).</td></tr>
+<tr><td>Apache Kafka (click_raw topic)</td><td>2 B clicks/day (200 MB/s) plus 100 B impressions/day (5 GB/s) need durable replay for billing reprocess; Kafka's partitioned log lets us hash-partition by adId across 256 partitions to absorb hot campaigns.</td><td>Kinesis (rejected: shard limits at 5 GB/s); Pulsar (smaller ops community); RabbitMQ (no replay).</td></tr>
+<tr><td>Avro (click event format)</td><td>Schema evolution matters across 10+ downstream consumers (Flink, Druid, Spark); Avro's schema-registry-backed compatibility lets us add fields without breaking existing jobs, and the binary format is 60% smaller than JSON.</td><td>Protobuf (rejected: weaker schema-registry tooling for streaming); JSON (3x bandwidth at 5 GB/s).</td></tr>
+<tr><td>Apache Flink (dedup + bot)</td><td>Keyed-stream dedup over a 24-h window needs exactly-once with sub-second latency at 25k clicks/sec; Flink's RocksDB state with incremental S3 checkpoints handles 128 GB dedup state with bounded recovery time.</td><td>Spark Streaming (rejected: micro-batch latency); Kafka Streams (state size limit at 128 GB problematic).</td></tr>
+<tr><td>RocksDB (Flink dedup state)</td><td>2 B keys × 64 B Bloom = 128 GB doesn't fit in heap; RocksDB's LSM with TTL compaction stores keyed dedup state on local SSD, with incremental S3 checkpointing recovering from box failure in &lt;5 min.</td><td>Heap state (rejected: GC + size); Redis (network hop per dedup); standalone HBase (operational overhead).</td></tr>
+<tr><td>Kafka transactional sink</td><td>Read-process-write exactly-once into click_clean + budget Redis Lua decrement requires atomic commit; Kafka transactions tie consumer-offset-commit + producer-write into one atomic step so a crashed Flink job can't double-decrement budget.</td><td>At-least-once + idempotent consumers (more app logic); 2PC (rejected: latency hit).</td></tr>
+<tr><td>Apache Druid (real-time dashboard)</td><td>Last-30-day click counts sliced by campaign × hour × geo need &lt;1 s response; Druid's bitmap-indexed segments with real-time ingestion from click_clean serves dashboards even as new events stream in.</td><td>ClickHouse (similar, Druid's lambda-pattern integration richer); BigQuery (per-query cost on dashboards prohibitive).</td></tr>
+<tr><td>S3 + Parquet (billing source-of-truth)</td><td>Billing aggregates within 0.01% require recomputability from the immutable raw log; Parquet on S3 partitioned by date supports column-pruned scans for monthly billing reconciliation against Druid's real-time view.</td><td>HDFS (operational at PB scale); Avro on S3 (no column pruning, slower scans).</td></tr>
+<tr><td>GBM bot filter (offline stage)</td><td>Two-stage filtering: simple rules online catch fast attacks; nightly GBM on session features (click cadence, IP reputation, UA entropy) catches sophisticated bots and backfills suspicion scores into billing aggregates.</td><td>Pure rule-based (rejected: misses adversarial bots); deep neural net (overkill for tabular features, slower training).</td></tr>
+<tr><td>Redis Cluster (budget Lua decrement)</td><td>Budget decrement after dedup needs idempotency token + atomic decrement in &lt;1 ms; Redis Lua executes the get-check-decrement script atomically and stores last-clickId per campaign to reject replays.</td><td>Postgres (rejected: too slow at 25k decrements/s); in-memory only (loses durability on failover).</td></tr>
+<tr><td>Watermark + 5-min lateness</td><td>Late events (mobile reconnects, edge replays) arrive minutes after click; Flink's watermark with 5-min allowed lateness routes very-late events to a side output for nightly correction without blocking real-time.</td><td>Strict event-time (rejected: drops late events); processing-time (loses billing accuracy).</td></tr>
+<tr><td>Snappy on Kafka</td><td>5 GB/s impression topic compressed to ~2 GB/s saves disk + network; Snappy's ~3 GB/s decompression keeps Flink workers from being CPU-bound on decompression.</td><td>gzip (rejected: too CPU-heavy at 5 GB/s); lz4 (close, snappy chosen for ecosystem fit).</td></tr>
+</tbody>
+</table>

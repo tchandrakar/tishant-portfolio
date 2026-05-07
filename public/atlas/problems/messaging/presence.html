@@ -1,0 +1,146 @@
+<h1>Design Presence Service (online/offline/typing across 1B users)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a presence subsystem usable by chat, social, and gaming products: report whether a user is online, when they were last seen, and whether they are currently typing in a particular conversation. Must scale to ~1B registered users, ~300M concurrent connections, and serve up to 5M presence reads/sec from clients rendering contact lists. Presence is soft state — strict durability is not required, but consistency tail behaviors are.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>States: online, offline, away (idle &gt; N min), typing (per conversation).</li>
+  <li>Last-seen timestamp; per-user privacy (everyone, contacts only, nobody).</li>
+  <li>Subscribers receive push when a watched user changes state.</li>
+  <li>Bulk query: "give me state of these 5000 users I follow."</li>
+  <li>Multi-device: a user is online if any device is online.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 propagation under 1 s for state changes.</li>
+  <li><b>Scale:</b> 300M concurrent sockets; 50M state changes/sec at peak (mass disconnect events).</li>
+  <li><b>Read QPS:</b> 5M/sec for bulk presence fetch.</li>
+  <li><b>Availability:</b> 99.9% (presence outages must not break chat).</li>
+  <li><b>Cost:</b> mostly in-memory; one box per few million users.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>State storage: 1B users * (24B per record: id8 + state1 + lastSeen8 + flags4 + pad) ≈ 24 GB hot — fits in a small Redis/in-mem ring across ~20 shards.</li>
+  <li>Heartbeats: 300M sockets * 1 heartbeat / 30s = 10M/sec inbound.</li>
+  <li>Subscriptions: avg 200 contacts watched per user * 300M concurrent = 60B subscription edges. Sharded.</li>
+  <li>Fan-out events: a celebrity goes online with 5M followers ⇒ 5M fan-out events; cap and batch.</li>
+  <li>Network: 50 bytes per event * 50M/sec = 2.5 GB/s ≈ 20 Gbps internal.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// From chat-edge to Presence Svc:
+HEARTBEAT     {userId, deviceId, ts}
+DISCONNECT    {userId, deviceId, reason}
+SET_TYPING    {userId, peerId, ttl=6}
+
+// Read APIs:
+GET  /v1/presence/{userId}                  → {state, lastSeen}
+POST /v1/presence/bulk  {userIds[]}          → map[userId]→{state,lastSeen}
+WS   /v1/presence/subscribe {userIds[]}      → push events
+
+// Internal events bus:
+PRESENCE_CHANGED {userId, state, ts}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Chat-Edge]──heartbeats──┐
+                         ▼
+                 [Presence Shard Ring]──events──[Pub/Sub Bus]
+                  (in-mem, sharded by userId)         │
+                         ▲                            ▼
+                         │                      [Subscriber Index]
+                  [Bulk Read API]                     │
+                         ▲                            ▼
+                  [App Servers]                 [Push to watchers via Chat-Edge]
+</div>
+<p>Walk-through: chat-edge boxes already terminate the user TCP socket, so they're the source of truth for "is this user connected." They emit heartbeats / disconnects to the presence shard hashed by userId. Each shard maintains a hashmap (userId → {state, lastSeen, deviceCount}). State changes publish events on a topic; the Subscriber Index turns "who watches userId X?" into a list of recipient sockets, and pushes to them via the chat-edge fleet.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Hot store (in-memory shard)</h3>
+<pre>struct PresenceRow {
+  uint64 user_id;
+  uint8  state;          // 0=offline,1=online,2=away
+  uint32 device_mask;    // bitmap of connected devices
+  uint64 last_seen_ms;
+  uint32 privacy;        // visibility flags
+}</pre>
+<h3>7.2 Cold store (Cassandra)</h3>
+<pre>CREATE TABLE last_seen (
+  user_id BIGINT PRIMARY KEY,
+  last_seen TIMESTAMP,
+  privacy INT
+);  -- async flush every 30s; survives restarts</pre>
+<h3>7.3 Subscriber index</h3>
+<p>(watcheeId → list of (watcherId, edgeBoxId)). Sharded by watcheeId. Built lazily: when a chat opens, edge subscribes the viewer to the peer's presence. Eviction on chat close keeps the index proportional to active conversations, not total contacts.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Heartbeat &amp; failure detection</h3>
+<p>Phi-accrual style detector: an absent heartbeat for 2x interval marks the device offline. Only when the last device of a user goes offline does the user state change to offline — multi-device coalescing happens on the shard.</p>
+<h3>8.2 Typing indicator</h3>
+<p>Pure soft state; never written to disk. TTL'd at 6s. Stored on the receiver's chat-edge as an ephemeral row keyed by (peerId, conversationId). Lossy by design: if a typing packet is dropped the worst outcome is the dots disappear, which self-heals within 6s.</p>
+<h3>8.3 Bulk read path</h3>
+<p>Client opens a chat with 200 contacts. Edge issues one bulk fetch sharded by userId hash. Each shard returns its slice; results stitched. Cached at the edge with 10s TTL.</p>
+<h3>8.4 Subscription fan-out for hot users</h3>
+<p>Celebrity has 10M watchers. Naive fan-out is a thundering herd on every blink. Mitigations: (a) coarsen the celeb's state to a 30s ticker (no flap), (b) move from push-to-watchers to pull-by-watcher (watchers poll every minute on idle, push only when chat is open), (c) sample fan-out — only push to currently-online watchers with that conversation focused.</p>
+<h3>8.5 Privacy</h3>
+<p>Per-user privacy flag is checked on read, not write. "Last seen recently" / "Last seen within a week" are coarsenings applied at read time. Blocked-by-recipient lookup runs against a per-user blocklist Bloom filter to fast-reject.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Mass disconnect (regional outage):</b> 50M users go offline in seconds; coalesce events at the shard with a 5s smoothing window before publishing.</li>
+  <li><b>Hot watchee:</b> celebrity user blows out the subscriber index — cap subscribers per user (latest N) and degrade to pull-only.</li>
+  <li><b>Cross-region presence:</b> a user in EU watching contacts in US needs cross-region pub/sub; use regional brokers with asynchronous bridges, accept ~1s extra latency.</li>
+  <li><b>Cardinality of typing:</b> keep typing entirely on the receiver's edge; never let it hit the central presence ring.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>In-memory shard ring</td><td>Microsecond reads, cheap</td><td>Shard restart loses state until re-heartbeated</td></tr>
+<tr><td>Push for low-fanout, pull for celebs</td><td>Bounded fan-out</td><td>Two code paths to maintain</td></tr>
+<tr><td>Eventual consistency</td><td>Cheap, fast, simple</td><td>Brief disagreement between regions</td></tr>
+<tr><td>Heartbeat 30s</td><td>Low overhead</td><td>Up to 60s to detect offline</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 8 Distributed systems — failure detection, phi-accrual, partial failures.</li>
+  <li>Ch. 11 Stream processing — pub/sub topics for state-change events.</li>
+  <li>Ch. 5 Replication — async cross-region replication of soft state.</li>
+  <li>Ch. 6 Partitioning — userId-hash partitioning for the presence ring.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Presence is soft state — I'd resist any pull to put it in a SQL database. Memory + async snapshot to Cassandra is the right shape."</li>
+  <li>"Celebrities break presence in the same way they break news feeds — the answer is the same: switch to a pull model past a follower threshold."</li>
+  <li>"Typing indicator stays on the recipient's edge; it never deserves a round trip to a central service."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>In-memory shard ring (Redis-style)</td><td>1B users * 24 B per record = only ~24 GB hot data; spreading across ~20 shards gives microsecond reads to satisfy 5M reads/sec for bulk fetches. SQL or even Cassandra would burn 100x the latency on what is fundamentally soft state.</td><td>Cassandra hot path (too slow), Postgres (wrong shape), local in-process map (no cross-edge sharing)</td></tr>
+    <tr><td>Cassandra (cold last-seen store)</td><td>Async flush of last_seen every 30 s only needs eventual durability — exactly Cassandra's sweet spot. Per-user PK gives O(1) lookup on rare reads (chat opening when user offline), and partition key naturally bounds the row.</td><td>Postgres (write throughput limited at 10M heartbeats/sec ingest), DynamoDB (cost at 1B users), Redis persistence only (lost on full ring failure)</td></tr>
+    <tr><td>Phi-accrual failure detector</td><td>Fixed timeouts misclassify a flaky network as offline; phi-accrual adapts to observed heartbeat variance, hitting the 1 s p99 propagation NFR while tolerating jitter at 10M heartbeats/sec ingest. Standard primitive from Akka/Cassandra literature.</td><td>Fixed 2x-interval timeout (false positives), gossip-based detection (too slow at 300M sockets), kernel TCP keepalive (too coarse)</td></tr>
+    <tr><td>Pub/sub bus (Redis Streams or Kafka)</td><td>2.5 GB/s of state-change events at 50M peak/sec needs a fan-out primitive that decouples shard publishers from subscriber-index workers. Topic-per-shard limits cross-shard chatter; replayable log helps reconstruct state after a shard restart.</td><td>Direct shard-to-edge calls (O(N²)), per-watcher push from shard (couples failure domains), HTTP webhook (ridiculous at this rate)</td></tr>
+    <tr><td>UserId-hash partitioning</td><td>60B subscription edges and 1B user records can only be tackled by a stable, computable shard key — userId hash makes "find user X's row" a single hash + RPC, no coordinator. Re-balancing only ~1/N keys when a shard fails preserves the 99.9% SLO.</td><td>Range partitioning (hot ranges for sequential signups), random sharding with directory (extra hop), consistent hash with virtual nodes (yes, picked variant)</td></tr>
+    <tr><td>WebSocket subscribe API</td><td>The "subscribers receive push when watched user changes state" FR requires bidirectional sub-second pushes; long-poll can't sustain 60B subscription edges across 300M sockets without amplifying load. WS keeps subscription state on the long-lived TCP.</td><td>HTTP long-poll (more reconnects), SSE (one-way; subscribe needs to mutate state), webhook (impossible for mobile)</td></tr>
+    <tr><td>Bloom filter (per-user blocklist)</td><td>Privacy check on read needs O(1) "did Alice block Bob?" lookup; a per-user Bloom filter fits in tens of bytes and rides in the same memory shard as the presence row, avoiding a separate DB hop on every read of 5M/sec.</td><td>Postgres lookup per read (too slow), client-side filtering (security risk), full set in shard memory (wastes RAM)</td></tr>
+    <tr><td>Push for low-fanout / pull for celebs</td><td>Celebrity with 10M watchers + naive push = 10M events on every blink — guaranteed to thunder-herd the bus. Switching to a pull model with 60s coarsened state past a threshold caps fan-out at the 50M/sec network budget. Two code paths is the price of survival.</td><td>Always push (collapses on celebs), always pull (defeats real-time UX for normal users), pre-computed feeds (storage cost)</td></tr>
+    <tr><td>Per-edge ephemeral typing</td><td>Typing is the most chatty signal per user (typing-on/typing-off dozens of times per chat); shipping it to a central ring would dominate the 50 bytes/event * 50M/sec budget. Storing on the receiver's edge with 6 s TTL eliminates the central RTT entirely.</td><td>Central presence ring (cost explosion), pub/sub fan-out (overkill for soft 6 s signal), per-conversation row in DB (insanity)</td></tr>
+    <tr><td>Lazy subscriber index</td><td>Naive "subscribe all of user A's contacts to A" pre-builds a 60B-edge index that wastes RAM on dormant chats. Building lazily on chat open and evicting on chat close keeps the index proportional to active conversations — a 100x reduction in working set.</td><td>Eagerly materialized index (RAM blowup), no index — scan on event (kills fan-out latency), client-side polling (bandwidth)</td></tr>
+    <tr><td>Coalescing window (5 s smoothing)</td><td>Mass disconnect (regional outage) generates 50M state changes in seconds and would saturate the bus; a 5 s smoothing window per shard collapses flap-flap-flap into one final event, surfacing the eventual state without thrashing.</td><td>Immediate publish (thundering herd), longer 60 s window (breaks 1 s p99 for normal cases), client-side coalescing (server still ingested)</td></tr>
+    <tr><td>Multi-device coalescing on shard</td><td>"User is online if any device is online" FR needs an authoritative aggregator; a device_mask bitmap on the shard row XORs device events without a separate query. State change publishes only when the last device drops, not on every device blip.</td><td>Per-device rows + read-side aggregate (extra reads), client-reported aggregate (untrustworthy), separate device service (extra hop)</td></tr>
+  </tbody>
+</table>

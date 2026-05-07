@@ -1,0 +1,138 @@
+<h1>Design Email Service (transactional + marketing at scale, SES-style)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">notifications</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build an SES-style multi-tenant email platform that sends both transactional (password reset, receipts) and marketing (newsletters, campaigns) email. The system must protect sender reputation, manage IP warm-up, handle bounces/complaints, support DKIM/SPF/DMARC signing, template rendering with personalization, and scale to billions of messages per day across thousands of tenants.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Send a single transactional email or a campaign (millions of recipients).</li>
+  <li>Template management with Handlebars-style variables and localization.</li>
+  <li>Bounce, complaint, open, click tracking via webhooks and event streams.</li>
+  <li>Suppression lists per tenant (hard bounces, unsubscribes, complaints).</li>
+  <li>IP pool management: dedicated, shared, warm-up pools.</li>
+  <li>DKIM signing per sending domain; SPF/DMARC validation guidance.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> transactional accept-to-handoff under 1 s p95; campaign jobs may take minutes.</li>
+  <li><b>Scale:</b> 5B emails/day, 60k/sec avg, 250k/sec peak across 50k tenants.</li>
+  <li><b>Availability:</b> 99.95%; durable accept even when MTAs degrade.</li>
+  <li><b>Deliverability:</b> bounce rate under 5%, complaint rate under 0.1%.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 5B/86,400 ≈ 58k avg; campaign bursts to 250k/sec.</li>
+  <li>Storage: 5B msgs × 2 KB metadata = 10 TB/day; 90-day retention ≈ 900 TB.</li>
+  <li>Body storage: 5B × 20 KB avg = 100 TB/day in S3; lifecycle to Glacier after 30d.</li>
+  <li>Event volume: opens+clicks ≈ 30% of sent = 1.5B events/day = 17k events/sec.</li>
+  <li>IP pool: 250k/sec ÷ 100 msg/IP/sec rate cap = 2500 sending IPs.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/email/send         {from,to,subject,html,text,headers}        -> messageId
+POST /v1/email/template     {name, html, text, variables}
+POST /v1/email/campaign     {templateId, audienceId, scheduleAt}        -> jobId
+GET  /v1/email/events?messageId=...                                     -> [open,click,bounce]
+POST /v1/suppressions       {tenantId, email, reason}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Tenant API] -> [Validation/Rate-limit] -> [Kafka: email.accepted]
+                                                |
+                                                v
+                                       [Renderer Worker]
+                                       (templates + body S3)
+                                                |
+                                                v
+                                  [Kafka: email.ready (sharded by domain)]
+                                                |
+                                                v
+                                  [MTA Pool] --(SMTP)--> [Recipient MX]
+                                                |
+                                                v
+                              [Bounce/FBL Listener] -> [Kafka: events]
+                                                |
+                                                v
+                              [Suppression Store] / [Tenant Webhooks]
+</div>
+<p>Acceptance is decoupled from delivery via Kafka so spikes don’t block tenants. Renderers expand templates and offload large bodies to S3. MTAs are sharded by recipient domain to allow per-domain rate control (Gmail/Yahoo/Outlook each have distinct throttles).</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Message metadata (Cassandra)</h3>
+<pre>CREATE TABLE messages (
+  tenant_id text, message_id timeuuid,
+  to_addr text, from_addr text, status text,
+  body_s3 text, sent_at timestamp,
+  PRIMARY KEY ((tenant_id, day_bucket), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);</pre>
+<h3>7.2 Suppression list (DynamoDB / RocksDB-backed KV)</h3>
+<pre>PK = (tenant_id, sha256(email))   value = {reason, added_at}</pre>
+<h3>7.3 Why these stores?</h3>
+<p>Cassandra absorbs 60k+ writes/sec with multi-DC replication and supports day-bucket pagination for tenant dashboards. Suppression lookups are point reads on the hot path and need sub-ms latency, so a managed KV with in-memory cache fits.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Renderer</h3>
+<p>Stateless workers pull from <code>email.accepted</code>, resolve templates via a versioned cache (Redis, 30s TTL), expand variables, sign with DKIM, and write final RFC 5322 body to S3. Output is a small pointer message on <code>email.ready</code>.</p>
+<h3>8.2 MTA pool &amp; reputation</h3>
+<p>Each MTA owns a subset of IP addresses. A scheduler routes messages to (IP, recipient-domain) lanes with token buckets configured from learned rate caps (e.g., Gmail 200/sec/IP for new senders). Warm-up follows a 30-day curve doubling daily volume. Per-IP reputation is tracked and bad IPs are auto-paused.</p>
+<h3>8.3 Feedback loop</h3>
+<p>Bounces arrive via SMTP (synchronous) and async via DSN/FBL mailboxes. Listeners parse, classify (hard/soft/transient), and update suppression. Hard bounces auto-suppress; soft bounces retry with exponential backoff up to 72h.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Domain throttling:</b> a campaign hitting 10M Gmail addresses must respect Gmail’s per-IP cap → spread across 500 IPs over 2 hours.</li>
+  <li><b>Reputation poisoning:</b> one tenant’s spam tanks shared-pool delivery; isolate suspect tenants to quarantine pool.</li>
+  <li><b>Renderer fan-out:</b> personalized campaign of 50M recipients → shard by recipient hash; render at 50k/sec across 200 workers.</li>
+  <li><b>Event ingestion:</b> 17k events/sec into Kafka; downstream tenant webhooks must not block — buffer and retry with DLQ.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Shared vs dedicated IP pools</td><td>Shared = cheap, fast warmup</td><td>Noisy neighbor risk</td></tr>
+<tr><td>Sync DKIM signing in renderer</td><td>Simpler pipeline</td><td>CPU-heavy; needs HSM offload at scale</td></tr>
+<tr><td>Cassandra for metadata</td><td>Linear writes</td><td>Range scans across tenants are expensive</td></tr>
+<tr><td>S3 for bodies</td><td>Cheap, durable</td><td>Adds 30–50 ms per send</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-DC Cassandra for tenant metadata.</li>
+  <li>Ch. 7 Transactions — idempotency tokens to avoid double-sends on retry.</li>
+  <li>Ch. 11 Stream Processing — Kafka topics decouple accept/render/send/event stages with at-least-once semantics; exactly-once is achieved via idempotent message-id keys.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd separate transactional and marketing onto different Kafka clusters and IP pools because reputation cross-contamination is the #1 deliverability killer."</li>
+  <li>"The hardest part is per-recipient-domain rate control — I'd model it as a hierarchical token bucket (tenant → IP → domain)."</li>
+  <li>"For an MVP I'd skip click-tracking and use an off-the-shelf MTA like Haraka, then build the in-house MTA when reputation tooling matters."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Haraka / Postfix MTA pool</td><td>Sending 5B emails/day = 250k peak/sec across 2500 IPs requires a battle-tested SMTP daemon with per-IP queue isolation; Haraka's plugin model lets us hook DKIM signing and per-domain throttling without forking core code.</td><td>SendGrid SMTP relay (margin-killing per-msg cost at 5B/day); building a new MTA from scratch (years of RFC 5321 edge cases).</td></tr>
+<tr><td>DKIM signing (RSA-2048 / Ed25519)</td><td>Receiver MTAs (Gmail, Yahoo) hard-bounce unsigned mail under DMARC reject; per-tenant private keys signed at the renderer authenticate ownership of the sending domain to keep our 5% bounce SLO.</td><td>No DKIM (catastrophic for deliverability); shared global key (one tenant compromise leaks everyone).</td></tr>
+<tr><td>SPF DNS records</td><td>Tenants publish <code>v=spf1 include:_spf.ourservice.com ~all</code> so receiving MTAs verify our 2500 sending IPs are authorized; pairs with DKIM under DMARC alignment to clear inbox-vs-spam thresholds at Gmail/Yahoo/Outlook.</td><td>SPF-only (no message integrity check); DKIM-only (subdomain spoofing risk).</td></tr>
+<tr><td>HSM (CloudHSM / KMS) for DKIM keys</td><td>RSA-2048 sign at 60k/sec costs ~3 cores per worker; offloading to FIPS-140-2 HSM both protects the per-tenant private keys and frees CPU for template rendering at 50k/sec across 200 workers.</td><td>In-process software signing (CPU-bound at scale, key exposure on host compromise); shared key in Vault (per-msg latency too high).</td></tr>
+<tr><td>Apache Kafka (email.accepted, email.ready, events)</td><td>60k avg / 250k peak msgs/sec needs a partitioned log; partitioning email.ready by recipient domain lets Gmail-bound traffic flow at Gmail's per-IP cap independently of Yahoo-bound traffic, and 1.5B events/day (17k/s) of opens/clicks land on the same backbone.</td><td>RabbitMQ (per-msg ack at 250k/sec overwhelms broker); Kinesis (shard rebalance lag during campaign spikes).</td></tr>
+<tr><td>S3 (rendered RFC 5322 bodies)</td><td>5B × 20 KB = 100 TB/day of bodies; S3 at $0.023/GB/month with lifecycle to Glacier after 30 days is 10× cheaper than keeping bodies in Cassandra and offloads body durability to AWS's 11-9s.</td><td>Cassandra blob storage (write amplification kills cluster); EBS volumes (no inter-AZ durability).</td></tr>
+<tr><td>Cassandra (messages metadata)</td><td>5B writes/day = 60k+/sec sustained; partitioning by <code>(tenant_id, day_bucket)</code> bounds partition size to ~10M rows even for the largest tenant and supports tenant dashboard pagination on <code>message_id DESC</code>.</td><td>Postgres (60k/sec writes saturate WAL on a single primary); MongoDB (range scans by day are inefficient on hashed shards).</td></tr>
+<tr><td>DynamoDB / RocksDB KV (suppression list)</td><td>Every send checks suppression on the hot path — 250k/s point reads at sub-ms latency; SHA256(email) keys with auto-sharded throughput are exactly the workload DynamoDB is built for.</td><td>Bloom filter only (false positives drop legitimate mail); SQL table (250k QPS point reads needs heavy caching anyway).</td></tr>
+<tr><td>Redis (template cache, 30s TTL)</td><td>Renderer pulls templates 60k+/sec; a 30-second hot cache with versioned keys serves &gt;99% of reads from RAM and lets template publishers iterate without DB stampedes.</td><td>In-process cache only (incoherent across 200 renderer workers); no cache (template DB QPS would explode).</td></tr>
+<tr><td>Hierarchical token bucket (tenant → IP → domain)</td><td>Gmail caps new senders at 200/sec/IP; a 3-level bucket enforces tenant rate, IP capacity, and domain politeness simultaneously so a 10M-Gmail-recipient campaign spreads across 500 IPs over 2h instead of bombing one IP into the spam folder.</td><td>Single global bucket (kills per-domain throttling); fixed-window counters (boundary spikes blacklist IPs).</td></tr>
+<tr><td>Dedicated vs shared IP pools</td><td>Reputation isolation: high-volume tenants (>1M/day) get dedicated IPs to control their warm-up curve, while low-volume tenants share warm pools to avoid a 30-day cold-start; quarantine pool isolates suspect tenants from poisoning shared reputation.</td><td>All-shared (one bad tenant tanks deliverability for 50k others); all-dedicated (cold IP warm-up takes 30 days, unusable for new tenants).</td></tr>
+<tr><td>Bounce/FBL listener (DSN + ARF mailboxes)</td><td>Hard bounces hit ~3% at our scale and must auto-suppress to stay under the 5% bounce SLO; ARF feedback loop reports from Gmail/Yahoo/Outlook flag complaints that drive the &lt;0.1% complaint SLO.</td><td>Synchronous SMTP-only (misses async DSN bounces hours later); manual review (250k/s makes it impossible).</td></tr>
+<tr><td>Apache Flink / Kafka Streams (event ETL)</td><td>17k events/sec of opens+clicks need windowed aggregation for tenant dashboards; stateful stream joins on message_id correlate sends → opens → clicks without batch ETL lag.</td><td>Spark batch (15-minute lag breaks "live" dashboards); Lambda + DynamoDB streams (cost prohibitive at 17k/s).</td></tr>
+</tbody>
+</table>

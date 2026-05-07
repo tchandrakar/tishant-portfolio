@@ -1,0 +1,141 @@
+<h1>Design Delivery Dispatch &amp; Routing (batching, courier assignment, ETA)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">food-delivery</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">maps-location</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the dispatch engine: given a stream of new orders and a fleet of couriers continuously reporting position, assign orders to couriers (possibly in batches of 2–3) to minimise customer ETA + courier idle time + total drive distance, subject to constraints (food temperature, alcohol licensing, vehicle capacity, courier preferences). This is the brain of any food-delivery platform and is the most algorithmically dense component.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Ingest order events (new, ready, cancelled) from Order Service.</li>
+  <li>Ingest courier pings (location, status, battery) at 1 Hz.</li>
+  <li>Decide assignment: single or batched, including pickup/drop sequence.</li>
+  <li>Push offer to courier; handle accept/reject within SLA.</li>
+  <li>Continuously re-estimate ETA and re-assign if a better plan exists pre-pickup.</li>
+  <li>Emit assignment events for tracking, payouts, analytics.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> assignment decision &lt; 2 s p99 from "food ready" event.</li>
+  <li><b>Throughput:</b> 10 K assignments/min peak; 1 M open orders steady-state globally.</li>
+  <li><b>Quality:</b> &lt; 5% reject rate; &lt; 4 min ETA error p50.</li>
+  <li><b>Availability:</b> 99.95% — falling back to greedy if the optimiser is down.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Couriers: 600 K active × 1 Hz pings = 600 K msg/s, ~120 MB/s into Kafka.</li>
+  <li>Orders: peak 1 K orders/s; each triggers ~1 KB assignment record.</li>
+  <li>Index size: live courier index ~500 MB in Redis Geo (sharded by region).</li>
+  <li>Compute: VRP solver budget ~200 ms × 100 regions × 12 ticks/min = 240 CPU-min/min ≈ 240 cores.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/dispatch/order      {orderId, restLat, restLng, dropLat, dropLng, prepEta, constraints}
+POST /v1/dispatch/courier    {courierId, lat, lng, status, battery}   (internal stream)
+GET  /v1/dispatch/order/{id}/assignment                              → {courierId, etaSec}
+POST /v1/dispatch/offer/{id}/accept|reject  {courierId}              → ack</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Order Svc]──┐
+             ↓ Kafka(order.events)
+[Courier app]→[Geo Ingest]→Kafka(courier.pings)→[Redis GEO + Flink state]
+             ↓                                      ↑
+        [Region Sharder]──────┐                     │
+                              ↓                     │
+                       [Dispatch Worker (per region)]
+                              ↓
+                  ┌──── [VRP Solver / OR-Tools] ────┐
+                  │                                  │
+                [ETA Svc] ← [Routing: OSRM] ← [Live traffic]
+                  ↓
+        [Assignment Store (Cassandra)] → Kafka(assign.events)
+                                              ↓
+                                  [Tracking, Payouts, Analytics]
+</div>
+<p>Each region (H3 res-6 cell or city) is owned by exactly one dispatch worker leader (via etcd/ZooKeeper). State is rebuildable from Kafka + Redis on failover.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Live courier index (Redis)</h3>
+<pre>GEOADD region:bom:active &lt;lng&gt; &lt;lat&gt; courier:42
+HSET courier:42 status free orders 0 battery 81 vehicle bike</pre>
+<h3>7.2 Open orders (in-memory per worker, snapshot to Redis)</h3>
+<pre>{ orderId, restLoc, dropLoc, prepReadyAt, deadline, batchKey }</pre>
+<h3>7.3 Assignments (Cassandra)</h3>
+<p>Partition <code>region+date</code>, clustering <code>created_at</code>; trail used for ML training and dispute resolution.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Region sharding</h3>
+<p>Each H3 res-6 hex (~36 km²) is a region; consistent-hashed to dispatch workers; one leader per region with a hot standby. Boundaries are widened to overlap so couriers near edges are visible to both regions.</p>
+<h3>8.2 Solver loop</h3>
+<p>Every 2 s tick: snapshot open orders + couriers within region. Build candidate assignments — singletons + batched pairs whose pickup-delta &lt; 5 min and drops are along-route (cosine of bearings &gt; 0.7). Cost = α·customerETA + β·courierIdleness + γ·extraDistance − δ·courierPay. Solve as min-cost flow (OR-Tools); cap at 500 nodes per tick.</p>
+<h3>8.3 Offer protocol</h3>
+<p>Push to courier app via persistent connection; 30 s to accept; on reject, mark cool-down 60 s and re-solve. Track historical accept-rate as a feature.</p>
+<h3>8.4 ETA service</h3>
+<p>OSRM gives free-flow time on the road graph; ML residual model adds traffic + weather + restaurant prep variance. Updates every 10 s while in-flight.</p>
+<h3>8.5 Re-assignment</h3>
+<p>Pre-pickup, if a better plan saves &gt; 90 s and courier hasn't accepted, swap. Post-pickup is locked except for catastrophic failures.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot region (downtown Friday 8 PM):</b> sub-shard H3 to res-7; spin up extra solver pods.</li>
+  <li><b>Solver SLA:</b> hard timeout 200 ms — fall back to greedy nearest-neighbor with batching heuristic.</li>
+  <li><b>Ping flood:</b> drop to 0.2 Hz when courier is idle &gt; 5 min; full rate when assigned.</li>
+  <li><b>Leader failover:</b> Kafka offset-based recovery; warm Redis snapshot every 30 s.</li>
+  <li><b>Cross-region orders (suburb → downtown):</b> handled by larger "metro" region overlaying the hex grid.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Batched solver (every 2s)</td><td>Globally better matches, allows order batching</td><td>+1–2s latency vs instant greedy</td></tr>
+<tr><td>Single leader per region</td><td>No conflicting assignments</td><td>Failover blip ~5 s</td></tr>
+<tr><td>Min-cost flow vs Hungarian</td><td>Handles capacity (multi-pickup)</td><td>Heavier solve; needs caps</td></tr>
+<tr><td>Pre-pickup re-assignment</td><td>Better ETAs</td><td>Courier UX confusion if too frequent</td></tr>
+<tr><td>OSRM self-hosted</td><td>$0 marginal cost, low latency</td><td>Map-data refresh ops</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 8 Distributed Trouble — partial failures, timeouts in the offer protocol.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — single-leader region ownership via etcd/ZooKeeper.</li>
+  <li>Ch. 11 Stream Processing — Kafka as the system of record; Flink for windowed state.</li>
+  <li>Ch. 12 Future of Data Systems — assignment store as derived data; replayable.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd treat dispatch as a <em>stream-of-decisions</em> problem on top of Kafka — every assignment is reproducible from inputs."</li>
+  <li>"The most underrated lever is the <em>delay</em> before assignment: waiting 30 s to batch can outperform instant dispatch on unit economics."</li>
+  <li>"For correctness, region leadership via consensus is non-negotiable; I never want two workers double-assigning a courier."</li>
+  <li>"Greedy fallback is a feature, not a hack — the system must keep moving when the optimiser is unhealthy."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Apache Kafka (order + ping streams)</td><td>600 K courier pings/s = 120 MB/s plus 1 K orders/s of order.events; partitioned log gives replayable input for the dispatch state machine — critical for leader failover where workers rebuild from offsets and audit trails for ML training.</td><td>Kinesis (24 hr replay too short for ML); Pulsar (smaller community); RabbitMQ (no replay; persistence too heavy).</td></tr>
+<tr><td>Redis GEO (per-region courier index)</td><td>Sub-ms <code>GEOSEARCH</code> over 600 K active couriers in 2 km region radius is the inner loop of the 2 s solver tick; sharded by H3 region keeps Mumbai/Delhi hot data isolated and the live index ~500 MB total.</td><td>PostGIS (slow at 600 K writes/s); MongoDB geo (poorer p99 tail); Tile38 (smaller community).</td></tr>
+<tr><td>Apache Flink (keyed state)</td><td>Joining 600 K pings/s with assignment state per courier_id needs windowed keyed state with exactly-once; Flink's checkpointing tolerates failover without losing in-flight assignments — Kafka Streams alone cannot manage 100s of MB of keyed state per node well.</td><td>Kafka Streams (state-store recovery slow at this size); Spark Streaming (microbatch latency); Storm (deprecated).</td></tr>
+<tr><td>OR-Tools min-cost flow</td><td>Batched 2-3 deliveries with capacity, time-window, and along-route constraints map naturally to min-cost flow; LP relaxation hits the 200 ms p99 budget per region while improving unit economics ~15% over Hungarian (which can't model multi-pickup capacity).</td><td>Hungarian (no capacity); Greedy (used as fallback only); Gurobi (license cost across 100 regions).</td></tr>
+<tr><td>Uber H3 (res-6 + res-7)</td><td>Hex grid (~36 km² at res-6) gives uniform region size for solver sharding; res-7 sub-shard kicks in for downtown Friday 8 PM hot regions. Edge-overlap natively handled by H3 ring queries.</td><td>S2 cells (rectangular distortion at high lat); geohash (non-uniform area); manual polygons (operational nightmare across cities).</td></tr>
+<tr><td>etcd / ZooKeeper (region leadership)</td><td>Single-leader-per-region is non-negotiable to avoid double-assigning a courier to two orders; etcd Raft consensus with 5 s lease ensures only one worker is authoritative per H3 cell, with hot-standby pre-warmed for failover.</td><td>Consul (similar; etcd has tighter K8s integration); custom heartbeat (split-brain risk); Redis Redlock (controversial correctness).</td></tr>
+<tr><td>Cassandra (assignment store)</td><td>10 K assignments/min sustained (with Super Bowl 3x bursts) needs write-optimised storage; partition by <code>region+date</code> handles fan-in and trailing scans for ML training and dispute resolution without taxing OLTP.</td><td>HBase (heavier ops); ScyllaDB (good fit; smaller team expertise); DynamoDB (cost at sustained writes).</td></tr>
+<tr><td>OSRM (self-hosted)</td><td>2 s solver tick × 100 regions × 12/min × ~50 route queries each = ~60 K route queries/s; Google Directions at $5/1K calls would cost ~$25M/year. Self-hosted on OSM gives sub-50 ms latency at $0 marginal cost.</td><td>Google Directions (cost-prohibitive); Mapbox (still per-request); Valhalla (less community tuning at this scale).</td></tr>
+<tr><td>XGBoost ETA residual</td><td>OSRM gives free-flow time; gradient boosting layers traffic, weather, and prep variance to hit &lt; 4 min p50 ETA error — directly drives customer SLA breach refunds. Re-trains every 10 s in-flight feature window.</td><td>Linear regression (under-fits); DNN (slower inference, marginal lift); Kalman filter (poor for prep variance).</td></tr>
+<tr><td>WebSocket persistent conn (offer push)</td><td>30 s SLA for courier accept/reject demands sub-second push; persistent WS conn from courier app to Offer Service avoids FCM/APNs latency tail (which can spike to 10 s+ on flaky networks).</td><td>FCM/APNs (latency tail); SSE (one-way only); HTTP polling (battery drain on courier devices).</td></tr>
+<tr><td>Kubernetes (HPA per region)</td><td>Hot-region scaling demands per-region pod fleets; HPA on solver queue depth lets Mumbai 8 PM downtown spin up 3x extra solvers without affecting suburb regions, hitting 99.95% availability.</td><td>EC2 ASG (slower scale-out); Nomad (smaller ecosystem); manual capacity (fragile across 100 regions).</td></tr>
+<tr><td>Snappy / LZ4 compression</td><td>120 MB/s of pings into Kafka compresses ~3-4x with LZ4, saving on network + retention storage; chosen over gzip for sub-ms decompression on the consumer side.</td><td>gzip (CPU-heavy decompression); zstd (slightly slower decode at our volume); none (3x infrastructure cost).</td></tr>
+<tr><td>Greedy nearest-neighbor (fallback)</td><td>Hard 200 ms timeout on the optimiser triggers fallback to greedy; without it, a stuck solver cascades into dispatch-wide timeouts during peak. Greedy keeps the system moving at ~5-10% worse efficiency, which is acceptable degradation.</td><td>No fallback (cascading failure); LP-only-with-shorter-cap (still risky); pre-computed offline plans (stale within minutes).</td></tr>
+</tbody>
+</table>
+

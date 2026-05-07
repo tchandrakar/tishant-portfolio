@@ -1,0 +1,152 @@
+<h1>Design Slack (workspaces, channels, threads, search)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">messaging</span>
+  <span class="tag">search</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a team-collaboration messenger: workspaces contain channels, channels contain messages and threads, with rich text, files, reactions, mentions, and full-text search across years of history. Slack serves ~20M DAU across millions of workspaces, sending ~1.5B messages/day. Unlike WhatsApp, server-side history is the product — every message is persisted forever, indexed, and searchable.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Workspaces with channels (public, private, DM, MPDM up to 9 users).</li>
+  <li>Threads off any message; reactions; mentions; pinned messages.</li>
+  <li>File uploads with previews; rich text via markdown/blocks.</li>
+  <li>Real-time delivery with typing/presence per workspace.</li>
+  <li>Full-text search scoped to user's accessible channels.</li>
+  <li>Mobile / desktop / web with multi-device sync and unread counts.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 send-to-receive under 500 ms; search p95 under 800 ms.</li>
+  <li><b>Scale:</b> 20M DAU, 1.5B msgs/day (≈18k/sec avg, peak 60k/sec).</li>
+  <li><b>Durability:</b> never lose a sent message; history retained per workspace policy.</li>
+  <li><b>Availability:</b> 99.99% chat plane; 99.9% search.</li>
+  <li><b>Tenancy:</b> hard isolation per workspace; per-workspace export and compliance.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 18k msgs/sec avg, 60k peak; reads ~10x writes ⇒ 600k reads/sec.</li>
+  <li>Sockets: ~5M concurrent WebSockets; 100k/box ⇒ 50 edge boxes.</li>
+  <li>Storage: 1.5B msgs/day * 1KB = 1.5 TB/day raw; 5 TB/day with metadata + index = ~2 PB/year.</li>
+  <li>Search index: Solr/ES, 200B docs total, sharded per workspace; ~1 PB on SSD.</li>
+  <li>File storage: 50 PB on S3 with CDN.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Real-time over WebSocket (RTM / Events API)
+chat.postMessage    {channel, text, blocks, thread_ts}    → ts, channel
+conversations.history {channel, latest, oldest, limit}    → messages[]
+search.messages     {query, scope}                         → hits[]
+reactions.add       {channel, ts, name}                    → ok
+files.upload        multipart                              → fileId, url
+
+// WS frames:
+hello / ping / pong
+message_event {channel, user, ts, text}
+typing_event  {channel, user}
+presence_change {user, presence}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──WSS──[Edge Gateway]──┐
+                               ├──[Channel Svc]──[Vitess/MySQL shards]
+                               ├──[Thread Svc]
+                               ├──[Presence Svc (Redis)]
+                               ├──[Indexer]──Kafka──[Solr Search Cluster]
+                               ├──[File Svc]──[S3]──[CDN]
+                               └──[Notification Svc]──APNs/FCM/Email
+</div>
+<p>Walk-through: client opens one WSS per workspace. Posting a message hits Channel Svc, which persists to MySQL (Vitess-sharded by workspace), publishes to Kafka, and pushes via the gateway to all online channel members. The Indexer consumes Kafka, writes to Solr. Reads of recent history come from MySQL + Memcached; older history and search go to Solr.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Messages (Vitess / MySQL, sharded by workspace_id)</h3>
+<pre>CREATE TABLE messages (
+  workspace_id BIGINT,
+  channel_id   BIGINT,
+  ts           DECIMAL(16,6),    -- "1714938472.001200"
+  user_id      BIGINT,
+  text         MEDIUMTEXT,
+  thread_ts    DECIMAL(16,6) NULL,
+  blocks       JSON,
+  PRIMARY KEY (workspace_id, channel_id, ts)
+);</pre>
+<h3>7.2 Why MySQL/Vitess?</h3>
+<p>Slack famously runs on Vitess. Per-workspace shard keys give linear scale, transactional updates for edits/reactions, and mature operational tooling. Channels-within-workspace fit a clustered index naturally (range scans for history are cheap).</p>
+<h3>7.3 Search (Solr)</h3>
+<pre>doc {
+  id: "W123:C456:1714938472.001200",
+  workspace_id: 123, channel_id: 456,
+  user_id: 99, text: "...", ts: 1714938472,
+  acl: ["U99","U100","U101"]   // members at index time
+}</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Edge gateway</h3>
+<p>Stateless WSS terminator. Maps (workspace_id, user_id) → socket. Subscribes the socket to channel topics in a pub/sub bus (Redis Streams or NATS). Backpressure: per-socket bounded queue, drop typing events first under load.</p>
+<h3>8.2 Channel service</h3>
+<p>Validates ACL, allocates monotonic <code>ts</code> (microsecond timestamp doubles as message id and sort key), writes to the workspace shard, fans out via pub/sub. Edits update the same row; an audit table tracks history for compliance.</p>
+<h3>8.3 Threads</h3>
+<p>A thread is messages sharing <code>thread_ts</code>. Loaded lazily; thread participants get notifications. Reply count maintained on the parent row, updated atomically.</p>
+<h3>8.4 Search</h3>
+<p>Indexer consumes Kafka, denormalizes channel members into the doc's ACL field at index time. Query path: rewrite to <code>(text:foo) AND acl:Uxxx AND workspace:Wnnn</code>. ACL changes (user leaves channel) trigger reindex of affected docs — bulk job, eventually consistent within minutes. Per-workspace shards mean a noisy tenant doesn't tank others.</p>
+<h3>8.5 Unreads</h3>
+<p>Per (user, channel) cursor stored in Redis with periodic flush to MySQL. Counts computed as messages-since-cursor; capped at 99+ to avoid expensive scans.</p>
+<h3>8.6 Notifications</h3>
+<p>Mention or DM triggers a job: if user has no live socket within 30s, route via APNs/FCM, else only update unread count. Email digest for 24h-stale mentions.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Mega-workspaces (500k users):</b> single shard becomes hot. Sub-shard by channel_id within workspace, or move giant tenants to dedicated shards (multi-tenant + dedicated hybrid).</li>
+  <li><b>#general fan-out:</b> a 100k-member channel broadcast = 100k push events. Use fan-out workers behind Kafka, batch by region, drop typing events under pressure.</li>
+  <li><b>Search ACL drift:</b> reindex amplification when an admin renames a channel; mitigate with versioned ACL doc and lazy filter at query time.</li>
+  <li><b>Hot threads:</b> a viral thread gets 10k replies; cap real-time fan-out and switch to pull-based after threshold.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>MySQL/Vitess sharded by workspace</td><td>Strong tenant isolation, ACID</td><td>Whale tenants need re-sharding</td></tr>
+<tr><td>Solr separate from primary store</td><td>Optimized for full-text</td><td>Eventual consistency for search</td></tr>
+<tr><td>WebSocket per workspace</td><td>Clear isolation, ACL local</td><td>N sockets for N workspaces</td></tr>
+<tr><td>ACL stamped at index time</td><td>Cheap query filter</td><td>Reindex on membership change</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — workspace-based sharding, secondary indexes (Solr) vs partitioning.</li>
+  <li>Ch. 3 Storage &amp; retrieval — inverted indexes for full-text search.</li>
+  <li>Ch. 11 Stream processing — Kafka pipeline from messages to search index.</li>
+  <li>Ch. 12 Future of data — derived datasets and reindex flows.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd treat workspace_id as the universal shard key from day one — every query carries it, which makes Vitess routing trivial."</li>
+  <li>"Search ACL is the subtle hard part: stamp ACL into docs and reconcile on membership change; pure query-time filtering doesn't scale."</li>
+  <li>"For 500k-user enterprise tenants, I'd offer a dedicated-shard tier rather than try to make one fit-all shard size work."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>MySQL + Vitess</td><td>Workspace-sharded MySQL gives ACID for edits, reactions, and unread cursors — needed because every message can be mutated, unlike WhatsApp. Vitess automates resharding when an enterprise tenant outgrows a shard, sustaining 60k peak msgs/sec across millions of workspaces.</td><td>Postgres + Citus (less mature for this scale), Cassandra (no transactions for edits), DynamoDB (cost + vendor lock-in)</td></tr>
+    <tr><td>WebSockets (WSS) per workspace</td><td>One socket per workspace gives clear ACL isolation — the gateway only subscribes a socket to topics that workspace member can read, simplifying the 5M concurrent socket fleet on ~50 boxes. Bidirectional frames are required for typing, presence, and message_event push under the 500 ms p99 budget.</td><td>HTTP long-poll (extra latency, no presence semantics), Server-Sent Events (one-way only), gRPC streaming (browser support gaps)</td></tr>
+    <tr><td>Solr (search cluster)</td><td>Full-text search across 200B docs with the 800 ms p95 NFR demands an inverted index, which neither MySQL nor Vitess can serve. Per-workspace shards give tenant isolation so a noisy enterprise can't tank others, and ACL-stamped docs let the query filter as a cheap term.</td><td>Elasticsearch (similar; Slack chose Solr historically for tenant-shard control), Postgres FTS (doesn't scale to 1 PB SSD), MeiliSearch (too young for this scale)</td></tr>
+    <tr><td>Kafka (indexing pipeline)</td><td>Decouples the 18k-avg/60k-peak msgs/sec write path from the eventually-consistent search index. Replayable log lets us rebuild Solr from scratch after schema changes, and ACL reindex jobs (channel renames, member churn) consume the same stream.</td><td>RabbitMQ (no replay), Kinesis (vendor lock-in), direct dual-write (loses messages on Solr outage)</td></tr>
+    <tr><td>Redis (presence + pub/sub bus)</td><td>Per-user, per-channel pub/sub fan-out at 600k reads/sec needs sub-millisecond latency — only an in-memory store qualifies. Per (user, channel) unread cursors with periodic flush to MySQL ride on the same fleet, capping cost.</td><td>NATS (less mature ops at Slack's vintage), Memcached (no pub/sub), in-DB pub/sub (puts hot path on disk)</td></tr>
+    <tr><td>Memcached (recent-history cache)</td><td>Reads are 10x writes (~600k/sec); the last few hundred messages of every active channel cache cleanly with LRU. Avoids hammering Vitess shards on common "open channel" UX, hitting the 500 ms p99 receive target.</td><td>Redis (overkill for plain key/value), in-app LRU (doesn't share across gateways), CDN cache (data is per-user-ACL-filtered)</td></tr>
+    <tr><td>S3 + CDN (file storage)</td><td>50 PB of files at compliance retention dwarfs the 2 PB/year message store; durable object storage with edge caching is the only economical fit and offloads bandwidth from the chat plane. Pre-signed URLs let clients upload/download direct.</td><td>Self-hosted Ceph (ops burden), HDFS (not edge-friendly), embedding files in MySQL (insanity at 50 PB)</td></tr>
+    <tr><td>APNs / FCM / Email (notification svc)</td><td>30 s "no live socket" window triggers mobile push for mentions and DMs; only the OS push channels reach a backgrounded device. Email digest layer covers 24 h-stale mentions for users who never opened the app.</td><td>SMS (cost), web push only (no iOS background), polling (drains mobile battery)</td></tr>
+    <tr><td>microsecond-timestamp message id (ts DECIMAL(16,6))</td><td>Doubles as primary key, sort key, and pagination cursor in one column — a single clustered index serves both history range scans and edits. Avoids the cost of a separate snowflake service for ~18k inserts/sec.</td><td>Snowflake-style 64-bit IDs (extra service), UUIDs (random writes hurt Vitess), auto-increment (gaps under failover)</td></tr>
+    <tr><td>ACL stamped at index time (denormalized)</td><td>Query-time ACL join across 200B docs would blow the 800 ms p95 search NFR. Writing the channel member list into each document lets Solr filter as a cheap term — paid back by background reindex on membership change.</td><td>Pure query-time ACL filter (slow), per-user index shards (storage explosion), trusted client filtering (security risk)</td></tr>
+    <tr><td>JSON (blocks column for rich text)</td><td>Slack's block kit is hierarchical and optional fields evolve frequently; a flexible JSON column avoids an ALTER TABLE every time a new block type ships. MySQL 5.7+ JSON support is enough for the rare server-side path queries.</td><td>Per-block tables (write amplification), MEDIUMTEXT serialization (no querying), Protobuf BLOB (opaque to ops tools)</td></tr>
+    <tr><td>Compliance audit table</td><td>Per-workspace export and retention policies are an explicit NFR; an audit table tracks every edit/delete so the original content survives the live row's mutation. Required for regulated tenants (HIPAA, FINRA).</td><td>Soft-delete flag (loses content history), event sourcing the whole DB (overkill), trusting Kafka log (retention too short)</td></tr>
+  </tbody>
+</table>

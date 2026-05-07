@@ -1,0 +1,132 @@
+<h1>Design Edge Cache Invalidation (purge at billions of files)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">cdn</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a CDN purge subsystem. A customer publishes a CMS update and expects the new HTML to appear globally in &lt; 5 seconds, across 300 POPs and tens of thousands of cache servers, without nuking adjacent cache that's still valid. We must support URL purge, prefix/wildcard purge, and tag-based purge over a working set of 100 B+ cache entries.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Purge by exact URL, by URL prefix, by surrogate key (Cache-Tag).</li>
+  <li>Purge propagation to all 300 POPs in &lt; 5 s p99.</li>
+  <li>Idempotent and replay-safe (purges can be retried during partition).</li>
+  <li>Customer-scoped: a purge from tenant A cannot affect tenant B's keys.</li>
+  <li>Audit log of purge events for 90 days.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Throughput:</b> 1 M purge ops/sec aggregate; bursts of 100 M tag-purge fan-outs.</li>
+  <li><b>Latency:</b> p50 propagation 1.5 s, p99 5 s, p999 30 s globally.</li>
+  <li><b>Storage:</b> 100 B cache entries; tag index 10× that.</li>
+  <li><b>Availability:</b> 99.99%; cache must "fail open" — invalidation outage cannot break serving.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Purge events: 1 M/s × 86,400 = 86 B/day. Each event ~200 bytes → 17 TB/day raw.</li>
+  <li>Fan-out per event: 1 → 300 POPs × ~200 boxes/POP = 60 k targets, but we deliver per-POP not per-box (POP-local broadcast).</li>
+  <li>Tag-index: avg 50 URLs per tag, p99 1 M URLs per tag (e.g. "homepage" tag).</li>
+  <li>Bandwidth for purge bus: 1 M/s × 200 B × 300 POPs = 60 GB/s on the global pub/sub.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /api/v4/zones/{z}/purge_cache  { "files": ["https://x.com/a.css", "..."] }
+POST /api/v4/zones/{z}/purge_cache  { "tags":  ["homepage", "user-42"] }
+POST /api/v4/zones/{z}/purge_cache  { "prefixes": ["https://x.com/blog/"] }
+POST /api/v4/zones/{z}/purge_cache  { "everything": true }
+GET  /api/v4/zones/{z}/purge_cache/status/{purgeId} → { state, completed_pops }</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Customer API] → [Purge Coordinator] → [Global Pub/Sub bus]
+                                              │
+                  ┌───────────────────────────┼───────────────────────────┐
+                  ▼                           ▼                           ▼
+            [POP-1 Relay]                [POP-2 Relay]      ...      [POP-300 Relay]
+                  │                           │                           │
+              fanout to                   fanout to                   fanout to
+            ~200 cache boxes           ~200 cache boxes            ~200 cache boxes
+                  │
+                  ▼
+          [Local Tag Index] → mark entries tombstoned
+</div>
+<p>The purge coordinator validates the request, assigns a monotonic <code>purgeId</code> (Lamport-style), and writes it to a globally-replicated, ordered log (Kafka-like, or a Quicksilver-style KV per Cloudflare). Each POP runs a relay that subscribes to the log and broadcasts purges intra-POP via UDP multicast or a local gRPC fanout.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Tag index (per cache box)</h3>
+<pre>// In-memory inverted index, persisted hourly
+tag_to_keys: HashMap&lt;tag, RoaringBitmap&lt;cache_key_id&gt;&gt;
+key_to_tags: HashMap&lt;cache_key_id, Vec&lt;tag&gt;&gt;</pre>
+<h3>7.2 Tombstone vs eviction</h3>
+<p>We don't physically delete on purge — that would require a synchronous index write under load. Instead, each cache entry stores a <code>generation</code> counter and a <code>min_valid_purge_id</code>. A purge bumps the per-tag/zone generation; a read compares and treats stale generations as MISS. Physical reclaim happens lazily.</p>
+<h3>7.3 Wildcard / prefix</h3>
+<p>Prefix purges materialize into "purge generations" stored in a per-zone trie. Lookup at read time checks each prefix ancestor. This avoids enumerating all matching keys at write time, which would be O(billions).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Purge coordinator</h3>
+<p>Stateless tier behind a regional API gateway. Authenticates, rate-limits per zone (e.g. 1k purge/sec), computes the canonical event, and writes to the ordered log with a fsync barrier. Returns <code>purgeId</code> immediately; propagation is async.</p>
+<h3>8.2 Global ordered log</h3>
+<p>Multi-region Raft (DDIA Ch. 5 leader-based replication, Ch. 9 linearizability). Single global leader for write order; followers in every region for read-side fanout. RPO 0 for purges by paying ~80 ms write latency. This is acceptable because we acked async to the customer.</p>
+<h3>8.3 POP relay</h3>
+<p>Subscribes to its regional follower, batches purges (10 ms windows), and pushes a compact bitmap to all in-POP cache boxes via UDP multicast (best-effort) plus a gRPC reconciliation channel (eventually consistent). Boxes that fall behind catch up by replaying from the log offset they last acked.</p>
+<h3>8.4 Tag-purge fan-out at scale</h3>
+<p>A tag like <code>"homepage"</code> may map to 100 M URLs. We never enumerate keys on the wire. We send the <i>tag</i> + a new generation; each box bumps its in-memory generation map (O(1) write). Cost is shifted to read time: a read does a generation lookup per tag (still O(k) for k tags on the entry, k≤8 typical).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot zone purge storms:</b> per-zone rate-limit + coalescing window (combine 50 purges in 100 ms).</li>
+  <li><b>Log leader bandwidth:</b> shard the log by zone-id hash; cross-shard purges are rare.</li>
+  <li><b>Box catching up after partition:</b> cache treats unknown generations as MISS — fail safe, but origin load spikes; mitigate with shield POP.</li>
+  <li><b>Clock skew:</b> never use wall clocks for ordering — use the log's monotonic offset (Ch. 8).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Tombstone via generation counter</td><td>O(1) write at any scale</td><td>Slight read overhead; generation map must be durable</td></tr>
+<tr><td>UDP multicast intra-POP</td><td>Microsecond fan-out, no per-box RPC</td><td>Lossy; needs reconciliation channel</td></tr>
+<tr><td>Single global Raft leader</td><td>Total order, deterministic replay</td><td>Cross-region write latency 80–150 ms</td></tr>
+<tr><td>Lazy physical eviction</td><td>Decouples write from delete cost</td><td>Disk usage temporarily inflated</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — leader-based ordered log; followers per region.</li>
+  <li>Ch. 8 Distributed Systems — partial failure during fanout, the impossibility of synchronous global delete, why we accept eventual consistency with bounded staleness.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — linearizability of purgeId issuance via Raft; reads are sequentially consistent at each box.</li>
+  <li>Ch. 11 Stream Processing — the purge log as a Kafka-style log consumed by every POP relay.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Purge is a write-amplification problem disguised as a delete problem. Generation counters trade read-time cost for unbounded write-time cost — the right trade for a CDN."</li>
+  <li>"I deliberately keep the customer ack on the regional coordinator, not on global propagation, so that one bad POP doesn't increase your purge p99 to 30 seconds."</li>
+  <li>"The hairy edge case is a partitioned POP returning stale content for an hour. My answer: the cache fails closed on unknown generations, accepting an origin spike over correctness violations."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Multi-region Raft (purge ordering)</td><td>1 M purge ops/sec demand a globally-monotonic purgeId for deterministic replay. Raft's leader-based total order gives linearizable issuance (DDIA Ch. 9), with ~80 ms cross-region commit latency that we hide by acking the customer at the regional coordinator before global propagation.</td><td>Paxos (more complex implementation); gossip (no total order); wall clocks (skew breaks ordering).</td></tr>
+<tr><td>Sharded Kafka-style ordered log</td><td>Sharding by zone-id hash spreads the 60 GB/s purge bus across log brokers; cross-zone purges are rare. Single-shard throughput would bottleneck at the leader's NIC at our 1 M/s aggregate.</td><td>Single global log (leader bandwidth ceiling); per-POP queues (no global order).</td></tr>
+<tr><td>Roaring bitmap tag index (per cache box)</td><td>Tags map to up to 1 M URLs each (e.g., "homepage"); roaring bitmaps compress 10–50× over plain HashSet, fitting the in-memory inverted index alongside the cache itself. Critical when each box stores billions of cache_key_ids.</td><td>HashSet&lt;keyId&gt; (memory blowout); B-tree (slower set ops); Bloom (false positives unacceptable for purge).</td></tr>
+<tr><td>Generation counter tombstones</td><td>Physical delete on purge would require synchronous index writes — impossible at 100 M tag-purge fan-out. Generation bumps are O(1) per tag/zone; reads pay an O(k≤8) lookup. Trades read-time cost for unbounded write-time cost — the right call for a CDN with read:purge ratio of 50,000:1.</td><td>Synchronous delete (write amp at billions of keys); tombstone records (storage growth).</td></tr>
+<tr><td>UDP multicast intra-POP fanout</td><td>~200 boxes per POP × 300 POPs = 60k targets. Per-box gRPC RPC fan-out adds milliseconds and CPU; UDP multicast is microsecond-fast and one-to-many native. The lossiness is acceptable because we layer a gRPC reconciliation channel for catch-up.</td><td>Per-box gRPC (fanout latency); SSE (TCP per-box still); Redis pub/sub (single-process bottleneck).</td></tr>
+<tr><td>gRPC reconciliation channel</td><td>UDP loss + box restarts mean some targets miss purges. Each box tracks its last-acked log offset; gRPC pull-based catch-up replays gaps. Required to hit the 5 s p99 propagation SLA even when 0.1% of multicast packets drop.</td><td>UDP-only (correctness violations); pull-only (defeats purpose of push).</td></tr>
+<tr><td>Per-zone purge trie (prefix purges)</td><td>Materializing prefix purges into key sets at write time is O(billions). Instead, store prefix generations in a per-zone trie and check ancestors at read time — turns a write-amplified operation into a bounded-cost read.</td><td>Enumerate keys (O(billions) write); regex match per request (CPU per read).</td></tr>
+<tr><td>Quicksilver-style replicated KV (purge state mirror)</td><td>Beyond the ordered log, each POP needs a queryable view of "what generations are current per zone/tag." Quicksilver's leader-based KV (DDIA Ch. 5) replicates this in &lt;1 s with bounded-staleness reads at the box level.</td><td>etcd (write throughput limit at 1 M/s); Consul (gossip storms).</td></tr>
+<tr><td>Per-zone token-bucket rate limiting</td><td>Hot zones can flood purge with 10k/sec, melting the coordinator. 1k purge/sec/zone with a 100 ms coalescing window combines bursts (50 purges → 1 log entry), keeping log offsets dense and propagation fast.</td><td>No rate limit (DoS surface); global rate limit (penalizes well-behaved tenants).</td></tr>
+<tr><td>Lamport-style monotonic purgeId</td><td>Boxes catching up after a partition need to know exactly where they are. Monotonic IDs make replay deterministic and detect missing entries in O(1). Wall-clock IDs would corrupt order under skew (DDIA Ch. 8).</td><td>UUID (no ordering); wall-clock timestamp (skew breaks replay).</td></tr>
+<tr><td>fsync write barrier on the log</td><td>Customer ack requires durability — a power loss must not lose acked purges. fsync at the log adds ~5 ms per write but guarantees RPO 0 for purge events. Acceptable since we ack regionally before global fanout.</td><td>Async fsync (lose acked purges); no durability (correctness violations).</td></tr>
+<tr><td>Hourly snapshot of in-memory tag index</td><td>Box restarts can't replay 86 B daily purge events. Hourly snapshots + delta replay from the log offset cap recovery time at minutes, not days. Necessary because the index doesn't fit in fsync-able write paths.</td><td>Replay-only (slow recovery); per-purge persistence (write amplification).</td></tr>
+<tr><td>Audit log in cold object store (S3/GCS)</td><td>90 days × 86 B events × 200 B = 1.5 PB cold data. S3 with lifecycle to Glacier hits compliance retention at &lt;$10k/month, vs. keeping it in the hot Raft log which would 100× cost.</td><td>Hot DB (cost); on-box logs (lost on box failure).</td></tr>
+</tbody>
+</table>
+

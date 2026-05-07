@@ -1,0 +1,137 @@
+<h1>Design Multi-channel Notification Orchestrator (channel choice, dedup, prefs)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">notifications</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the brain in front of push, email, SMS, and in-app channels. Given a logical event ("order shipped"), the orchestrator must pick the optimal channel(s) per user, respect quiet hours and channel preferences, deduplicate against recently sent notifications, throttle per category, and fall back across channels on non-delivery. Targets: 2B logical events/day across 200M users.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Single API: <code>notify(userId, eventType, payload)</code> — orchestrator decides channels.</li>
+  <li>Per-user channel preferences and quiet hours (with timezone).</li>
+  <li>Per-category frequency caps (e.g., max 3 marketing/day).</li>
+  <li>Deduplication on (userId, eventKey) within configurable window.</li>
+  <li>Channel fallback: if push not delivered in N minutes, fall back to email.</li>
+  <li>A/B testing of channel-mix policies.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> orchestration decision under 100 ms p95.</li>
+  <li><b>Scale:</b> 2B events/day, 23k events/sec avg, 100k/sec peak.</li>
+  <li><b>Availability:</b> 99.95%; user prefs are critical and read-heavy.</li>
+  <li><b>Consistency:</b> preference reads strongly consistent or near-RT.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 23k avg, 100k peak.</li>
+  <li>User pref store: 200M users × 1 KB = 200 GB; Redis hot cache 32 GB (top 10% active).</li>
+  <li>Dedup state: 2B events × 1 KB key/value × 24h = ~30 GB; Redis cluster.</li>
+  <li>Decision logs: 2B/day × 500 B = 1 TB/day → S3 + Parquet for offline analysis.</li>
+  <li>Engagement features: 200M users × 100 features × 4 B = 80 GB feature store.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/notify              {userId, eventType, payload, dedupKey, ttl}
+PUT  /v1/users/{id}/prefs    {channels:{push:true,email:true,sms:false}, quietHours, locale, tz}
+POST /v1/categories          {category, frequencyCap, fallbackOrder:[push,email,sms]}
+GET  /v1/notify/{id}                                                  -> decision, attempts, status</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Caller] -> [Orchestrator API]
+                  |
+                  v
+        [Decision Engine] -- reads --> [Pref Cache: Redis]
+                  |                    [Feature Store: KV]
+                  |                    [Dedup Store: Redis SETNX]
+                  |
+        +---------+----------+----------+
+        v         v          v          v
+   [Push Topic] [Email] [SMS Topic] [In-app Topic]
+        |         |          |          |
+        v         v          v          v
+    Push Svc   Email Svc   SMS Svc    Inbox Svc
+        \________________________/
+                  |
+                  v
+        [Status Aggregator] -> [Fallback Scheduler] -> re-enqueue if needed
+</div>
+<p>Each channel emits delivery events back to a status aggregator. The fallback scheduler is a delay-queue (Kafka + per-event timer or Redis sorted set keyed by deadline) that triggers next-channel attempts when a primary channel doesn’t confirm delivery within its grace window.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Preferences (DynamoDB / Cassandra)</h3>
+<pre>CREATE TABLE prefs (
+  user_id text PRIMARY KEY,
+  channels map&lt;text, boolean&gt;,
+  quiet_start time, quiet_end time, tz text,
+  category_overrides map&lt;text, frozen&lt;pref&gt;&gt;
+);</pre>
+<h3>7.2 Dedup &amp; rate-limit (Redis)</h3>
+<pre>SETNX dedup:{user}:{eventKey} 1 EX 86400
+INCR ratelimit:{user}:{category}:{day} EX 86400</pre>
+<h3>7.3 Decision log (Kafka -> S3 Parquet)</h3>
+<p>Every decision is logged with the inputs, chosen channels, and policy version for offline analysis and audit.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Decision engine</h3>
+<p>Pipeline of stages: <i>load prefs → dedup check → frequency-cap check → quiet-hour shift → channel selection → policy override</i>. Each stage is a pure function with a typed input/output, enabling unit tests and policy versioning. Decisions are emitted to a Kafka topic before any channel send for replayability.</p>
+<h3>8.2 Channel selection policy</h3>
+<p>Default policy: <code>push if device-active in 7d, else email, else SMS for high-priority only</code>. Engagement-aware: a learned model scores channel effectiveness from the feature store and the engine picks argmax above a threshold. Bandit experiments are scoped per category.</p>
+<h3>8.3 Fallback scheduler</h3>
+<p>For events with <code>fallbackOrder=[push,email]</code> and grace=10 min: write a delayed message to Kafka via a Redis ZSET keyed by <code>now + 600s</code>. A poller scans due items every 1 s and re-runs decision with channel masked to the next in order. Cancel on success event.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Pref read amplification:</b> 100k decisions/sec × 1 read = 100k Redis GETs/sec → use a near-cache (process-local LRU) with 10 s TTL to halve traffic.</li>
+  <li><b>Dedup hot users:</b> a server emitting 1k events for one user/sec; shard dedup keys with user-bucket suffix to spread load.</li>
+  <li><b>Quiet-hour holdback:</b> events queued for 8h sleep need a durable timer service; use Kafka log compaction + replay rather than huge Redis ZSETs.</li>
+  <li><b>Policy rollout:</b> bad policy version can drop notifications; canary 1% then 5% then 100%.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Centralized orchestrator</td><td>Single place for prefs/dedup</td><td>Becomes a hot dependency</td></tr>
+<tr><td>Async fallback (delay queue)</td><td>Flexible, durable</td><td>Adds 5–15 min E2E latency</td></tr>
+<tr><td>Strong consistency for prefs</td><td>No surprise deliveries after opt-out</td><td>Higher read latency</td></tr>
+<tr><td>Learned channel selection</td><td>Higher engagement</td><td>Hard to debug; needs offline eval</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 7 Transactions — idempotent enqueue with dedup key prevents duplicate notifications across retries.</li>
+  <li>Ch. 11 Stream Processing — orchestrator emits decisions to Kafka; channel services are downstream consumers. Status events feed back into the fallback scheduler as a windowed join.</li>
+  <li>Ch. 12 Future of Data Systems — derived state (engagement features) is rebuilt from the decision/event log.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd treat the orchestrator as a pure decision service that emits intent to Kafka — channel services are isolated and can degrade independently."</li>
+  <li>"The hardest part is dedup correctness across retries and channel fallbacks; I'd key on (userId, eventKey, channel) with a 24h TTL."</li>
+  <li>"Quiet hours look simple but timezone math is brutal — store IANA tz string per user and reject ambiguous times."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Apache Kafka (decision log + channel topics)</td><td>2B events/day = 23k avg / 100k peak/sec must flow through the orchestrator without backpressuring callers; Kafka's partitioned log gives durable replay for policy debugging and decouples decision-making from per-channel send latency.</td><td>RabbitMQ (per-msg ack throttle hurts at 100k/s); Pulsar (operational overhead unjustified vs Kafka here).</td></tr>
+<tr><td>Redis cluster (preferences cache)</td><td>100k decisions/sec × pref read = 100k Redis GETs/sec must clear under 1 ms; sharded Redis with 32 GB hot cache covers the top 10% active users (200 GB total prefs) and a process-local LRU near-cache halves backend traffic.</td><td>Memcached (no native cluster mode for failover); in-process only (incoherent across orchestrator pods).</td></tr>
+<tr><td>Redis SETNX (dedup store)</td><td>Dedup window of 24h × 2B events/day = ~30 GB of keys; SETNX with EX=86400 atomically claims (userId, eventKey) so retries and channel fallbacks can't double-fire — a critical correctness primitive across the 100k/s peak.</td><td>Postgres unique index (write contention at 100k/sec); Bloom filter (false positives drop legitimate notifications).</td></tr>
+<tr><td>DynamoDB / Cassandra (preferences store)</td><td>200M users × 1 KB = 200 GB read-heavy with strong-consistency requirement on opt-out; DynamoDB's strongly-consistent reads cost 2× but guarantee no notification after the user toggles off (regulatory + UX).</td><td>Postgres (200 GB single-primary read scaling caps before 100k/sec); MongoDB (eventual consistency risks unwanted sends).</td></tr>
+<tr><td>Redis ZSET (delay queue / fallback scheduler)</td><td>Fallback grace window of 10 min × 100k/sec = 60M in-flight delayed jobs; Redis sorted sets keyed by deadline give O(log N) ZADD and O(1) ZPOP for the 1-second poller — Kafka delayed delivery isn't native and would need a separate delay topic per grace duration.</td><td>Kafka per-delay-topic (topic explosion); Quartz / DB-backed timer (DB lock contention at 100k/s).</td></tr>
+<tr><td>Process-local LRU cache (10s TTL)</td><td>At 100k decisions/sec, the orchestrator pod farm is the bottleneck on Redis; a 10-second LRU on userId → prefs cuts Redis traffic by ~50% while staying within the "near-RT" preference-consistency NFR.</td><td>No cache (Redis QPS doubles); 60-second TTL (post opt-out window too wide).</td></tr>
+<tr><td>S3 + Parquet (decision audit log)</td><td>2B/day × 500 B = 1 TB/day decision logs for offline policy evaluation, A/B analysis, and audit; columnar Parquet on S3 gives 10× compression and Athena/Presto-friendly scan for ad-hoc queries on policy version drift.</td><td>Postgres OLAP (1 TB/day ingest melts WAL); ClickHouse (great but heavier ops than S3+Athena for offline-only).</td></tr>
+<tr><td>Feature store (KV) for engagement features</td><td>Channel-selection model needs 100 features × 200M users = 80 GB at p95 sub-ms read on the hot path; a managed feature store (Feast / DynamoDB) keeps online inference budget under the 100 ms p95 decision SLO.</td><td>Database join at decision time (latency blowout); Redis only (no offline/online consistency for training).</td></tr>
+<tr><td>IANA timezone strings (quiet hours)</td><td>Quiet-hour shift requires correct DST handling for 200M users globally; storing <code>America/Los_Angeles</code> rather than UTC offset survives DST transitions and ambiguous times that would otherwise misfire 2x/year.</td><td>Fixed UTC offset (breaks DST); user-supplied "PST" abbreviation (ambiguous, e.g., PST/PDT).</td></tr>
+<tr><td>Multi-armed bandit (channel A/B)</td><td>Per-category bandits learn channel effectiveness from real-time engagement events; Thompson sampling auto-balances exploration/exploitation without manual experiment cutovers — at 23k/sec we can converge on the winning policy within hours.</td><td>Fixed A/B with manual cutoff (slow, requires analyst); rule-based heuristics (no improvement loop).</td></tr>
+<tr><td>Canary policy rollout (1% → 5% → 100%)</td><td>A bad policy version can drop notifications silently; canary gating with decision-log diffing catches regressions before they hit 200M users — at 2B events/day even a 0.1% bad-decision rate is 2M misfires.</td><td>Big-bang deploy (catastrophic blast radius); shadow-mode only (no real user impact signal).</td></tr>
+<tr><td>Kubernetes HPA + KEDA (orchestrator pods)</td><td>4× spike from 23k → 100k/sec needs autoscaling on Kafka lag (KEDA) rather than CPU alone; CPU lags real demand by 30s+ which would queue 3M decisions before scaling triggers.</td><td>Static fleet sized for peak (5× cost); CPU-only HPA (slow reaction to event spikes).</td></tr>
+</tbody>
+</table>

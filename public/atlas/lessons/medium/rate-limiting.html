@@ -1,0 +1,76 @@
+<h1>Distributed counters & rate limiting (token / leaky bucket)</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">rate-limiting</span>
+  <span class="tag">token-bucket</span>
+  <span class="tag">leaky-bucket</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Rate limiting is a distributed counter problem in disguise. You want to allow up to N requests per window per key (user, IP, API token) across a fleet of stateless servers. The two classical algorithms — <b>token bucket</b> (allows bursts up to bucket size, refills at rate r) and <b>leaky bucket</b> (smooths to a steady drip) — give you different shapes of "fair". Implementing them <i>correctly</i> when ten edge servers see the same user simultaneously is where the interesting engineering lives.</p>
+
+<h2>Why it matters</h2>
+<p>Without rate limits, one buggy client or one motivated attacker can consume your entire capacity. With <i>wrong</i> rate limits — counted only locally per server, or with a sliding window that's actually a fixed window — limits leak by 2x at the edges. Every public API (Stripe, GitHub, Twitter) lives or dies by this; in interviews, "design a rate limiter" is its own canonical question.</p>
+
+<h2>Token bucket vs leaky bucket</h2>
+<ul>
+  <li><b>Token bucket:</b> Bucket of capacity B, refilled at r tokens/sec. Each request consumes 1 token; if empty, reject. Allows bursts up to B, then settles to r/sec. Used by AWS, Stripe.</li>
+  <li><b>Leaky bucket (queue):</b> Requests enter a fixed-size FIFO; processed at rate r. Excess requests overflow and are dropped. Output rate is constant — good when downstream cannot tolerate bursts.</li>
+  <li><b>Fixed window:</b> Count per minute, reset at boundary. Simple, but a user can do 2N requests across the boundary (last 30s of minute 1 + first 30s of minute 2).</li>
+  <li><b>Sliding window log:</b> Store every timestamp, count those within the last 60s. Accurate but memory-heavy.</li>
+  <li><b>Sliding window counter:</b> Weighted blend of current and previous fixed window — cheap and ~1% accurate.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  Token bucket
+  refill r/sec
+       │
+       ▼
+   ┌───────┐         req ──► take 1 token ──► allow
+   │ ▓ ▓ ▓ │         empty ────────────────► reject (429)
+   │ ▓ ▓ ▓ │
+   └───────┘  capacity B (burst size)
+
+  Leaky bucket
+   req ──► [ □ □ □ ░ ░ ░ ] ──drip r/sec──► allow
+                  └ overflow ──► reject
+</div>
+
+<h2>Doing it across N servers</h2>
+<p>Local counters are wrong: ten servers each allowing 100 rps means the user gets 1000 rps. Real options:</p>
+<ul>
+  <li><b>Centralized Redis with Lua:</b> Atomic INCR + EXPIRE, or a Lua script implementing token bucket. ~1ms per check, single source of truth, single point of failure if not replicated.</li>
+  <li><b>Sticky routing:</b> Hash user_id to a specific limiter shard. No coordination, but loses requests when a node dies.</li>
+  <li><b>Approximate / async:</b> Each edge keeps a local counter and gossips deltas every 100ms. Allows ~10% over-limit but stays up under partition.</li>
+  <li><b>Token-issuer:</b> A central authority hands out batches of tokens to edges; edges spend locally. Bursts well, recovers from edge crashes by not re-issuing.</li>
+</ul>
+
+<h2>Edge cases that bite</h2>
+<ul>
+  <li><b>Clock skew:</b> Sliding windows that compare wall clocks across hosts will mis-count. Use the Redis server clock as the single source.</li>
+  <li><b>Hot keys:</b> A single celebrity user can pin one Redis shard. Pre-shard popular keys (user_id + bucket_index % 4) and sum.</li>
+  <li><b>Cost-weighted requests:</b> A search endpoint costs 10x a ping. Charge tokens proportional to cost, not 1.</li>
+  <li><b>Soft vs hard limits:</b> Reject with 429 + <code>Retry-After</code> header so clients back off; don't just drop the connection.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Using fixed window and calling it "100 rps" when it's actually "200 rps at boundaries".</li>
+  <li>Implementing the limiter in app memory and forgetting it resets on deploy.</li>
+  <li>Not having a kill-switch to disable limits during incidents.</li>
+  <li>Returning 500 instead of 429 — clients don't know to slow down and retry storms make it worse.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> An API at 1M rps globally needs per-API-key limits of 100 rps with 200-token burst. Edge fleet is 200 servers across 5 regions. Design the limiter — describe data flow, where state lives, and what happens when one region partitions.
+  <br/>
+  <b>Hint:</b> A pure central Redis won't survive. Consider a token-issuer with regional caches that fall back to local approximate counting under partition.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-rate-limiter">Design a rate limiter</a> — the canonical version with throughput numbers.</li>
+  <li><a href="#problem/design-distributed-counter">Design a distributed counter</a> — the underlying primitive.</li>
+  <li><a href="#problem/design-api-gateway">Design an API gateway</a> — where rate limiting actually lives in production.</li>
+</ul>

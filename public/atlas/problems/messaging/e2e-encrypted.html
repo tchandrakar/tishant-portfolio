@@ -1,0 +1,156 @@
+<h1>Design End-to-End Encrypted Messaging (Signal protocol, double ratchet)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Very Hard</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design an E2E-encrypted messaging service: only sender and recipient devices can read message content; the server only sees opaque ciphertext, routing metadata, and what it must to deliver. Implement the Signal protocol — X3DH for key agreement, double ratchet for forward secrecy and post-compromise security. Support multi-device, group chats, and asynchronous delivery (the recipient can be offline when sent). Real Signal serves ~50M MAU; WhatsApp uses the same protocol at 100B msgs/day.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Identity registration; per-device key bundles uploaded to server.</li>
+  <li>Async first message: sender derives a session without recipient online (X3DH).</li>
+  <li>Forward secrecy and post-compromise security via double ratchet.</li>
+  <li>Group chat with sender keys (Signal group v2 / MLS for larger groups).</li>
+  <li>Multi-device: message encrypted to all of recipient's devices.</li>
+  <li>Safety numbers / key verification for users to detect MITM.</li>
+  <li>Sealed sender (server doesn't know who sent a message).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 send-to-deliver under 500 ms.</li>
+  <li><b>Scale:</b> 100M users, 1B msgs/day, peak 30k msgs/sec.</li>
+  <li><b>Availability:</b> 99.95% delivery plane.</li>
+  <li><b>Privacy:</b> server learns minimum metadata; "private contact discovery" via SGX or PIR.</li>
+  <li><b>Crypto correctness:</b> deterministic, audited, no homegrown primitives.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 1B/day ≈ 12k/sec avg, peak 30k/sec.</li>
+  <li>Prekey storage: 100M users * 100 one-time prekeys * 32B ≈ 320 GB; per-device, multi-device 4x = ~1.3 TB.</li>
+  <li>Mailbox: ciphertext queued until delivery; assume 10% recipients offline ⇒ 100M msgs * 1.5KB = 150 GB transient.</li>
+  <li>Sealed-sender tokens: 100M * 64B = 6.4 GB rotated weekly.</li>
+  <li>Network: 1.5KB * 30k/sec = 360 Mbps text.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Identity / keys
+POST /v1/keys                {identityKey, signedPreKey, oneTimeKeys[]}
+GET  /v1/keys/{userId}/{deviceId}                      → bundle
+PUT  /v1/keys/replenish      {oneTimeKeys[]}
+
+// Messaging
+POST /v1/messages/{recipientId}
+     headers: Sealed-Sender-Token  (authenticates without revealing sender)
+     body:    {deviceId, ciphertext, timestamp, type}
+WS   /v1/queue                                          → push of ciphertext
+
+// Group
+POST /v1/groups              {members[], senderKeyDist[]}
+POST /v1/groups/{id}/send    {ciphertext}               → fan-out</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Sender]──TLS──[Edge]──[Auth (sealed sender)]──[Key Server]
+                  │                                        │
+                  ▼                                  [Prekey Store]
+            [Mailbox Queue]──push──[Recipient Edge]──[Recipient]
+                  │
+              [Cassandra]
+                  │
+            [Contact Discovery (SGX)]
+</div>
+<p>Walk-through: at install, client publishes its identity key, signed prekey (rotated monthly), and 100 one-time prekeys to Key Server. To start a session, sender fetches recipient's bundle, runs X3DH to derive a shared secret, initializes a double-ratchet state, encrypts the first message, and POSTs ciphertext to the Mailbox. Recipient's edge pushes ciphertext when its socket is up; otherwise the Mailbox holds it until reconnect. Server never sees plaintext.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Prekey store</h3>
+<pre>CREATE TABLE prekeys (
+  user_id BIGINT, device_id INT, key_id INT,
+  pubkey BLOB, signature BLOB, used BOOLEAN,
+  PRIMARY KEY ((user_id, device_id), key_id));
+CREATE TABLE signed_prekey (
+  user_id BIGINT, device_id INT,
+  key_id INT, pubkey BLOB, signature BLOB, ts TIMESTAMP,
+  PRIMARY KEY ((user_id, device_id)));</pre>
+<h3>7.2 Mailbox</h3>
+<pre>CREATE TABLE mailbox (
+  user_id BIGINT, device_id INT, msg_id TIMEUUID,
+  sender_blind BLOB,         -- sealed sender opaque to server
+  ciphertext BLOB, ts TIMESTAMP,
+  PRIMARY KEY ((user_id, device_id), msg_id));</pre>
+<h3>7.3 Why Cassandra?</h3>
+<p>Per-(user, device) partition is naturally bounded; rows are deleted on delivery. Multi-DC with LOCAL_QUORUM gives durability without cross-ocean RTT. Append-only writes match LSM well.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 X3DH (Extended Triple Diffie-Hellman)</h3>
+<p>Sender computes 3 (or 4) DH operations: DH(IK_a, SPK_b), DH(EK_a, IK_b), DH(EK_a, SPK_b), DH(EK_a, OPK_b) — concatenated and HKDF'd into a 32-byte root key. The signed prekey gets verified with the recipient's identity key, preventing key substitution. The one-time prekey is consumed once; the server marks it used.</p>
+<h3>8.2 Double ratchet</h3>
+<p>Two interleaved ratchets: (a) <b>DH ratchet</b> — every reply, generate a new ephemeral DH key pair, derive a new root key; provides post-compromise security (an attacker who learns state can't decrypt future messages once you reply). (b) <b>Symmetric KDF chain</b> — within a sending streak, derive each message key from the previous; provides forward secrecy (compromise of current key doesn't reveal past messages). Out-of-order delivery handled by skipped-message keys cached up to a bound.</p>
+<h3>8.3 Sender keys for groups</h3>
+<p>Naive E2E group with N members = N pairwise ciphertexts per send. Sender keys: each member generates a chain key per group, shares it pairwise once. Subsequent sends are one ciphertext encrypted to that chain, server fans out. Member churn (someone leaves) requires the remaining members to rotate sender keys.</p>
+<h3>8.4 MLS for big groups</h3>
+<p>Sender-key approach is O(N) for membership change. MLS (Messaging Layer Security, RFC 9420) uses a binary tree (TreeKEM): membership change is O(log N). Worth adopting for groups &gt; ~50.</p>
+<h3>8.5 Sealed sender</h3>
+<p>The sender packages their identity (with signature) into the ciphertext envelope. The outer envelope is anonymous to the server — only the recipient decrypts and learns who sent it. The server still rate-limits via short-lived "delivery tokens" issued by an unlinkable token service.</p>
+<h3>8.6 Private contact discovery</h3>
+<p>Naive "send me your phonebook hashes" leaks the social graph. Use Intel SGX enclaves (Signal's approach) or oblivious PRF / PIR so the server can match contacts without learning the input set. The enclave attestation is verified by the client.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Prekey exhaustion:</b> heavy senders consume one-time prekeys faster than recipient replenishes. Server warns at 20%, falls back to signed prekey only (still secure but less PCS guarantees on first message).</li>
+  <li><b>Skipped-key memory:</b> reordered messages cause keys to be cached. Cap at 2000 per session, drop oldest (sender retransmits).</li>
+  <li><b>Group churn storms:</b> members leaving a 200-person group force ratchet rotations; batch with a 10s window.</li>
+  <li><b>Multi-device fan:</b> 4 devices/recipient * group fan = 4x ciphertexts; acceptable but plan for it.</li>
+  <li><b>Metadata leak:</b> traffic volume + timing remains visible — pad messages and add cover traffic for high-threat models.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>X3DH + Double Ratchet</td><td>Async first message, forward + PCS</td><td>Complex state per session</td></tr>
+<tr><td>Sender keys for groups</td><td>O(1) send</td><td>O(N) on membership change</td></tr>
+<tr><td>MLS / TreeKEM</td><td>O(log N) membership</td><td>More complex, newer</td></tr>
+<tr><td>SGX contact discovery</td><td>Server doesn't see graph</td><td>SGX has known side-channel attacks</td></tr>
+<tr><td>Sealed sender</td><td>Server doesn't see who sent</td><td>Anti-abuse harder; need tokens</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 9 Consistency &amp; consensus — ordering and out-of-order delivery semantics for ratchets.</li>
+  <li>Ch. 8 Distributed systems — Byzantine assumptions; the server is untrusted by design.</li>
+  <li>Ch. 11 Stream processing — push pipelines for ciphertext fan-out.</li>
+  <li>Ch. 6 Partitioning — per-(user, device) mailbox partitions.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I would never implement crypto from scratch — I'd use libsignal or an audited MLS library and treat the protocol as a black box."</li>
+  <li>"The hardest non-crypto part is contact discovery: privacy-preserving set membership at scale needs SGX or oblivious primitives, neither is free."</li>
+  <li>"Sealed sender plus rate-limit tokens is the cleanest way to keep anti-abuse working without giving the server identity metadata."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Signal protocol (libsignal)</td><td>Mandated by the "no homegrown primitives" NFR — libsignal is independently audited, used by Signal and WhatsApp at 100B msgs/day, and provides X3DH + double ratchet as a vetted black box. Reimplementing for 100M users would be reckless.</td><td>Custom protocol (audit risk), OMEMO (XMPP-only), OTR (no async first message)</td></tr>
+    <tr><td>X3DH key agreement</td><td>Async first message FR demands a recipient-offline session derivation; X3DH's 3-4 DH operations against a published prekey bundle gives that property with mutual authentication via the signed prekey. Standard, peer-reviewed.</td><td>Plain DH (no async), TLS-style handshake (requires both online), PGP exchange (manual key trust)</td></tr>
+    <tr><td>Double ratchet</td><td>Forward secrecy + post-compromise security are explicit FRs — only the double ratchet (DH ratchet on reply, symmetric KDF chain on streak) gives both. Skipped-key cache (capped at 2000) tolerates out-of-order delivery without losing messages.</td><td>Single ratchet (no PCS), per-message ECDH (handshake every message), AES-CTR with shared key (no FS)</td></tr>
+    <tr><td>MLS / TreeKEM (RFC 9420)</td><td>Sender-key group churn is O(N); a 200-member group losing a member triggers expensive rotations. MLS's TreeKEM brings membership change to O(log N), worth the complexity above ~50 members per FR.</td><td>Sender keys only (O(N) churn), pairwise per-member (O(N) send), homegrown tree (audit risk)</td></tr>
+    <tr><td>Cassandra (prekeys + mailbox)</td><td>Per-(user, device) partition is naturally bounded — prekeys are consumed-and-deleted, mailbox rows drop on delivery. LOCAL_QUORUM multi-DC matches the 99.95% delivery NFR without cross-ocean RTT inside the 500 ms p99 budget. LSM matches append + delete pattern.</td><td>DynamoDB (cost), Postgres (poor at append-delete churn), Redis (no durability for prekeys)</td></tr>
+    <tr><td>Sealed sender envelope</td><td>Privacy NFR requires "server learns minimum metadata" — wrapping sender identity inside an envelope opaque to the server is the only way to deliver without leaking who messaged whom. Recipient unwraps; server cannot.</td><td>Authenticated sender (leaks graph), Tor-style mix net (latency), no anti-abuse (spam blowup)</td></tr>
+    <tr><td>Unlinkable delivery tokens</td><td>Sealed sender removes identity from messages, breaking rate limits unless we re-introduce auth somehow. Short-lived tokens issued by an unlinkable service let the server rate-limit without learning who is sending — keeps abuse at bay under sealed sender.</td><td>No anti-abuse (spam), per-message login (defeats sealed sender), fixed API key (linkable)</td></tr>
+    <tr><td>Intel SGX (private contact discovery)</td><td>Naive "send your phonebook hashes" leaks the social graph; SGX runs the matching enclave-attested so the server's host OS can't see inputs. Used by Signal in production. Side-channel risks are documented but bounded.</td><td>Plain server lookup (graph leak), oblivious PRF (latency), full PIR (infeasible at 100M users), no contact discovery (UX dead)</td></tr>
+    <tr><td>Per-device prekey bundles</td><td>Multi-device FR (4 devices/user) means each device has its own ratchet — partition key (user_id, device_id) keeps the 1.3 TB total prekey storage scoped per device, and exhaustion of one device's prekeys doesn't affect others.</td><td>Single user-level bundle (broken multi-device security), in-memory only (lost on restart), per-message DH (no async)</td></tr>
+    <tr><td>WebSockets (push channel)</td><td>Recipient-online ciphertext push needs sub-500 ms p99 delivery; HTTP polling can't meet that across mobile networks at 30k peak msgs/sec. WS lets the edge stream queued ciphertexts immediately on socket open.</td><td>HTTP long-poll (latency, battery), SSE (one-way is fine, but WS chosen for symmetry with auth heartbeats), MQTT (no inherent advantage at this scale)</td></tr>
+    <tr><td>Sender keys (groups)</td><td>For groups under ~50 members the FR favors O(1) send cost over O(log N) churn; a single ciphertext fanned out by the server beats encrypting per-member at the device. Member churn forces a rotation, but it's bounded.</td><td>Per-member pairwise (O(N) send burns mobile battery), MLS for tiny groups (overkill complexity)</td></tr>
+    <tr><td>Signed prekey rotation (monthly)</td><td>The signed prekey bridges X3DH when one-time prekeys are exhausted; rotating monthly limits blast radius if it leaks while keeping replenishment simple. The signature with the identity key prevents server-side substitution attacks.</td><td>Static prekey forever (compromise window forever), per-day rotation (client churn), no signed prekey (server can substitute)</td></tr>
+    <tr><td>Padded ciphertext + cover traffic (high-threat)</td><td>Even with sealed sender, traffic volume and timing leak metadata; padding messages to fixed sizes and sending cover traffic blunt traffic analysis for users opting into a high-threat profile. Recognized but optional given bandwidth cost.</td><td>No padding (graph leakage), full constant-rate cover (bandwidth blowup), onion routing (latency)</td></tr>
+    <tr><td>Safety numbers / key verification</td><td>Users need an out-of-band way to detect MITM substitution of identity keys; safety numbers (SHA-256 of both identity keys, displayed as digits/QR) are the standard Signal-style UX. Direct FR for "users to detect MITM."</td><td>Trust-on-first-use only (no MITM detection), CA-style PKI (centralization), web of trust (UX nightmare)</td></tr>
+  </tbody>
+</table>

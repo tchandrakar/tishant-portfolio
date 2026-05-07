@@ -1,0 +1,177 @@
+<h1>Design Memcached (LRU, consistent-hash, multi-tenant)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a multi-tenant, in-memory look-aside cache fronting OLTP databases for a service with thousands of microservices. Targets: 50M ops/sec aggregate, p99 GET under 500 us, no replication (cache-only), elastic add/remove of nodes without invalidating &gt;1/N of keys, and noisy-neighbor isolation across tenants.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Commands: get, gets, set, add, cas, incr/decr, delete, flush_all, touch.</li>
+  <li>Per-tenant namespaces with quota in MB and ops/sec.</li>
+  <li>Consistent-hashing client with virtual nodes; warm rings on deploy.</li>
+  <li>TTL with lazy expiration + background reaper; LRU eviction when slab full.</li>
+  <li>Binary protocol over TCP and UDP for SET-and-forget low-latency reads.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 GET 100 us, p99 500 us same-AZ.</li>
+  <li><b>Throughput:</b> 200k req/s/node on 16-core; cluster of 250 nodes = 50M req/s.</li>
+  <li><b>Memory:</b> 128 GB/node, 32 TB cluster, hit rate &gt; 95%.</li>
+  <li><b>Availability:</b> Cache is best-effort; node loss degrades but never errors out.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>1B daily active users * 50 reads/user = 50B reads/day = 580k reads/sec average, 5x peak = 2.9M/s — easily handled by &lt;20 nodes; budget 250 for tenant isolation.</li>
+  <li>Object mix: 1 KB avg, 30B keys cached → 30 TB working set.</li>
+  <li>Network: 1 KB * 200k ops = 200 MB/s/node = 1.6 Gbps NIC.</li>
+  <li>Connections: 50k clients * 2 conns/node = mux through proxy or use UDP for reads.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>get   &lt;key&gt;               → VALUE &lt;key&gt; &lt;flags&gt; &lt;bytes&gt;\r\n&lt;data&gt;\r\nEND
+set   &lt;key&gt; &lt;flags&gt; &lt;ttl&gt; &lt;bytes&gt; [noreply]\r\n&lt;data&gt;\r\n  → STORED
+cas   &lt;key&gt; &lt;flags&gt; &lt;ttl&gt; &lt;bytes&gt; &lt;cas-token&gt; → STORED|EXISTS
+delete &lt;key&gt;              → DELETED|NOT_FOUND
+incr  &lt;key&gt; &lt;delta&gt;       → &lt;new-value&gt;</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App tier]──┐
+[App tier]──┼─►[mcrouter / smart client]──hash ring──┬─►[memcached node 1]
+[App tier]──┘                  ▲                    ├─►[memcached node 2]
+                               │                    ├─►[memcached node 3]
+                       [config registry]            └─►[memcached node N]
+                                                          │
+                                                  slab allocator + LRU
+</div>
+<p>Apps talk to mcrouter (Facebook-style proxy) which owns the consistent-hash ring. mcrouter does request coalescing, lease tokens for thundering-herd protection, and pool failover. Each memcached node is shared-nothing.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Slab allocator</h3>
+<p>Memory is split into 1 MB pages, each assigned to a slab class with fixed chunk size (96 B, 120 B, ... 1 MB; growth factor 1.25). Eliminates external fragmentation but causes <b>slab calcification</b> — workload shift starves new sizes; mitigation: slab rebalancer redistributes pages periodically.</p>
+<h3>7.2 LRU</h3>
+<p>Per-slab segmented LRU: HOT (20%), WARM (40%), COLD (40%). New items enter HOT; on miss it ages to COLD. This avoids scan-pollution (DDIA Ch.3 — cache replacement policies). Each item has a 4 B last-access ts updated lazily to avoid contention.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Consistent hashing &amp; vnodes</h3>
+<p>Ring of 2^32 with ~200 vnodes per physical node. Add a node → only 1/N keys move (DDIA Ch.6 "Consistent Hashing"). Use Ketama hashing for client-library compat. <b>Warm-up:</b> stagger adds 5 min apart; pre-fetch hot keys via gutter pool to avoid stampede.</p>
+<h3>8.2 Multi-tenancy</h3>
+<p>Two strategies: (a) per-tenant pools (full isolation, low utilization) or (b) shared cluster + key prefix + slab quotas via cgroup-like accounting. We pick (b) with admission control: token bucket per tenant in mcrouter. Fairness via weighted DRF.</p>
+<h3>8.3 Stampede protection</h3>
+<p>Lease tokens: on miss, mcrouter returns a 64-bit lease and stalls subsequent identical misses for 100 ms; only the lease holder fills cache. Reduces DB read amplification by 100-1000x at peak.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot keys:</b> celebrity profile served by one node; replicate hot keys to a "gutter" pool of ~5% capacity; mcrouter shadow-reads.</li>
+  <li><b>UDP loss:</b> reads only; SET still goes TCP. Allows 2x throughput per NIC at the cost of ~0.01% miss rate.</li>
+  <li><b>Connection storm:</b> use mcrouter to mux 10k clients → 50 backend conns/node.</li>
+  <li><b>Slab calcification:</b> rebalance daily; alert on slab imbalance &gt; 30%.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>No replication</td><td>2x more capacity, simpler</td><td>Cold cache on node loss, DB stampede risk</td></tr>
+<tr><td>Slab vs malloc</td><td>O(1) alloc, no fragmentation</td><td>Calcification when sizes drift</td></tr>
+<tr><td>Look-aside vs read-through</td><td>App controls, language-agnostic</td><td>Double round-trip on miss; race conditions need CAS</td></tr>
+<tr><td>UDP for reads</td><td>Higher pps, no conn state</td><td>Loss treated as miss; unfit for WAN</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch.3 Storage and Retrieval — in-memory hash index, LRU eviction discussion.</li>
+  <li>Ch.6 Partitioning — consistent hashing with virtual nodes; rebalancing.</li>
+  <li>Ch.7 Transactions — CAS as compare-and-swap analog of optimistic concurrency.</li>
+  <li>Ch.9 Consistency — read-your-writes is NOT guaranteed across cache+DB; double-delete or write-through to fix.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd choose memcached over Redis when the workload is pure look-aside and we want predictable per-thread scaling — memcached is multi-threaded, Redis is not."</li>
+  <li>"Cache-aside has a known race: writer deletes key, reader fills with stale value before DB commit. Mitigation is delayed double-delete or DB CDC into the cache."</li>
+  <li>"The biggest production lesson: invest in mcrouter early. Without it, hot keys and stampedes will be the postmortem you write at 3 AM."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Memcached server</td>
+      <td>Multi-threaded with per-thread LRU sharding scales linearly to 200k req/s on 16 cores — exactly what 50M aggregate ops/sec across 250 nodes requires. No replication code path means simpler binary and lower memory overhead per cached object.</td>
+      <td>Redis (single-threaded, 100k/node ceiling); custom in-process cache (no shared invalidation).</td>
+    </tr>
+    <tr>
+      <td>mcrouter proxy</td>
+      <td>Owns the consistent-hash ring so all 50k client conns become 50 backend conns/node — solves the C10k connection storm. Centralizes lease tokens, request coalescing, and pool failover; without it hot keys and stampedes dominate postmortems.</td>
+      <td>Smart client per language (drift across SDKs); twemproxy (no leases, less feature-rich).</td>
+    </tr>
+    <tr>
+      <td>Ketama consistent hashing</td>
+      <td>2^32 ring with ~200 vnodes/physical node ensures adding a node moves only ~1/N keys (DDIA Ch.6). Ketama is the de-facto compat hash across PHP, Java, Go, Python clients — critical for a multi-tenant cache touched by thousands of microservices.</td>
+      <td>Rendezvous (HRW) hashing (slightly better balance, less library support); modulo (every add reshuffles all keys).</td>
+    </tr>
+    <tr>
+      <td>Slab allocator (1 MB pages, 1.25 growth)</td>
+      <td>O(1) malloc/free with zero external fragmentation, which matters when running for months with 30 TB working set. Power-of-1.25 chunk classes keep internal waste under ~12% on average — better than malloc's 30% RSS bloat at this scale.</td>
+      <td>jemalloc (fragmentation drift over weeks); tcmalloc (better for short-lived workloads).</td>
+    </tr>
+    <tr>
+      <td>Slab rebalancer (background thread)</td>
+      <td>Workload mix shifts (avatars 5 KB → tokens 100 B) cause slab calcification — pages stuck in stale classes while new size starves. Daily rebalance keeps imbalance under 30%, our alert threshold; without it hit rate degrades 5-15% over weeks.</td>
+      <td>Static slab assignment (calcification); restart cycling (cold cache shock).</td>
+    </tr>
+    <tr>
+      <td>Segmented LRU (HOT 20% / WARM 40% / COLD 40%)</td>
+      <td>Plain LRU is poisoned by full-table scans (DDIA Ch.3). Segmented LRU keeps recent items in HOT until verified by a second access, protecting the 95% hit rate from one-shot batch jobs that touch billions of keys.</td>
+      <td>Plain LRU (scan pollution); LFU (better hit rate but counter overhead per access).</td>
+    </tr>
+    <tr>
+      <td>Binary protocol over TCP</td>
+      <td>Compact framing (24 B header) saves ~40% bandwidth vs ASCII at 1 KB avg values, and the fixed header avoids parser branches that hurt the p99 500us tail. CAS tokens fit naturally in the binary opaque field.</td>
+      <td>ASCII text protocol (legacy, easier debug); gRPC (overkill, +200us serialization).</td>
+    </tr>
+    <tr>
+      <td>UDP for reads</td>
+      <td>No conn state means each NIC handles 2x more pps; for 200 MB/s/node read traffic this avoids needing 25 GbE everywhere. Loss is treated as a cache miss (expected ~0.01% — well below the 5% miss budget on a 95% hit-rate cache).</td>
+      <td>TCP-only (conn state explosion); QUIC (good but no mainstream memcached client).</td>
+    </tr>
+    <tr>
+      <td>CAS (compare-and-swap) tokens</td>
+      <td>Look-aside cache has a writer/reader race (writer deletes, reader refills with stale DB read). 64-bit CAS token is the optimistic-concurrency analog (DDIA Ch.7) — refill only succeeds if the version matches, eliminating the race without locks.</td>
+      <td>Distributed lock (Redlock complexity, latency); double-delete (still a window).</td>
+    </tr>
+    <tr>
+      <td>Lease tokens (mcrouter)</td>
+      <td>On miss, mcrouter issues one lease and stalls duplicate misses for 100 ms — the 100x-1000x DB read amplification reduction is the difference between surviving a hot-key event and DB meltdown. Cheaper than per-key Redlock.</td>
+      <td>Coalescing in app code (per-language drift); request hedging (amplifies, not reduces).</td>
+    </tr>
+    <tr>
+      <td>Gutter pool (5% capacity)</td>
+      <td>Hot keys pin to a single node by hash; replicating just hot keys to a small "shadow" pool with mcrouter shadow-reads sidesteps the single-node bottleneck without paying full-cluster replication cost (which would halve effective capacity).</td>
+      <td>Full N-way replication (50% capacity loss); client-side L1 only (per-pod cache pollution).</td>
+    </tr>
+    <tr>
+      <td>Token-bucket admission (mcrouter)</td>
+      <td>Multi-tenancy in a shared 32 TB pool needs per-tenant ops/sec quotas to prevent noisy neighbor. Token bucket per (tenant, route) gives bounded burst + sustained rate; weighted DRF guarantees fairness when capacity is contended.</td>
+      <td>Per-tenant pools (low utilization, ~30% wasted RAM); no admission (one tenant kills cache).</td>
+    </tr>
+    <tr>
+      <td>Lazy expiration + reaper thread</td>
+      <td>TTL check on GET is O(1) and avoids a global timer wheel. Background reaper sweeps cold expired entries to free slabs, but at low priority (CPU yield) so it never steals from request threads — preserving the p99 500us latency target.</td>
+      <td>Eager TTL timer per key (heap insert overhead); never expire (memory bloat).</td>
+    </tr>
+    <tr>
+      <td>Linux: SO_REUSEPORT + RPS, NUMA pinning</td>
+      <td>SO_REUSEPORT spreads accept() across worker threads avoiding the herd. RPS pins NIC queues to cores; NUMA-aware allocation cuts cross-socket memory access (which adds ~100 ns per hop) — measurable on the 100us p50 GET budget.</td>
+      <td>Default networking (single-accept bottleneck); userspace NIC (DPDK is overkill here).</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,136 @@
+<h1>Design Pastebin (text + code paste with syntax highlight, expiry)</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">misc</span>
+  <span class="tag">file-storage</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a service to publish text/code snippets up to 10 MB, addressable by a short ID, with optional syntax highlighting (~180 languages), expiry (10 min — never), visibility (public/unlisted/private), and a raw endpoint usable by curl. Pastebin.com peaks at ~17 M monthly pastes and roughly 1.5 B raw views/month.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Create a paste with body, language hint, expiry, visibility, optional password.</li>
+  <li>Read by short ID — rendered HTML view and <code>/raw/{id}</code> endpoint.</li>
+  <li>Server-side syntax highlight rendering, cached.</li>
+  <li>Search by user, tag, language for logged-in users.</li>
+  <li>Spam/abuse pipeline: keyword scan + dedupe-by-hash flag for credential dumps.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> read p99 &lt; 150 ms; write p99 &lt; 400 ms incl. 10 MB body.</li>
+  <li><b>Scale:</b> 17 M writes/month (~7 wps avg, 200 wps peak); 1.5 B reads/month (~580 rps avg, 8 K rps peak).</li>
+  <li><b>Availability:</b> 99.9% reads, 99.5% writes.</li>
+  <li><b>Durability:</b> 11×9s for non-expired pastes (S3 standard).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Avg paste 10 KB, p99 1 MB, max 10 MB. 17 M × 10 KB = 170 GB/month metadata-adjacent; bodies in object store.</li>
+  <li>5-yr retention (paid tier) = ~10 TB body store.</li>
+  <li>Highlighted-HTML cache: 80% hit ratio over hot 5% of pastes → 50 GB Redis is enough.</li>
+  <li>Egress: 1.5 B reads × 15 KB rendered = ~22 TB/month outbound.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/pastes        {body, lang?, expiresIn?, visibility, password?}  → {id, url}
+GET  /{id}                                                                → HTML render
+GET  /raw/{id}                                                            → text/plain
+DELETE /v1/pastes/{id}  Authorization: Bearer ...                         → 204
+GET  /v1/users/{u}/pastes?cursor=                                         → list</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Browser] --&gt; [CDN] --&gt; [API GW] --&gt; [Paste Svc] --&gt; [Postgres metadata]
+                                       |              |
+                                       |              +--&gt; [S3 bodies]
+                                       |
+                                       +--&gt; [Highlight Svc (Pygments/Tree-sitter)]
+                                                |
+                                                +--&gt; [Redis rendered-HTML cache]
+                                       |
+                                       +--&gt; [Kafka] --&gt; [Abuse-scan worker]
+                                                          |
+                                                          +--&gt; [Quarantine bucket]
+</div>
+<p>Walk-through: the Paste Service writes metadata to Postgres and the body to S3 in a single transaction (write S3 first, then commit row referencing the object key). Render path: Postgres lookup, body fetch from S3 if not cached, Pygments highlight, store HTML in Redis with 1 h TTL.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Postgres metadata</h3>
+<pre>CREATE TABLE pastes (
+  id            CHAR(8) PRIMARY KEY,        -- base62
+  owner_id      BIGINT,
+  s3_key        TEXT NOT NULL,
+  lang          TEXT,
+  size_bytes    INT,
+  visibility    SMALLINT,                   -- 0 public, 1 unlisted, 2 private
+  pw_hash       TEXT,
+  created_at    TIMESTAMPTZ,
+  expires_at    TIMESTAMPTZ                 -- partial index WHERE expires_at IS NOT NULL
+);
+CREATE INDEX ix_owner ON pastes(owner_id, created_at DESC);</pre>
+<h3>7.2 Why split metadata + S3?</h3>
+<p>Postgres rows stay slim (~200 B), keeping the hot working set in RAM. S3 handles the long tail of 10 MB bodies cheaply with built-in lifecycle expiration. Storing big blobs in Postgres TOAST works initially but vacuum cost grows unbounded — see DDIA Ch. 3 on storage engines.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 ID generation</h3>
+<p>8-char base62 = 218 trillion IDs. Sample randomly from CSPRNG; collision rate negligible at our scale (birthday-bound after ~14 M unlisted-only pastes). Insert with <code>ON CONFLICT DO NOTHING</code> and retry on the rare miss.</p>
+<h3>8.2 Highlight pipeline</h3>
+<p>Tree-sitter parses lazily for the top-20 languages (covers 92% of traffic); fall back to Pygments for the long tail. Render output keyed by <code>sha256(body) + lang</code> — different pastes with identical content share one cache entry.</p>
+<h3>8.3 Expiry</h3>
+<p>Postgres partial index drives a sweeper that runs every 60 s, deletes rows past <code>expires_at</code>, and queues their <code>s3_key</code> for async S3 deletion. S3 lifecycle policy is the safety net (delete after expires + 7 days).</p>
+<h3>8.4 Private + password pastes</h3>
+<p>Argon2id over the password; never serve from CDN edge cache (force <code>Cache-Control: private, no-store</code>). Body decrypted server-side per request — paste-level keys wrapped by KMS.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Viral pastes (post on Hacker News):</b> CDN with 60 s TTL absorbs the spike; one paste can do 100 K rps without touching origin.</li>
+  <li><b>Highlight CPU:</b> 10 MB Rust file + Tree-sitter is ~600 ms; cap to 256 KB rendered preview, link to <code>/raw</code> for the rest.</li>
+  <li><b>Abuse:</b> async hash-against-known-leaks (HIBP, GitHub secret scanner) within 5 min of write.</li>
+  <li><b>Postgres write hot spot:</b> sequential ID would cause btree right-edge contention; random base62 spreads writes uniformly.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>S3 for bodies</td><td>Cheap, durable, easy lifecycle</td><td>Extra hop, eventual consistency historically</td></tr>
+<tr><td>Server-side highlight</td><td>Cache once, serve cheap HTML</td><td>CPU + memory cost on origin</td></tr>
+<tr><td>Random IDs</td><td>Unguessable, balanced shard</td><td>Slight collision retries</td></tr>
+<tr><td>Postgres vs DynamoDB</td><td>Joins, partial indexes, mature</td><td>Manual sharding past 5 TB</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage Engines — why blob in object store, metadata in btree.</li>
+  <li>Ch. 6 Partitioning — owner_id-by-range vs id-by-hash secondary indexes.</li>
+  <li>Ch. 11 Stream Processing — async abuse-scan via Kafka.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I deliberately do not server-render bodies &gt; 256 KB inline — interviewer will probe TTFB, and partial-render + lazy-load is the answer."</li>
+  <li>"Hardest part is abuse: leaked credentials and phishing make pastebins a magnet. I'd outline the takedown SLO (15 min) and the human-in-the-loop queue."</li>
+  <li>"For multi-region, I'd start single-region with cross-region S3 replication and add read replicas later — strong consistency on writes is more valuable than 50 ms of EU latency."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>PostgreSQL (metadata)</td><td>17 M pastes/month is small for a single Postgres primary; partial indexes drive the expiry sweeper efficiently and 200 B rows keep the working set in RAM, supporting 8 K rps peak read with sub-150 ms p99.</td><td>DynamoDB (no partial indexes for expiry sweep); MySQL (worse partial-index support).</td></tr>
+    <tr><td>Amazon S3 (paste bodies)</td><td>Bodies range 10 KB avg to 10 MB max; 11×9s durability, $0.023/GB-month pricing on ~10 TB of 5-yr retention, and built-in lifecycle rules give us the safety-net expiry deletion without app code.</td><td>Postgres TOAST (vacuum cost grows unbounded past TB); GCS (similar but lock-in to AWS stack).</td></tr>
+    <tr><td>Random base62 IDs (8 char)</td><td>62^8 = 218 trillion IDs gives birthday collisions only after ~14 M inserts; random distribution avoids B-tree right-edge contention that sequential IDs would cause at 200 wps peak.</td><td>Snowflake (sequential, hot btree page); UUIDv4 (longer URLs, ugly to share).</td></tr>
+    <tr><td>Tree-sitter (top-20 langs)</td><td>92% of traffic is JS/Python/Go/Rust/etc.; Tree-sitter's incremental parser highlights 100 KB in &lt; 50 ms — fast enough to render inline without blocking the 150 ms read p99.</td><td>highlight.js (browser-side, breaks raw <code>/raw</code> use case); ANTLR (slower, heavier).</td></tr>
+    <tr><td>Pygments (long-tail langs)</td><td>Covers 180+ obscure languages where Tree-sitter has no grammar; only invoked off the hot path for the 8% tail, so the slower 600 ms render on 10 MB doesn't hurt aggregate latency.</td><td>Rouge (Ruby-only ecosystem); chroma (Go port lacks coverage).</td></tr>
+    <tr><td>Redis (rendered HTML cache)</td><td>80% hit ratio over hot 5% of pastes fits in 50 GB; serving cached HTML straight from Redis hits the &lt; 150 ms read SLO and shields Pygments CPU from viral spikes.</td><td>Memcached (no persistence, cold-start cost); CDN-only (rendered HTML changes on lang flip).</td></tr>
+    <tr><td>SHA-256 content key</td><td>Render cache keyed by <code>sha256(body)+lang</code> dedupes identical content across pastes — credential-dump copies share one cache entry, saving CPU during abuse spikes.</td><td>Paste-id key (no dedup, wastes cache); xxHash (collisions a real risk at 14 M pastes).</td></tr>
+    <tr><td>Argon2id (password pastes)</td><td>Memory-hard KDF resists GPU brute-force at the per-paste-password granularity; tuned to 100 ms cost stays under the 400 ms write p99 while making offline cracking economically infeasible.</td><td>bcrypt (no memory hardness); PBKDF2 (GPU-vulnerable).</td></tr>
+    <tr><td>AWS KMS (envelope encrypt)</td><td>Per-paste DEKs wrapped by KMS CMK give defense-in-depth for private pastes; one KMS call per fetch fits the 150 ms latency budget and rotation is centralized.</td><td>Vault (extra ops burden); app-layer key store (key rotation nightmare).</td></tr>
+    <tr><td>Apache Kafka (abuse pipeline)</td><td>Async hash-against-known-leaks needs durable replay if we add a new HIBP-style scanner months later; Kafka's 7-day retention plus replay gives that without re-reading 170 GB/month of bodies.</td><td>SQS (no replay); RabbitMQ (no log retention semantics).</td></tr>
+    <tr><td>CDN (CloudFront/Fastly)</td><td>One viral paste can do 100 K rps without touching origin; 60 s edge TTL on public pastes turns the HN-spike problem into a CDN problem, freeing origin for the long-tail.</td><td>Origin-only (capacity blowup); longer TTL (breaks delete-now SLO).</td></tr>
+    <tr><td>HIBP / GitHub Secret Scanner</td><td>Real-world pastebins are credential-dump magnets; integrating with HIBP and GitHub's secret-scanning service gives us a 5-min takedown SLO without building secret detection from scratch.</td><td>In-house regex scanner (false-positive hell); manual review only (15-min SLO impossible).</td></tr>
+  </tbody>
+</table>

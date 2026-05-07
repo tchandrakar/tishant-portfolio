@@ -1,0 +1,156 @@
+<h1>Design Inventory Management at Scale (oversell prevention, multi-warehouse)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ecommerce</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design an inventory system that tracks stock for 100M SKUs across 500 warehouses, exposes a single "available-to-promise" (ATP) number per SKU to the storefront, and prevents oversell during flash sales. It must reconcile with WMS (warehouse management) events, allow soft holds during checkout, and support multi-warehouse fulfilment optimization.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Read ATP for any SKU at p99 &lt; 30 ms.</li>
+  <li>Reserve N units (soft hold, TTL 10 min) for a cart.</li>
+  <li>Commit a reservation atomically with order creation.</li>
+  <li>Release reservation on cart abandon or checkout failure.</li>
+  <li>Adjust on receipts (PO arrivals), shipments, returns, cycle counts.</li>
+  <li>Multi-warehouse allocation: pick best-cost warehouse for an order.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Correctness:</b> zero oversell — physical stock &gt;= committed reservations at all times.</li>
+  <li><b>Latency:</b> read p99 &lt; 30 ms; reservation p99 &lt; 100 ms; ATP staleness &lt; 1 s.</li>
+  <li><b>Scale:</b> 100M SKUs * 500 warehouses = 50B (sku, wh) rows; peak 100k reservations/s.</li>
+  <li><b>Availability:</b> 99.99%; degrades to "out of stock" rather than oversell on partition.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 1M ATP reads/s peak (Black Friday), 100k reservations/s, 30k commits/s.</li>
+  <li>Storage: 50B rows * 64 B = 3.2 TB hot; ledger of all events 30 TB/yr.</li>
+  <li>Hot keys: top 1000 SKUs see 60% of reservation traffic.</li>
+  <li>WMS event rate: 10M events/day from 500 warehouses.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/inv/atp/{sku}?region=US        → {available, leadTimeDays}
+POST  /v1/inv/reserve  {sku,qty,cartId}  → {reservationId, expiresAt}
+POST  /v1/inv/commit   {reservationId, orderId, idemKey}
+POST  /v1/inv/release  {reservationId}
+POST  /v1/inv/adjust   {sku, wh, delta, reason, eventId}  (WMS only)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Storefront] [Cart] [Checkout]      [WMS / Receiving]
+     |         |        |                   |
+     v         v        v                   v
+   [Read API]  [Write API]              [Adjust API]
+       |            |                        |
+       v            v                        v
+    [ATP Cache]  [Reservation Svc]      [Adjust Svc]
+       (Redis)        |                      |
+                      v                      v
+                [Postgres shard "stock" table -- per-SKU row]
+                      |
+                      v
+                 [Kafka inv-events]
+                      |
+        +-------------+-------------+
+        v             v             v
+    [ATP Mat View] [Analytics]  [Recon Svc]
+</div>
+<p>Single source of truth: the per-(sku, warehouse) row in Postgres. Everything else is derived.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Stock row (Postgres, sharded by sku_id hash)</h3>
+<pre>CREATE TABLE stock (
+  sku_id     bigint,
+  wh_id      int,
+  on_hand    int  NOT NULL,            -- physical count
+  reserved   int  NOT NULL DEFAULT 0,  -- soft + hard holds
+  committed  int  NOT NULL DEFAULT 0,  -- shipped not yet decremented
+  version    bigint NOT NULL,
+  PRIMARY KEY (sku_id, wh_id),
+  CHECK (on_hand - reserved - committed &gt;= 0)
+);</pre>
+<h3>7.2 Reservation ledger</h3>
+<pre>reservations(resv_id PK, sku_id, wh_id, qty, cart_id, status,
+             created_at, expires_at, idem_key UNIQUE);</pre>
+<h3>7.3 Why a relational ledger?</h3>
+<p>We need atomic CAS on the stock row plus a durable record of who holds what. DDIA Ch.7 makes the case explicit: anything weaker than a serializable update on the count column allows the lost-update anomaly, which is precisely oversell.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 ATP read path</h3>
+<p>Most reads are cached in Redis (TTL 1 s, populated by a Kafka consumer reading inv-events). On cache miss, we fall through to a read replica. Storefront tolerates ~1 s staleness — overstating stock is OK at browse time; we re-check at reserve time.</p>
+<h3>8.2 Reservation write path</h3>
+<pre>BEGIN;  -- SERIALIZABLE
+SELECT on_hand, reserved, version FROM stock
+  WHERE sku_id=$1 AND wh_id=$2 FOR UPDATE;
+-- check on_hand - reserved - committed &gt;= qty
+UPDATE stock SET reserved = reserved + $qty, version = version+1
+  WHERE sku_id=$1 AND wh_id=$2;
+INSERT INTO reservations (...);
+COMMIT;</pre>
+<p>Idempotency: <code>idem_key</code> unique on reservations; a duplicate insert returns the same resv_id without changing stock.</p>
+<h3>8.3 Multi-warehouse allocation</h3>
+<p>For an order with multiple SKUs, an allocator solves a min-cost flow problem: which warehouse fulfils which line, minimizing split-shipment cost + distance. Soft-holds across warehouses, then commit on success or release.</p>
+<h3>8.4 Reconciliation</h3>
+<p>Daily job compares physical counts (cycle count from WMS) with logical on_hand. Discrepancies emit corrective adjust events with reason="recon". Drift &gt; 0.5% pages on-call.</p>
+<h3>8.5 Hot-key strategy</h3>
+<p>For the top-N SKUs we use bucketed counters: pre-split a SKU into 16 sub-rows; reservation picks a bucket (random or hash(cart_id)); ATP reads sum buckets. This linearly scales write throughput at the cost of read complexity.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Single-row contention:</b> bucketed counters; co-located reservation worker per shard; batching.</li>
+  <li><b>Long checkout TTLs:</b> short hold (10 min) + reserve-on-checkout-start (not on add-to-cart) reduces in-flight holds.</li>
+  <li><b>Cross-region writes:</b> stock rows pinned to home region; a SKU's "owner region" is fixed.</li>
+  <li><b>Recovery from a botched WMS feed:</b> ledger replay from Kafka with idempotent eventId dedup.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Postgres serializable single-row</td><td>Provably no oversell</td><td>Per-shard write ceiling</td></tr>
+<tr><td>Redis ATP cache</td><td>Fast reads</td><td>Stale; must re-check on reserve</td></tr>
+<tr><td>Bucketed counters for hot SKUs</td><td>Linear write scaling</td><td>Reads must aggregate; "stuck" inventory in low buckets</td></tr>
+<tr><td>Soft hold on checkout (not ATC)</td><td>Frees inventory for active buyers</td><td>Buyer can lose item between cart and checkout</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 7 Transactions — the canonical chapter for this problem; serializable isolation for the decrement; lost-update vs write-skew vs phantom anomalies.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — Raft/Paxos under the Postgres replication; why Redlock alone is insufficient for a financial-grade decrement.</li>
+  <li>Ch. 11 Stream Processing — Kafka inv-events for derived stores and recon.</li>
+  <li>Ch. 12 The Future of Data Systems — using a log as the system-of-record and rebuilding views.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The check-then-act in inventory is the textbook lost-update; only serializable isolation or compare-and-set with a version column makes it safe."</li>
+  <li>"I distinguish soft holds (cart, Redis-only) from hard holds (checkout, persisted) so we don't pay for ledger writes on browse traffic."</li>
+  <li>"For hot SKUs, bucketed counters are pragmatic; the cost is read aggregation, but it preserves correctness while scaling writes."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Postgres SERIALIZABLE (stock row)</td><td>Zero-oversell at 100k reservations/s requires the strongest isolation. SERIALIZABLE single-row update with a CHECK constraint (on_hand - reserved - committed &gt;= 0) makes oversell impossible at the database level. DDIA Ch.7's lost-update is the textbook anomaly we're defeating.</td><td>Snapshot isolation (write-skew oversells); Redis INCR (loses the consistency battle under partition); Spanner (latency overhead for in-region writes).</td></tr>
+<tr><td>Sharded by sku_id hash</td><td>50B (sku, wh) rows can't live on one primary. Hashing by sku_id evenly spreads cold inventory while letting us pin hot SKUs to dedicated shards. Each shard handles ~5k reservations/s, well below the Postgres write ceiling, and ATP reads use replicas of the same shard.</td><td>Range partitioning (hot SKUs cluster on one shard); per-warehouse sharding (top 1000 SKUs cross all warehouses, no isolation).</td></tr>
+<tr><td>Bucketed counters (top SKUs)</td><td>Top 1000 SKUs absorb 60% of reservation traffic — single-row CAS becomes a serial bottleneck. Pre-splitting into 16 sub-rows with hash(cart_id) selection turns serial contention into parallel writes; ATP reads sum buckets. Linear write scaling preserves zero-oversell.</td><td>Pure single-row (chokes at 1000 reservations/s per hot SKU); Redis-only counter (no durability for financial-grade correctness).</td></tr>
+<tr><td>Redis (ATP cache)</td><td>1M ATP reads/s at p99 &lt; 30 ms is impossible against Postgres. Redis hash, populated from Kafka inv-events with 1 s TTL, absorbs read traffic. Storefront tolerates 1 s staleness because we re-check authoritatively at reserve time — overstating browse-time stock costs nothing.</td><td>Memcached (no fit for partial-key lookups by region); read replicas only (Postgres ceiling can't serve 1M/s).</td></tr>
+<tr><td>Reservation ledger (durable)</td><td>Hard holds at checkout need durability for audit and recovery. The reservations table has a UNIQUE idem_key that converts retries into no-ops automatically — duplicate inserts return the same resv_id without changing stock. This is end-to-end exactly-once-effect for inventory.</td><td>In-memory holds (lose holds on crash); event-sourcing only (slower point lookup of "who holds what").</td></tr>
+<tr><td>Kafka (inv-events)</td><td>10M WMS events/day plus 100k reservation events/s feed derived stores: ATP cache, analytics, recon. Partition by sku_id preserves ordering per-SKU. 7-day retention enables Kafka replay to rebuild ATP cache or detect drift; eventId dedup prevents double-application.</td><td>RabbitMQ (no replay for cache rebuild); SQS (no per-key ordering); Kinesis (vendor lock).</td></tr>
+<tr><td>Soft holds in Redis (TTL)</td><td>10-minute TTL via Redis EX 600 frees abandoned-cart inventory automatically — no scheduled cleanup job. Sub-ms write latency keeps cart UX snappy. Critical: soft holds are advisory only; we re-acquire as a hard hold against Postgres at checkout-start.</td><td>Postgres expires_at column (every read scans for expired); per-cart cron (race conditions, latency).</td></tr>
+<tr><td>Min-cost flow allocator</td><td>Multi-warehouse allocation across 500 warehouses for a multi-line order is an optimization problem (split-shipment cost vs distance vs SLA). Min-cost flow on a small graph (lines × candidate warehouses) runs in &lt; 50 ms and is provably optimal — heuristics ship 20% more split orders.</td><td>Greedy heuristic (suboptimal splits); ILP solver (overkill latency for line-count &lt; 20).</td></tr>
+<tr><td>Postgres read replicas</td><td>Even with Redis fronting, ATP cache misses fall through to read replicas. Replicas absorb leftover read load and serve as the recovery target if the cache is cold. Replication lag is tolerable because cache fronts the hot path.</td><td>Single primary for reads (write traffic competes); CDC into Cassandra (more moving parts).</td></tr>
+<tr><td>Reconciliation job (daily)</td><td>WMS feeds drift; physical cycle counts diverge from logical on_hand. A daily diff job emits corrective adjust events with reason="recon"; drift &gt; 0.5% pages on-call. Without this, the CHECK constraint will eventually fire on a real customer's reserve and show "out of stock" wrongly.</td><td>Per-event reconciliation (too noisy); manual ops (doesn't scale to 500 warehouses).</td></tr>
+<tr><td>Idempotency on adjust eventId</td><td>WMS retries are routine — receiving an event twice without dedup would double-count a 1000-unit pallet. Each adjust carries a UUID stored in a dedup table; replays during Kafka recovery are no-ops. Critical at 10M events/day where even a 0.001% double-application is 100 wrong rows.</td><td>Best-effort delivery (corrupts inventory); upstream dedup only (we don't trust the WMS).</td></tr>
+<tr><td>Region-pinned writes</td><td>Stock rows have a fixed "owner region" — cross-region writes would multiply lost-update risk and inflate p99. Each SKU's authoritative shard lives in one region; other regions read via async replication for browse but reserve through the home region.</td><td>Multi-master write (oversell risk multiplies); Spanner global writes (latency too high for 100 ms reservation budget).</td></tr>
+</tbody>
+</table>
+

@@ -1,0 +1,146 @@
+<h1>Design Reddit (threaded comments + voting + subreddits)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">social-network</span>
+  <span class="tag">search</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design Reddit: a community-organized link-aggregator with deeply threaded comments, up/down voting, and per-community (subreddit) listings ordered by Hot/New/Top/Best. The system must handle 100K+ vote events/sec, render 10K-comment threads quickly, and serve the front page at p99 &lt; 200 ms to 500M+ MAU.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Create subreddit; submit post (link or text) to a subreddit; comment with arbitrary nesting.</li>
+  <li>Up/down vote posts and comments. Sort orders: Hot, New, Top, Best (Wilson lower-bound).</li>
+  <li>Front page: aggregated across subscribed subreddits.</li>
+  <li>Search across posts, comments, subreddits.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 500M MAU, 100M DAU, 5M posts/day, 50M comments/day, 200M votes/day.</li>
+  <li><b>Latency:</b> listing p99 &lt; 200 ms; thread render with 10K comments p99 &lt; 500 ms (paginated).</li>
+  <li><b>Availability:</b> 99.95%; vote ingestion must accept retries idempotently.</li>
+  <li><b>Consistency:</b> eventual on vote counts; strong on "did I vote on this?" per user.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Writes: 50M comments + 5M posts + 200M votes = ~3K/sec avg, 30K/sec peak (Super Bowl, AMAs).</li>
+  <li>Reads: 100M DAU × 50 listings = 5B/day = 58K/sec avg, ~300K/sec peak.</li>
+  <li>Storage: 5M posts × 1 KB = 5 GB/day; 50M comments × 500 B = 25 GB/day; 5-yr ≈ 55 TB hot, plus replication.</li>
+  <li>Search index: 500M-doc Elasticsearch cluster, ~3 TB with replicas.</li>
+  <li>Cache: hot subreddit listings (top 10K subs × 4 sort orders × 1000 posts) ≈ 100 GB Redis.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /api/submit              {sr, kind, title, url|body}     → postId
+POST  /api/comment             {parentId, body}                → commentId
+POST  /api/vote                {thingId, dir: -1|0|1}
+GET   /r/{sr}/{sort}?after=...                                  → [post]
+GET   /comments/{postId}?sort=best&limit=200&depth=8           → tree
+GET   /search?q=...&type=post|comment|subreddit                 → hits</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] → [CDN] → [API GW] → [Submit Svc] → [Postgres (sharded by sr_id)]
+                          │                          │
+                          │                          ▼
+                          │                    [Kafka content events] → [ES Indexer]
+                          ▼
+                    [Vote Svc] → [Vote Stream Kafka] → [Counter Aggregator] → [Cassandra counts]
+                          │                                                       │
+                          ▼                                                       ▼
+                    [User-vote KV (RocksDB)]                              [Listing Cache (Redis ZSET)]
+                                                                                   ▲
+[Listing Svc] → [Hot/Best scorer] ─────────────────────────────────────────────────┘
+[Comment Svc] → [Comment Tree Cache (Redis hash + materialized order)]
+</div>
+<p>Walk-through: submission persists to Postgres and emits Kafka. Votes are append-only to the vote log; an aggregator updates score in Cassandra and refreshes Redis ZSETs keyed by (sr, sort). Listings read directly from Redis ZSET. Comment threads are rendered from a precomputed traversal stored in Redis, then sorted client-side or per-request by Best.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Posts &amp; comments (Postgres, sharded by subreddit_id)</h3>
+<pre>CREATE TABLE posts (
+  post_id bigint PK, sr_id bigint, author_id bigint,
+  title text, url text, body text, kind smallint,
+  score int, hot_score double, created_at timestamptz
+);
+CREATE TABLE comments (
+  comment_id bigint PK, post_id bigint, parent_id bigint,
+  author_id bigint, body text, score int, depth smallint,
+  path ltree,                       -- materialized path for tree ops
+  created_at timestamptz
+);
+CREATE INDEX ON comments USING GIST (path);</pre>
+<h3>7.2 Votes (Cassandra + per-user RocksDB)</h3>
+<pre>-- aggregate counts:
+CREATE TABLE thing_score (thing_id bigint PRIMARY KEY, ups counter, downs counter);
+-- user's vote for de-dup and "did I vote":
+user_vote:{userId}:{thingId} → {-1|0|1}     (RocksDB, sharded by userId)</pre>
+<h3>7.3 Why Cassandra for counters?</h3>
+<p>Distributed counter type, multi-DC, write-optimized. Trade-off: eventual consistency, no compare-and-set. We tolerate it because vote counts are advisory and we re-verify per-user vote separately.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Hot ranking</h3>
+<p>Reddit's classic Hot formula (logarithmic + age decay):
+<code>hot = log10(max(|s|,1)) × sign(s) + (epoch − 1134028003) / 45000</code>. Recomputed when score changes &gt; threshold or every N seconds. Stored as <code>hot_score</code> on the post and used as ZSET score.</p>
+<h3>8.2 Best comment sort (Wilson lower-bound)</h3>
+<p>Confidence-aware: a comment with 1 up / 0 down doesn't beat 100 up / 5 down. Computed offline per comment and cached.</p>
+<h3>8.3 Threaded comments at scale</h3>
+<p>Materialized path (ltree) gives O(log n) subtree fetch. For viral threads (10K+ comments), paginate by load-more-on-deep-branch; precompute "top 200 by Best at depth ≤ 5" snapshot, refresh every 10 s.</p>
+<h3>8.4 Vote idempotency &amp; abuse</h3>
+<p>Vote write key (userId, thingId) is upsert in RocksDB. Aggregator emits delta = newDir − oldDir, so flips are exactly handled. Anti-vote-fraud runs as a stream consumer scoring suspicious patterns.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot post during AMA:</b> ZSET write contention — rate-limit re-rank to once per 2 s; engage local-replica fanout.</li>
+  <li><b>Deep comment trees:</b> server-side render the visible window; lazy-load deeper nodes.</li>
+  <li><b>Search lag:</b> Elasticsearch indexer driven from Kafka with 2 s SLO; for severe lag, fall back to Postgres trigram for last-hour content.</li>
+  <li><b>Cache stampede:</b> request coalescing + per-key locks for ZSET rebuilds.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Materialized path for comments</td><td>Single-query subtree, simple</td><td>Move/restructure is expensive</td></tr>
+<tr><td>Cassandra counters</td><td>Massive write throughput</td><td>Eventual; counter resyncs are pain</td></tr>
+<tr><td>Async hot-score recompute</td><td>Cheap; bounded freshness</td><td>Briefly stale ordering</td></tr>
+<tr><td>Postgres for content</td><td>Rich queries, transactions for moderation</td><td>Sharding ops harder than KV</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — single-leader Postgres per shard with read replicas; conflict-free counters on Cassandra.</li>
+  <li>Ch. 6 Partitioning — sharding by subreddit_id; secondary indexes for user-history queries.</li>
+  <li>Ch. 11 Stream Processing — Kafka vote stream feeding aggregator and search indexer; idempotent consumer pattern.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The interesting bit is comments, not posts — votes are routine, but rendering a 10K-comment thread fast is what makes Reddit feel like Reddit."</li>
+  <li>"I'd argue for ltree/materialized paths over adjacency-list closure-table because a single index satisfies both subtree and ancestor queries."</li>
+  <li>"For ranking I'd reuse the public Hot formula early on, then layer ML on top once we have engagement data."</li>
+  <li>"I'd discuss vote-fraud as a stream-processing problem rather than a synchronous check, so we don't slow down the write path."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Postgres</b> (sharded by <code>sr_id</code>)</td><td>5 GB/day posts + 25 GB/day comments need rich queries (moderation: "all posts by user X in subreddit Y this week"); Postgres transactions handle moderation actions atomically and the per-shard <code>~55 TB</code> 5-yr footprint fits a sharded layout.</td><td>Cassandra (no rich query for moderation), MySQL (acceptable but Postgres ltree wins for comment trees), DynamoDB (vendor lock + cost at this read volume).</td></tr>
+    <tr><td><b>Postgres ltree + GIST index</b> (comment trees)</td><td>Materialized-path with ltree gives O(log n) subtree fetch and ancestor query from a single index — exactly what's needed to render 10K-comment threads at p99 &lt; 500 ms; alternatives need multiple round-trips per node.</td><td>Adjacency list (recursive CTE blows up on deep threads), closure table (2× write amplification on every comment), nested set (move-restructure is catastrophically expensive).</td></tr>
+    <tr><td><b>Cassandra counters</b> (vote aggregates)</td><td>200M votes/day with 30K/sec spike (AMA) demands a counter type optimized for writes; multi-DC distributed counters tolerate eventual consistency because vote counts are advisory and per-user "did I vote" lives separately in RocksDB.</td><td>Redis INCR (single-shard hot key on AMA posts), Postgres counter row (lock contention at 30K/sec), DynamoDB atomic counters (cost).</td></tr>
+    <tr><td><b>RocksDB</b> (per-user vote KV, sharded by userId)</td><td>"Did I vote on this thing" needs strong per-key consistency (we cannot show a user their vote was registered then forget it); RocksDB's LSM gives us cheap (userId, thingId) → dir upserts and replays well for the aggregator delta computation.</td><td>Redis (no durability guarantee for the 200M votes/day write log), Cassandra (eventual consistency wrong here), MySQL (sharding ops at this write rate harder).</td></tr>
+    <tr><td><b>Redis ZSET</b> (listing cache by sort)</td><td>(sr, sort) → top-1000 posts ZSET keyed by <code>hot_score</code> serves the front page at p99 sub-ms; 100 GB working set fits in cluster RAM and ZADD on score-update keeps the 4 sort orders maintained without re-sorting on read.</td><td>Postgres ORDER BY (cannot hit p99 200 ms at 300K/sec peak), Memcached (no sorted-set primitive), Elasticsearch (overkill for sort that's purely numeric).</td></tr>
+    <tr><td><b>Apache Kafka</b> (vote stream + content events)</td><td>Append-only vote log decouples synchronous "I voted" UX from the aggregator updating Cassandra; replayability lets us recompute hot scores after a Hot-formula tweak, and the stream feeds anti-vote-fraud as a second consumer.</td><td>RabbitMQ (no replay for fraud retraining), direct RPC (loses backpressure and the fraud-detection consumer pattern), DB triggers (couples write path to async work).</td></tr>
+    <tr><td><b>Elasticsearch</b> (search index)</td><td>500M-doc full-text search across posts, comments, subreddits at 2 s indexing SLO needs an inverted-index store with relevance scoring; Lucene's BM25 + custom analyzers handle Reddit-specific tokenization (subreddit names, code blocks).</td><td>Postgres FTS (cannot scale to 500M docs at 58K/sec read), Solr (similar trade-offs without OSS momentum), trigram search only (poor relevance).</td></tr>
+    <tr><td><b>Hot formula</b> (<code>log10(|s|)·sign(s) + epoch/45000</code>)</td><td>Reddit's classic ranking formula is interpretable and cheap to recompute; logarithmic vote-weighting prevents huge AMA posts from dominating forever, and the linear epoch term gives us bounded freshness with simple async re-rank threshold.</td><td>Pure ML rank (overkill before engagement data exists), pure recency (Hot already age-decays, but pure new-only kills quality posts), Wilson lower-bound (used for Best comment sort, not for posts where vote velocity matters).</td></tr>
+    <tr><td><b>Wilson lower-bound</b> (Best comment sort)</td><td>Confidence-aware so a comment with 1 up / 0 down doesn't beat 100 up / 5 down; computed offline per comment and cached, since recomputing on every read would blow the 500 ms thread-render SLO at 50M comments/day.</td><td>Naive ratio (gameable), raw upvote count (penalizes new comments), real-time recompute (cost prohibitive at this scale).</td></tr>
+    <tr><td><b>CDN</b> (front-page caching)</td><td>Front-page subreddit listings are public-readable and identical for unauthenticated users; CDN with short TTL absorbs the long tail of read traffic and offloads the listing service from the 300K/sec peak.</td><td>App-tier-only (capacity blowup), Redis-only (still requires app round-trip), no caching (Postgres meltdown).</td></tr>
+    <tr><td><b>Stream-based fraud detection</b></td><td>Anti-vote-fraud as a Kafka consumer scoring suspicious patterns (rapid alt-account voting, brigading bursts) keeps the synchronous vote write path fast; the 30K/sec peak cannot afford a synchronous fraud check on every vote.</td><td>Synchronous fraud check (kills write latency), batch-only nightly (catches fraud too late), no fraud check (degrades platform integrity).</td></tr>
+    <tr><td><b>Request coalescing</b> + per-key locks</td><td>ZSET cache stampede on a viral post (single key, thousands of misses simultaneously) needs single-flight rebuild; per-key lock with subsequent waiters joining the in-flight rebuild is the standard fix.</td><td>Hard TTL with no coalescing (stampede), longer TTL (degrades freshness), pessimistic DB lock (worse tail latency).</td></tr>
+    <tr><td><b>Async hot-score recompute</b></td><td>Recomputing hot_score on every vote at 30K/sec peak would saturate the DB; threshold-based recompute (when |Δscore| crosses N or every N seconds) keeps the work bounded with at-most-N-second staleness.</td><td>Synchronous recompute (write amplification), pull-on-read (CPU cost on hot subreddits), no recompute (broken ordering).</td></tr>
+  </tbody>
+</table>

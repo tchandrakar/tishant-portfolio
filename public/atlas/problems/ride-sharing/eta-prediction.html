@@ -1,0 +1,139 @@
+<h1>Design ETA Prediction Service (ML-based, real-time traffic)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build an ETA service that, given an origin/destination pair, returns an accurate travel-time estimate in single-digit milliseconds. Used by ride matching, fare estimation, food delivery, and live trip tracking. Must adapt to live traffic (incidents, weather, events) and learn from billions of historical trip traces.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>POST /eta with origin/dest → travel_time, distance, polyline.</li>
+  <li>Bulk ETA: 1×N (one origin, many candidates) for dispatch fan-out.</li>
+  <li>Live updates: while a trip is in progress, refresh ETA every 30s using current traffic.</li>
+  <li>Mode-aware: car, bike, walk, scooter speed profiles.</li>
+  <li>Confidence interval: return p50 and p90 ETAs, not just a point estimate.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> single ETA p99 &lt; 50 ms; bulk-50 ETA p99 &lt; 80 ms.</li>
+  <li><b>Accuracy:</b> MAE &lt; 60s for trips under 30 min, &lt; 10% relative error overall.</li>
+  <li><b>Scale:</b> 500 K QPS globally at peak (dispatch fan-out dominates).</li>
+  <li><b>Freshness:</b> traffic state lag &lt; 90s; model refresh hourly.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>500 K QPS × ~5 KB request/response avg → 2.5 GB/s ingress; CDN can't help (per-request unique).</li>
+  <li>Road graph: ~50 M edges globally, ~5 GB compressed; per-region shard ~100–500 MB → fits in memory.</li>
+  <li>Live traffic snapshots: every 60s, 50 M edges × 8 B speed value = 400 MB/min → 24 GB/hour pushed to read replicas.</li>
+  <li>Trip traces for training: 25 M trips/day × 1 KB = 25 GB/day → 9 TB/year, kept 2 years for seasonality.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/eta             {origin, dest, mode, depTs}     → {p50, p90, distM, polyline}
+POST /v1/eta/bulk        {origin, dests[], mode}         → [{dest, p50, p90}]
+POST /v1/eta/live/{trip} {currentLoc}                    → {p50, p90, etaTs}
+
+Internal:
+  GET /v1/traffic/snapshot/{region}/{t}                  → edge_speeds[]
+  POST /v1/route/shortest {o, d, weights}                → path, time</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] -> [API GW] -> [ETA Service]
+                            |        \
+                            v         v
+                       [Router]    [Ranker (GBM/DNN)]
+                       /    \           ^
+                      v      v          |
+            [Road Graph]   [Live Traffic State]   <-- [Kafka: gps_pings]
+                                                          ^
+                                                          |
+                                              [Map-matcher / Speed agg]
+                                                          ^
+                                                          |
+                                              [Drivers + open ridehailing fleets]
+</div>
+<p>Two-stage pipeline: a classical graph router (Contraction Hierarchies / CRP) returns a candidate path and base time; a learned ranker corrects this using context (time-of-day, weather, event tag, recent observed speeds for these edges). The traffic state is a materialized view over the GPS ping stream.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Road graph (custom binary, mmap'd)</h3>
+<pre>edge {
+  u: int32, v: int32, length_m: float,
+  cls: u8 (highway|arterial|residential),
+  free_flow_s: float, lanes: u8, oneway: bit
+}</pre>
+<p>Stored as compressed adjacency lists, mmap'd per region into a stateless router process. Reload via blue/green every map update (weekly).</p>
+<h3>7.2 Live traffic (Redis + RocksDB)</h3>
+<p>Hot: edge → recent observed speed window (last 5 min, EWMA). Warm: per-edge time-series in RocksDB for the past 24h, used by the ranker as a feature.</p>
+<h3>7.3 Trip traces (Parquet on S3, partitioned by day/region)</h3>
+<p>Ground-truth labels for offline training: (origin, dest, departure_ts, actual_time, path).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Router</h3>
+<p>Contraction Hierarchies precomputed weekly: shrinks 50 M-edge query to ~hundreds of hops, gets sub-ms shortest path. Edge weights = base free-flow time × live speed multiplier.</p>
+<h3>8.2 ML ranker</h3>
+<p>Gradient-boosted tree on features: base ETA, hour-of-day, day-of-week, weather code, edge-class mix, recent edge-speed deltas, origin/dest cluster embeddings. Trained nightly on the previous 90 days. Served via a thin C++ predictor; ~200 µs/inference.</p>
+<h3>8.3 Map-matcher &amp; speed aggregator</h3>
+<p>Stream job (Flink) consumes GPS pings, snaps each to the nearest road edge using a Hidden Markov Model, and emits (edge_id, speed). A per-edge tumbling window (1 min) computes mean speed and pushes to Redis. Outliers filtered by Kalman smoothing.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Bulk fan-out:</b> a 50-candidate dispatch ETA call must reuse one source-side Dijkstra (one-to-many) — drops cost from 50× to ~1.5×.</li>
+  <li><b>Cold edges:</b> rural roads have no recent pings; fall back to historical-time-of-day model.</li>
+  <li><b>Map updates:</b> a global graph rebuild every week; use blue/green per region to avoid stalls.</li>
+  <li><b>Hot regions:</b> shard router by region; a single SF instance handles ~50 K QPS.</li>
+  <li><b>Tail latency:</b> bound router with a 20 ms deadline; on timeout, return haversine × class multiplier as fallback.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>CH preprocessing</td><td>Sub-ms queries</td><td>Slow (hours) to rebuild on map change</td></tr>
+<tr><td>GBM over DNN</td><td>Cheaper inference, interpretable</td><td>Misses long-range temporal patterns</td></tr>
+<tr><td>Per-edge speed (vs link)</td><td>Fine-grained accuracy</td><td>50 M keys → memory pressure</td></tr>
+<tr><td>Eventual freshness (90s)</td><td>Cheap aggregations</td><td>Slow to react to flash incidents</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage and retrieval — mmap'd column-oriented road graph for cache-friendly traversal.</li>
+  <li>Ch. 10 Batch processing — Spark jobs to rebuild CH and train GBM nightly.</li>
+  <li>Ch. 11 Stream processing — Flink HMM map-matcher and per-edge windowed speeds.</li>
+  <li>Ch. 12 Future of data systems — lambda-style: batch trains the model, streaming serves features.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The two-stage design (graph router + learned ranker) gives me cheap inference while still capturing context like weather and events."</li>
+  <li>"I'd treat traffic as a materialized view over GPS pings — that means a clean replay path when I change the speed-aggregation logic."</li>
+  <li>"For dispatch, a one-to-many Dijkstra is the single biggest cost saver: 50× fewer searches per ride request."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Contraction Hierarchies (CH)</td><td>50 M global edges shrink to a few hundred hops per query; the 50 ms p99 single-ETA budget and 80 ms bulk-50 budget at 500 K QPS are only feasible because CH delivers sub-ms shortest-path lookups.</td><td>Live Dijkstra → 50–100 ms per query, blows the SLO; A* → faster than Dijkstra but still 5–10× slower than CH.</td></tr>
+    <tr><td>mmap'd binary road graph</td><td>Per-region 100–500 MB shards mmap into stateless router processes; OS page cache shares pages across forks, and blue/green reload on weekly map updates avoids stalling the 500 K QPS read path.</td><td>Postgres/PostGIS in-line → 10–100× slower for shortest-path; in-process JVM heap → GC pauses break tail latency.</td></tr>
+    <tr><td>S2/H3 (cluster embeddings)</td><td>Origin/dest cluster embeddings as ranker features need consistent geographic bucketing; H3 res 8 (~0.7 km²) gives the GBM a stable categorical even when the road graph rebuilds.</td><td>Free-form k-means → embeddings drift on retrain; raw lat/lng → ranker overfits to coordinate noise.</td></tr>
+    <tr><td>Redis (live edge speeds)</td><td>EWMA over 5-min windows keyed by edge_id needs sub-ms reads from the router on every shortest-path expansion; 50 M edges × 8 B = 400 MB hot fits comfortably with sharding.</td><td>Memcached → no atomic ops for EWMA update; in-process cache → no cross-pod consistency.</td></tr>
+    <tr><td>RocksDB (warm 24h history)</td><td>Per-edge time-series for the past day feeds the ranker as a feature; LSM keeps writes cheap as Flink emits 50 M edge updates/min, and range scans by edge_id are fast.</td><td>InfluxDB → fine, RocksDB embeds in the ranker process for 0-network-hop reads; Cassandra → overkill for embedded use.</td></tr>
+    <tr><td>Flink (HMM map-matcher)</td><td>GPS pings snap to road edges via Hidden Markov Model with stateful per-trip context; Flink's keyed state handles 1.25 M wps and exactly-once checkpoints survive AZ failure without double-counting speeds.</td><td>Spark Streaming → micro-batch latency makes 90s freshness hard; Kafka Streams → harder for HMM-style stateful pipelines.</td></tr>
+    <tr><td>Kafka (gps_pings)</td><td>Replayable stream lets us reprocess speed aggregation when the smoothing logic changes; 1.25 M wps partitioned by region keeps the map-matcher stateful jobs co-located with the corresponding road shard.</td><td>Kinesis → fine, Kafka has stronger Flink connector story; SQS → no replay or partition ordering.</td></tr>
+    <tr><td>S3 + Parquet (trip traces)</td><td>25 M trips/day × 1 KB = 25 GB/day; 2-year retention = ~18 TB. Day/region partitioning means a Spark training job over the past 90 days reads only ~2 TB and parallelizes across 1 K cores.</td><td>HDFS → no managed multi-region durability; row-store SQL → poor compression and full-scan cost.</td></tr>
+    <tr><td>Spark (CH rebuild + GBM training)</td><td>Weekly CH preprocessing and nightly GBM training are batch-shaped (hours of compute on TB of data); Spark's broadcast joins handle the road-graph + traces join naturally.</td><td>Flink batch → less mature ML tooling; Hadoop MR → 5–10× slower wall-clock.</td></tr>
+    <tr><td>GBM (gradient boosted trees)</td><td>200 µs/inference at 500 K QPS = 100 cores aggregate; interpretable feature importances let us debug regressions per-city. MAE &lt; 60s target is achievable without DNN-scale hardware.</td><td>DNN → 5–20× more inference cost, opaque; linear regression → too biased for non-linear weather/event interactions.</td></tr>
+    <tr><td>gRPC (router + ranker)</td><td>Two-stage pipeline must complete in 50 ms p99; protobuf and HTTP/2 multiplex the router and ranker calls in parallel from the ETA service.</td><td>REST → JSON parse eats 5–10 ms of the budget; co-located library → harder to scale router and ranker independently.</td></tr>
+    <tr><td>Kalman smoother (outlier filter)</td><td>GPS pings have ±10 m noise that, naively averaged, produces 30+ km/h speed errors on a 25 m edge; Kalman filter on the per-edge speed series reduces variance by 3–5×.</td><td>Median filter → drops legitimate fast events; raw mean → biased by outliers.</td></tr>
+    <tr><td>CDN bypass (per-request unique)</td><td>500 K QPS × 5 KB = 2.5 GB/s ingress lands directly on the ETA service because origin/dest pairs rarely repeat; CDN caching wouldn't help and would just add a hop.</td><td>Edge cache → near-zero hit rate, wasteful; client-side dedup → no benefit for unique journeys.</td></tr>
+  </tbody>
+</table>
+

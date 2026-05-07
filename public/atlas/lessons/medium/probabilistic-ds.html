@@ -1,0 +1,70 @@
+<h1>Probabilistic data structures: Bloom, Count-min, HyperLogLog</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">bloom-filter</span>
+  <span class="tag">count-min</span>
+  <span class="tag">hyperloglog</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Exact answers cost memory proportional to the data. When the data is billions of items but the question is small ("have I seen this before?", "how many uniques?", "what's the top key?"), probabilistic data structures trade a tiny, bounded error for orders-of-magnitude smaller memory. The three you need to know cold: <b>Bloom filter</b> (set membership, no false negatives), <b>Count-min sketch</b> (frequency estimates, never under-counts), and <b>HyperLogLog</b> (cardinality of huge sets in a few KB).</p>
+
+<h2>Why it matters</h2>
+<p>Real systems are full of "is this URL in our 100M crawl-list?" and "how many unique users hit this endpoint today?" type questions. Storing a hash set of every item works at small scale and explodes at large scale. These structures let a cache, a fraud system, or an analytics pipeline answer the same questions in fixed, predictable memory — usually a few MB regardless of input size.</p>
+
+<h2>Bloom filter — set membership</h2>
+<p>A bit array of m bits and k hash functions. <b>Insert:</b> set <code>h1(x), h2(x), …, hk(x)</code> bits to 1. <b>Query:</b> if all k bits are 1, "probably present"; if any is 0, "definitely absent". No false negatives, tunable false-positive rate (~1% with ~10 bits per item, k=7).</p>
+<ul>
+  <li><b>Use it:</b> in front of a slow store to skip lookups that definitely miss (Cassandra does this per SSTable).</li>
+  <li><b>Don't use it:</b> when you need deletes (use counting Bloom) or exact answers.</li>
+</ul>
+
+<h2>Count-min sketch — frequency</h2>
+<p>A 2D array of d rows × w cols, plus d hash functions (one per row). <b>Increment:</b> for each row i, do <code>table[i][hi(x) % w]++</code>. <b>Query:</b> return the <i>min</i> of the d cells. Always overestimates (collisions add), never underestimates. Width controls accuracy, depth controls confidence.</p>
+<ul>
+  <li><b>Use it:</b> top-K heavy hitters, streaming frequency, anti-abuse counters where exact is overkill.</li>
+  <li><b>Don't use it:</b> for tail counts — small frequencies get drowned in collision noise.</li>
+</ul>
+
+<h2>HyperLogLog — cardinality</h2>
+<p>Hash each item, look at the leading-zero count of the hash, keep the max per bucket. The intuition: in a uniform random stream, seeing a hash with 20 leading zeros means you've probably seen ~2^20 distinct items. Average across many buckets to reduce variance. ~1.6 KB of state estimates cardinality up to 10^9 with ~2% error.</p>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  Bloom (membership)        Count-min (frequency)        HLL (cardinality)
+  ┌─┬─┬─┬─┬─┬─┬─┬─┐         row1 [ . 7 . 2 . . 9 . ]      bucket: max(lead0)
+  │1│0│1│1│0│1│0│0│  ←OR    row2 [ 3 . . . 8 . . 4 ]      ┌──┬──┬──┬──┬──┐
+  └─┴─┴─┴─┴─┴─┴─┴─┘         row3 [ . . 5 . . 1 . . ]      │ 4│ 7│ 2│ 5│ 3│
+   k hashes per item        min over rows = est           └──┴──┴──┴──┴──┘
+   AND on query             never under-counts            harmonic mean → N
+</div>
+
+<h2>Picking the right one</h2>
+<ul>
+  <li><b>"Have I seen X?"</b> Bloom.</li>
+  <li><b>"How often is X?"</b> Count-min.</li>
+  <li><b>"How many distinct?"</b> HyperLogLog.</li>
+  <li><b>"Top-K heavy hitters?"</b> Count-min sketch + a small min-heap of candidates.</li>
+  <li>All three are <i>mergeable</i> — you can sketch per-shard and union for a global answer. That's the property that makes them shine in distributed systems.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Sizing the Bloom filter for the wrong N — once you exceed expected capacity, false-positive rate climbs fast.</li>
+  <li>Using count-min for things with extreme skew without a top-K heap to extract the actual hot items.</li>
+  <li>Storing PII in a "Bloom filter is one-way" mindset — small input spaces (phone numbers) are trivially brute-forced.</li>
+  <li>Reporting HLL cardinality without disclosing the ±2% — finance teams will hate you.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> A real-time analytics service tracks "unique users per URL per minute" across 1 billion URLs. Exact storage is impossible. Sketch a design — what structure per URL, how do you merge across shards, how do you bound memory?
+  <br/>
+  <b>Hint:</b> One HLL per URL key, small (1–4 KB) precision, merge per minute window across shards. Total memory ~ URLs × HLL size.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-twitter-trending">Design Twitter trending</a> — count-min + heap for top-K hashtags.</li>
+  <li><a href="#problem/design-distributed-counter">Design a distributed counter</a> — HLL for unique-visitor counters.</li>
+  <li><a href="#problem/design-web-crawler">Design a web crawler</a> — Bloom filter to skip already-fetched URLs.</li>
+</ul>

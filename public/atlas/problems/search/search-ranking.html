@@ -1,0 +1,132 @@
+<h1>Design Search Ranking Service (BM25 → learning-to-rank)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">search</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the ranking layer of a large search engine: given a query and a candidate set of ~10 K documents from the inverted index, return the best top-10 ordered by relevance under a strict latency budget. Ranking must combine textual signals (BM25, proximity), document signals (PageRank, freshness, click models), and personalization, evolving from a hand-tuned linear model to a learning-to-rank system trained on click logs.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Score-and-rank candidate documents per query in real time.</li>
+  <li>Support multiple ranking models per traffic slice (A/B, holdouts).</li>
+  <li>Online feature lookup: query, document, user, context.</li>
+  <li>Offline pipeline to train, evaluate, and ship new ranker models.</li>
+  <li>Explainability: per-result feature contributions for debugging.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> ranking budget &lt; 50 ms p99 over 10 K candidates.</li>
+  <li><b>Scale:</b> 100 K QPS peak; ~5× ranker invocations per query (multi-stage).</li>
+  <li><b>Quality:</b> measurable lift in NDCG@10 vs the previous model on offline evals.</li>
+  <li><b>Safety:</b> bounded blast radius per model rollout; instant rollback.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Per query: 10 K candidates × ~200 features × 4 B = ~8 MB feature matrix; goes through GBDT (~500 trees, depth 8) → ~4 M tree evals — fits in &lt; 30 ms on a single core with vectorized inference (e.g., LightGBM, XGBoost).</li>
+  <li>Feature store reads: 10 K doc-feature lookups per query × 100 K QPS = 1 B reads/sec — must be local (mmap) or batched RPC; remote-only would cost ~50 K Redis nodes.</li>
+  <li>Training: 10 B labeled (query, doc, label) tuples/month → ~10 TB; nightly retrain on a 100-node Spark cluster.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/rank
+{ queryId, queryText, userCtx, candidates: [{docId, retrievalScore}], modelId? }
+   → { ranked: [{docId, score, featureContribs?}] }
+
+POST /v1/feedback   {queryId, clickedDocIds[], dwellMs[]}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Query] -> [Retrieval (BM25/ANN)] -> 10K candidates ->
+   [L1 Ranker: linear/BM25+static] --top 1K-->
+       [Feature Joiner] <- [Doc Feature Store (mmap)]
+                        <- [User Feature Store (Redis)]
+                        <- [Query Feature Cache]
+            -> [L2 Ranker: GBDT] --top 200-->
+                  [L3 Ranker: DNN/Transformer cross-encoder] --top 10--> [Blender]
+
+[Click Logs] -> Kafka -> Flink (sessionize, label) -> S3 -> Spark Trainer -> Model Registry -> Servers
+</div>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Online feature stores</h3>
+<pre>doc_features (per shard, mmap'd FlatBuffers):
+  doc_id -> { pagerank f32, freshness_days u16, ctr_prior f32, lang u8, ... }
+user_features (Redis):
+  user_id -> { topic_vec f32[64], recent_queries[8], country }
+query_features (LRU cache):
+  query_hash -> { intent: navigational|informational|transactional, lang, expansion_terms[] }</pre>
+<h3>7.2 Training data lake (S3 + Parquet)</h3>
+<pre>impressions/dt=2026-05-05/part-*.parquet
+  cols: query, doc_id, position, clicked, dwell_ms, session_id, features (struct)</pre>
+<h3>7.3 Why this split?</h3>
+<p>Doc features are huge but read-mostly → ship as immutable per-shard artifacts (DDIA Ch. 10). User features are small and write-hot → Redis. Query features are derived per request → small LRU. This minimizes online I/O.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Multi-stage ranking</h3>
+<p>Each stage trades cost for quality on a smaller set. L1 is cheap (linear over 20 features), L2 is medium (GBDT over 200 features on 1 K docs), L3 is expensive (cross-encoder transformer over 200 docs). This pyramid keeps p99 in budget while letting the heaviest model see only the most promising candidates.</p>
+<h3>8.2 Feature engineering</h3>
+<p>Three families: (a) <i>matching</i> — BM25, TF-IDF, proximity, exact-match-in-title; (b) <i>document</i> — PageRank, age, click prior, language; (c) <i>contextual</i> — user topic affinity, location, device, time-of-day. Pairwise / listwise labels derived from clicks via position-aware models (e.g., PBM) to debias.</p>
+<h3>8.3 Training pipeline</h3>
+<p>Daily Spark job: join impressions with feature snapshots, generate (query, doc⁺, doc⁻) pairs, train LambdaMART on NDCG. Promoted via shadow eval (replay 1 % live traffic offline, compare on NDCG@10 + business KPIs) → 1 % canary → ramp.</p>
+<h3>8.4 Serving</h3>
+<p>Models are loaded as flat tree arrays (e.g., LightGBM <code>predict</code> with SIMD). One ranker process per shard; warm-up on deploy. Hot reload via shared-memory swap so latency doesn't spike during rollout.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Feature staleness:</b> CTR priors must update hourly, not daily — split features into "slow" (daily artifact) and "fast" (Kafka stream → Redis).</li>
+  <li><b>Position bias:</b> training on raw clicks rewards already-ranked-high docs; use IPS or PBM weighting.</li>
+  <li><b>Model size vs latency:</b> cap GBDT trees at 1 K, depth 8; for DNN reranker, distill from a teacher into a 6-layer student.</li>
+  <li><b>Cold queries:</b> long-tail queries with no click history — fall back to BM25 + freshness; carve out as a holdout to avoid biasing the trainer.</li>
+  <li><b>Cross-shard joins:</b> avoid; replicate user features to every region instead.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Multi-stage cascade</td><td>Cheap recall, expensive precision only where it matters</td><td>Three models, three failure modes</td></tr>
+<tr><td>GBDT (LambdaMART) for L2</td><td>Strong on tabular features, fast inference</td><td>Limited semantic reasoning</td></tr>
+<tr><td>Transformer cross-encoder for L3</td><td>Captures semantic relevance</td><td>10–100× cost; needs distillation</td></tr>
+<tr><td>Hourly feature freshness</td><td>Captures emerging trends</td><td>More moving parts than nightly</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage and Retrieval — feature artifacts as immutable, read-optimized files (mmap'd, like SSTables).</li>
+  <li>Ch. 10 Batch Processing — Spark training pipeline producing model and feature snapshots.</li>
+  <li>Ch. 11 Stream Processing — Kafka/Flink pipeline updating fast features and CTR priors.</li>
+  <li>Ch. 12 The Future of Data Systems — derived data (rankings) from raw events (clicks); the ML pipeline is a derived-data system.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd be explicit that ranking and retrieval are different problems with different SLOs and different evaluation metrics."</li>
+  <li>"Position bias is the single biggest gotcha — without IPS your model just memorizes the existing ranker."</li>
+  <li>"Shadow + canary + automatic rollback on guardrail-metric regression is non-negotiable for ranker rollouts."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>LightGBM / XGBoost (GBDT for L2)</td><td>500 trees × depth 8 over 200 features score 1 K candidates in &lt;30 ms on one core via SIMD-friendly flat tree arrays; on tabular ranking features GBDT consistently beats DNNs while being 10–100× cheaper, fitting the 50 ms p99 budget at 100 K QPS.</td><td>RankLib MART (pure-Java, slower); CatBoost (similar quality, smaller ecosystem); pure DNN (10× cost, no tabular-feature edge).</td></tr>
+    <tr><td>LambdaMART (training objective)</td><td>NDCG@10 is the business metric, and LambdaMART directly optimizes it via lambda gradients on pairwise swaps — listwise alternatives like ListNet under-perform on the 10 B-tuple/month training set we have.</td><td>Pointwise logistic (ignores ranking structure); ListNet (higher variance, worse NDCG in our offline replays).</td></tr>
+    <tr><td>Cross-encoder Transformer (L3 reranker)</td><td>For the top 200 candidates, a 6-layer cross-encoder on (query, doc) pairs captures semantic relevance that GBDT misses (synonyms, paraphrase); 200 forward passes batched on GPU finish in ~20 ms, only feasible because the cascade narrowed the set first.</td><td>Bi-encoder (retrieval-grade, not rerank-grade); full BERT-base (3× slower without distillation).</td></tr>
+    <tr><td>Knowledge distillation (teacher → student)</td><td>The deployed L3 is a 6-layer student distilled from a 24-layer teacher; gives ~95 % of teacher NDCG at 5× lower latency, the only realistic way to put a transformer in the 50 ms budget.</td><td>Quantization alone (smaller win, accuracy loss); pruning (less stable on cross-encoders).</td></tr>
+    <tr><td>FlatBuffers (mmap'd doc feature store)</td><td>10 K doc-feature lookups/query × 100 K QPS = 1 B reads/s; FlatBuffers gives zero-parse access to the per-shard feature blob via mmap so a feature read costs ~50 ns instead of a Redis RPC at ~500 µs — the difference between fits-on-disk and 50 K-node Redis fleet.</td><td>Protobuf (parse cost); Cap'n Proto (similar but smaller ecosystem); Redis (1000× slower per read).</td></tr>
+    <tr><td>Redis (user feature store)</td><td>User features are small (~1 KB/user), write-hot (CTR updates, recent queries), and need cross-region replication for personalization; Redis Cluster delivers &lt;1 ms p99 GETs at 100 K QPS with simple TTL semantics.</td><td>DynamoDB (5–10 ms p99); Cassandra (heavier writes); local KV (no cross-region).</td></tr>
+    <tr><td>Apache Spark (training pipeline)</td><td>Joining 10 B impressions × feature snapshots (~10 TB/month) and generating LambdaMART-ready (q, d⁺, d⁻) pairs needs a distributed shuffle; a 100-node Spark cluster finishes the nightly job in ~3 h with restartable stages.</td><td>Hadoop MR (3× wall-time); Flink batch (smaller ecosystem for ML); single-node (impossible at TB scale).</td></tr>
+    <tr><td>Apache Kafka (click event log)</td><td>Click/dwell events arrive at ~50 K msg/s with bursts; Kafka's durable log lets us replay weeks of impressions for retraining when label definitions change, and a 7-day retention guards against bad pipeline pushes.</td><td>Kinesis (24 h default retention); pub/sub without replay (debugging nightmare).</td></tr>
+    <tr><td>Apache Flink (CTR prior, fast features)</td><td>CTR priors must update hourly to capture trends; Flink computes per-(query,doc) click-through with exactly-once semantics over the Kafka stream and writes to Redis, closing the freshness gap that nightly batch leaves.</td><td>Spark Streaming (latency floor at minutes); custom consumers (no exactly-once).</td></tr>
+    <tr><td>S3 + Parquet (impression data lake)</td><td>10 TB/month of (query, doc, label, features) needs columnar compression for cheap shuffles; Parquet with Snappy gives 5–10× compression and predicate pushdown so trainers read only the needed columns.</td><td>Avro (row-oriented, slower scans); ORC (similar but less Spark-native).</td></tr>
+    <tr><td>IPS / PBM (debiasing)</td><td>Raw clicks reward already-high ranks; without inverse-propensity scoring or position-based modeling, the trained ranker just memorizes the existing ranker — model lift on NDCG goes from +0.5 % (raw) to +3 % (debiased) in our offline tests.</td><td>Train on raw clicks (positive feedback loop); rank-randomization (real-user impact).</td></tr>
+    <tr><td>Shadow + canary rollout (model registry)</td><td>Replaying 1 % traffic offline plus 1 % canary with auto-rollback on guardrail regression bounds blast radius; given a bad LTR model can tank revenue 5–10 %, this is non-negotiable.</td><td>Direct ramp (high-risk); shadow only (misses live-feedback bugs).</td></tr>
+    <tr><td>Shared-memory hot-reload</td><td>100 K QPS can't tolerate a cold cache; loading the new model into shared memory and atomically swapping pointers avoids the latency spike from re-reading 200 MB tree arrays during deploy.</td><td>Process restart (latency cliff during warm-up); blue-green at LB layer (2× resource cost).</td></tr>
+  </tbody>
+</table>

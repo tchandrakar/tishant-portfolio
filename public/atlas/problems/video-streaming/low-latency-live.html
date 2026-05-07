@@ -1,0 +1,133 @@
+<h1>Design Low-latency Live Streaming (LL-HLS, CMAF, sub-3s glass-to-glass)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">cdn</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a CDN-scale live streaming pipeline with glass-to-glass latency under 3 seconds, suitable for sports, auctions, and live events. Must support millions of concurrent viewers (CDN-scaled), adaptive bitrate, and DRM. Cannot rely on WebRTC because the audience size demands HTTP-cacheable delivery. Standard HLS at 6-second segments yields 20–30s latency — unacceptable.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Ingest RTMP/SRT/WebRTC-WHIP from broadcasters.</li>
+  <li>Transcode to ABR ladder; package as LL-HLS and LL-DASH (CMAF).</li>
+  <li>Deliver via CDN with HTTP/2 + chunked transfer.</li>
+  <li>DRM (Widevine, FairPlay, PlayReady) for premium content.</li>
+  <li>DVR window (rewind 6 hours).</li>
+  <li>Live captions and metadata insertion (SCTE-35 markers).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> glass-to-glass 2–3s p95 (vs ~20s standard HLS).</li>
+  <li><b>Scale:</b> 10M concurrent viewers per event, 100K events.</li>
+  <li><b>Quality:</b> rebuffer ratio < 0.5%, video start time < 1s.</li>
+  <li><b>Availability:</b> 99.95%; survive single-region failure.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Ingest:</b> 100K streams * 8 Mbps = 800 Gbps; load balanced across 50 ingest PoPs.</li>
+  <li><b>Transcode:</b> 100K * 5 renditions = 500K outputs; GPU/ASIC fleet ~50K nodes.</li>
+  <li><b>Egress:</b> peak 10M viewers * avg 3 Mbps = 30 Tb/s; CDN handles 95%, origin shield ~1.5 Tb/s.</li>
+  <li><b>Origin storage:</b> rolling 6-hour DVR window * 100K streams * 8 Mbps total = ~1.7 PB live working set on hot tier.</li>
+  <li><b>Manifest QPS:</b> 10M viewers refreshing every 200 ms = 50M req/s on manifests; absolute necessity to serve manifests from edge with ETag/cache.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/channels                       {name, drm}      → ingestUrls{rtmp,srt,whip}
+GET  /hls/{ch}/master.m3u8                               → master playlist
+GET  /hls/{ch}/{rendition}/playlist.m3u8?_HLS_msn=N&amp;_HLS_part=K   → media playlist (blocking)
+GET  /hls/{ch}/{rendition}/seg{n}.fmp4                   → CMAF segment
+GET  /hls/{ch}/{rendition}/seg{n}.part{k}.fmp4           → CMAF chunk (~200ms)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Encoder/OBS] --RTMP/SRT/WHIP--> [Ingest PoP] --> [Transcoder (GPU)]
+                                                       |
+                                                       v
+                                                  [LL-HLS Packager]  -- CMAF chunks --> [Origin Shield (HTTP/2)]
+                                                       |                                          |
+                                                       v                                          v
+                                                  [DRM License Svc]                      [CDN Edge Tier]
+                                                                                                  |
+                                                                                                  v
+                                                                                              [Player]
+</div>
+<p>Walk-through: encoder pushes to ingest. Transcoder produces CMAF with 200 ms chunks aligned across renditions. Packager writes manifests with EXT-X-PART and EXT-X-PRELOAD-HINT directives. Edge serves chunks with HTTP/2 chunked transfer; player uses blocking playlist reload for sub-second updates.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Live segment store (Redis + S3 tiered)</h3>
+<p>Latest 30s of chunks live in Redis (key: ch:rendition:msn:part). After 30s, chunks flush to S3 and remain there for the DVR window. After 6 hours, optionally move to VOD bucket for replay or expire.</p>
+<h3>7.2 Manifest cache</h3>
+<pre>edge_cache_key = (channel, rendition, msn, part)
+TTL = 1s for live chunks, immutable=true once segment closes
+s-maxage on master = 5s</pre>
+<h3>7.3 Why not store in HDFS or Cassandra?</h3>
+<p>Chunk read pattern is hot-then-cold; in-memory + object storage matches the access pattern. Cassandra adds compaction overhead with no benefit for blob-style payloads.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Encoder + transcoder</h3>
+<p>Encoder configures GOP=2s, keyframe-aligned, B-frames=0 to avoid B-frame reorder latency. Transcoder runs h264_nvenc with low-latency preset; per-rendition bitrate fixed via CRF + cap-VBV.</p>
+<h3>8.2 LL-HLS packager</h3>
+<p>Emits CMAF chunks every 200 ms inside 2-second segments. Manifest contains <code>EXT-X-PART-INF</code>, <code>EXT-X-PART</code> for the latest 3 segments, and <code>EXT-X-PRELOAD-HINT</code> for the next chunk, enabling the player to pre-issue blocking GETs.</p>
+<h3>8.3 Origin shield + edge</h3>
+<p>HTTP/2 chunked transfer is critical: a partial chunk being written by the packager must stream to the player as it grows. Shield holds open the connection, edges proxy via H/2 push or simple H/2 streaming. Range-coalesced requests deduplicate concurrent edge fetches at the shield.</p>
+<h3>8.4 Player tuning</h3>
+<p>Buffer target 1.5–2 chunks (~400 ms); jump-back if buffer stalls > 500 ms. Use Common Media Client Data (CMCD) headers so CDN can prioritize bandwidth-starved clients.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Manifest QPS:</b> 50M+ rps; cache at edge with 1s TTL or use blocking-playlist hold-time so client requests stay open until new part is ready (saves 80% of QPS).</li>
+  <li><b>Thundering herd on segment publish:</b> origin shield collapses N concurrent edge fetches to one origin pull (request coalescing).</li>
+  <li><b>DRM licensing:</b> keep license requests at <2% of player count via long-lived per-session tokens (1 hour).</li>
+  <li><b>Cross-region failover:</b> dual-ingest from broadcaster (or origin replication); CDN re-routes on origin health-check failure.</li>
+  <li><b>Latency budget breakdown:</b> capture 50ms + encoder 300ms + ingest+transcode 500ms + packager 200ms + CDN buffer 1000ms + player buffer 500ms ≈ 2.5s.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>LL-HLS vs WebRTC</td><td>Scales to 10M via CDN, DRM-friendly</td><td>2–3s vs WebRTC sub-second</td></tr>
+<tr><td>CMAF chunked transfer</td><td>Single asset for HLS+DASH</td><td>Origin needs HTTP/2 streaming</td></tr>
+<tr><td>2s segments / 200ms parts</td><td>Good latency, manageable QPS</td><td>More manifest churn</td></tr>
+<tr><td>Blocking playlist reload</td><td>Reduces poll storm</td><td>Long-lived connections at edge</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — origin replication for live failover.</li>
+  <li>Ch. 6 Partitioning — channel-keyed sharding of packagers and origin shields.</li>
+  <li>Ch. 11 Stream Processing — telemetry pipeline (rebuffer, latency) for QoE.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The single most important design choice is CMAF chunked transfer over HTTP/2 — it lets the player consume bytes before a segment is fully written."</li>
+  <li>"Standard HLS latency is dominated by the player's 3-segment buffer (18s); LL-HLS replaces that with parts and blocking-playlist hold-time, dropping it to ~2s."</li>
+  <li>"I'd benchmark a 5M-viewer event with synthetic load and watch tail-latency on manifest QPS — that's almost always the breaking point before video bandwidth."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>LL-HLS with CMAF</b></td><td>200ms partial chunks within 2-second segments deliver 2–3s glass-to-glass while remaining HTTP-cacheable; <code>WebRTC</code> can't fan out to 10M concurrent without a forest of SFUs, so CMAF over <code>HLS</code> is the only path.</td><td><code>WebRTC</code> — won't scale to 10M; standard <code>HLS</code> — 20–30s latency unacceptable; <code>DASH</code>-only — Apple iOS won't play it</td></tr>
+    <tr><td><b>HTTP/2 chunked transfer</b></td><td>Player consumes bytes before a chunk is fully written by the packager; without H/2 streaming the player would have to wait for chunk completion, adding 200ms per chunk to the latency budget.</td><td>HTTP/1.1 — no streaming chunked transfer at scale; HTTP/3 — emerging, mid-2024 CDN support uneven</td></tr>
+    <tr><td><b><code>RTMP</code> / <code>SRT</code> / WHIP ingest</b></td><td>Multi-protocol ingest covers all encoder ecosystems: <code>RTMP</code> for legacy OBS, <code>SRT</code> for satellite/lossy uplinks (forward error correction), WHIP for browser-based broadcasters.</td><td><code>RTMP</code>-only — locks out modern lossy-network workflows; WHIP-only — narrow adoption</td></tr>
+    <tr><td><b>NVIDIA NVENC (h264_nvenc)</b></td><td>Low-latency preset with B-frames=0 and GOP=2s avoids reorder-induced latency; 500K transcode outputs (100K streams × 5 renditions) need hardware encode at ~50K GPU/ASIC nodes.</td><td>x264 — 5× CPU cost; AV1 — too slow for live encode</td></tr>
+    <tr><td><b>Redis (live segment cache)</b></td><td>Latest 30s of CMAF chunks live in Redis keyed by (channel, rendition, msn, part); in-memory access matches the hot-then-cold pattern of live streaming where 90% of reads are within 30s of write.</td><td>Cassandra — compaction overhead on blob-style payloads; HDFS — wrong access pattern</td></tr>
+    <tr><td><b>S3 (DVR window + VOD)</b></td><td>1.7 PB live working set on hot tier, then 6-hour DVR rolloff to S3; lifecycle rules transition expired DVR to VOD bucket for replay or delete — single storage layer, two retention policies.</td><td>HDFS — durability needs triple-replicate; persistent block storage — too expensive at PB scale</td></tr>
+    <tr><td><b>EXT-X-PART / EXT-X-PRELOAD-HINT</b></td><td>Apple LL-HLS directives that let player pre-issue blocking GETs for the next chunk; without preload-hint, player must poll, adding round-trip latency and 50M+ rps manifest QPS.</td><td>Standard <code>HLS</code> directives — 18s buffer minimum; custom polling — 50M rps load on edge</td></tr>
+    <tr><td><b>Origin shield (request coalescing)</b></td><td>10M viewers triggering simultaneous edge fetches for a freshly-published chunk would melt origin; shield collapses N concurrent fetches to one origin pull, capping origin bandwidth at 1.5 Tb/s.</td><td>Direct origin — thundering herd; multi-tier shield — diminishing returns past one layer</td></tr>
+    <tr><td><b>Widevine / FairPlay / PlayReady</b></td><td>Premium live (sports, auctions) requires multi-DRM by contract; long-lived per-session tokens (1 hour) keep license-server load at &lt;2% of player count.</td><td>Single DRM — rights holders refuse; clear-key — non-starter</td></tr>
+    <tr><td><b>SCTE-35 markers</b></td><td>In-band metadata for ad insertion and content boundaries; standard signaling that downstream ad-stitchers and DVR players already understand.</td><td>Custom metadata — ecosystem won't recognize; out-of-band signaling — drift between media and markers</td></tr>
+    <tr><td><b>CMCD headers</b></td><td>Common Media Client Data conveys buffer level, throughput, and content ID to CDN — lets CDN prioritize bandwidth-starved clients (low buffer) over comfortable ones, reducing rebuffer ratio.</td><td>No client telemetry — CDN can't prioritize; proprietary headers — no standardization</td></tr>
+    <tr><td><b>Blocking playlist reload</b></td><td>Client opens a long-lived GET with <code>_HLS_msn=N&amp;_HLS_part=K</code>; server holds connection until next part is ready, eliminating 80% of poll storm at 50M+ manifest rps.</td><td>Standard polling — 50M rps overload; WebSocket signaling — incompatible with <code>HLS</code> ecosystem</td></tr>
+    <tr><td><b>Edge cache with 1s TTL</b></td><td>ETag-keyed edge caching with 1-second TTL on live chunks (immutable=true once segment closes) absorbs the manifest QPS without breaking liveness; master playlist gets s-maxage=5s.</td><td>No cache — 50M rps to origin; long TTL — viewers see stale playlist</td></tr>
+    <tr><td><b>Latency-budget engineering</b></td><td>Capture 50ms + encoder 300ms + ingest+transcode 500ms + packager 200ms + CDN 1000ms + player 500ms ≈ 2.5s; every component has a fixed budget so a regression in one is detected immediately.</td><td>No budget — invisible regressions; loose budgets — silent latency creep</td></tr>
+  </tbody>
+</table>

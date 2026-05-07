@@ -1,0 +1,138 @@
+<h1>Design S3-style Object Storage (durability 11-9s, erasure coding)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">file-storage</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a globally distributed object store with the durability and API surface of Amazon S3: 11 nines of durability, virtually unlimited capacity, single-key strong read-after-write consistency, and an HTTP REST interface. Objects range from 1 byte to 5 TB. The system must internally use erasure coding (not 3x replication) to keep storage cost competitive at exabyte scale.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>PUT / GET / DELETE / HEAD / LIST on objects keyed by <code>(bucket, key)</code>.</li>
+  <li>Multipart upload for objects above 5 GB, up to 10,000 parts.</li>
+  <li>Versioning, lifecycle policies (move to IA / Glacier after N days), object lock (WORM).</li>
+  <li>Bucket-level IAM and signed URLs.</li>
+  <li>Server-side encryption (SSE-S3, SSE-KMS, SSE-C).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Durability:</b> 99.999999999% (11-9s) annual.</li>
+  <li><b>Availability:</b> 99.99% standard tier.</li>
+  <li><b>Latency:</b> first-byte under 100 ms p99 in-region for warm GET.</li>
+  <li><b>Scale:</b> 280 trillion+ objects in production; 100 M+ requests/s peak globally.</li>
+  <li><b>Cost:</b> &lt; 1.5x raw bytes including all overhead at the largest tier.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Objects: 280 T total; assume 200 KB median → ~56 EB user data.</li>
+  <li>Erasure coding 10+4 → 1.4x storage overhead = ~78 EB physical.</li>
+  <li>Request mix: 90% GET, 8% PUT, 2% LIST; 100 M req/s peak → 90 M GET/s, 8 M PUT/s.</li>
+  <li>Index size: 280 T x ~250 B per row = 70 PB of metadata (sharded across thousands of nodes).</li>
+  <li>Cross-region replication: ~3 PB/day for customers who opt in.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>PUT    /{bucket}/{key}                     body=bytes    → ETag
+GET    /{bucket}/{key}                                   → stream
+DELETE /{bucket}/{key}                                   → 204
+POST   /{bucket}/{key}?uploads                            → uploadId
+PUT    /{bucket}/{key}?partNumber=N&uploadId=U  body     → ETag(part)
+POST   /{bucket}/{key}?uploadId=U  body=part-list        → ETag(object)
+GET    /{bucket}?prefix=p&marker=m&max-keys=1000          → keys</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] ──► [GSLB / Anycast] ──► [Front-End Web Servers]
+                                       │
+                 ┌─────────────────────┼──────────────────────┐
+                 ▼                     ▼                       ▼
+          [Index Service]      [Storage Nodes]          [Auth / IAM]
+           (sharded KV)        (chunk servers)
+                 │                     │
+                 ▼                     ▼
+        [Replicated index DB]   [Erasure-coded shards across 3 AZs]
+                                       │
+                                       ▼
+                              [GC + Repair workers]
+</div>
+<p>Walk-through: a PUT lands on a stateless front-end which streams the body through a chunker (8 MB chunks), erasure-codes each chunk 10+4, and writes the 14 shards to 14 different storage nodes spread across 3 availability zones. Once a quorum of writes succeeds, the front-end commits a single row to the Index Service mapping <code>(bucket, key, version)</code> → manifest of chunk locations. Only after the index commit succeeds does the client see HTTP 200.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Index (sharded LSM KV, like FoundationDB / DynamoDB)</h3>
+<pre>row key:  bucket || 0x00 || key || 0x00 || version_id
+value:    {
+  size, etag, content_type, storage_class,
+  chunk_manifest: [{chunk_id, ec_geometry, node_set, offset}],
+  encryption: {alg, key_id, iv},
+  created_ts, lifecycle_state
+}</pre>
+<p>Range-partitioned by <code>bucket||key</code> so LIST is a single-shard prefix scan.</p>
+<h3>7.2 Storage layer</h3>
+<p>Each chunk = 8 MB user data → 10 data shards of 800 KB + 4 parity shards via Reed-Solomon. Tolerates loss of any 4 of the 14 shards. Shards are placed on different failure domains (rack + AZ aware). Stored on log-structured ext4 with bitrot scrubbing every 14 days.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Why erasure coding, not 3x</h3>
+<p>3x replication = 3.0x cost. 10+4 EC = 1.4x cost for the same fault tolerance against AZ loss. At 56 EB user data this is the difference between 168 EB and 78 EB of physical disk — billions of dollars.</p>
+<h3>8.2 Strong read-after-write consistency</h3>
+<p>The index is the single source of truth. A GET first reads the index row (linearizable single-key read via Paxos/Raft on that shard), then fetches chunks. As long as the index commits the new manifest before returning 200 to the writer, every subsequent read sees it. This is exactly the model AWS shipped in December 2020.</p>
+<h3>8.3 Multipart upload</h3>
+<p>Each part is independently chunked and EC'd. The final POST glues part manifests into one object manifest in a single atomic index write — no data movement.</p>
+<h3>8.4 Background workers</h3>
+<p>Garbage collection (delete tombstoned chunks after the lifecycle window), repair (regenerate missing shards from any 10 survivors), scrubber (periodic CRC), and cross-region replicator (tails the index change log and replays PUTs to the peer region).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot keys:</b> S3 historically had 3,500 PUT / 5,500 GET per prefix. Solution: range partitions auto-split when QPS exceeds threshold; clients are advised to randomize key prefixes.</li>
+  <li><b>Small object overhead:</b> a 1 KB object with 14 shards costs more in metadata than data. Pack many small objects into 64 MB extents on disk; the index points to <code>(extent_id, offset, length)</code>.</li>
+  <li><b>Repair storms:</b> a rack failure can require regenerating petabytes. Token-bucket per rack so repair never starves user IO.</li>
+  <li><b>LIST performance:</b> LIST is a range scan; pagination of 1,000 keys keeps it bounded.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Reed-Solomon 10+4</td><td>1.4x cost, AZ-loss tolerant</td><td>Decode CPU on degraded reads</td></tr>
+<tr><td>Range-partitioned index</td><td>Cheap LIST, locality</td><td>Hot-prefix risk needs auto-split</td></tr>
+<tr><td>Strong consistency on the index</td><td>Simpler clients, no read-repair logic</td><td>Index is on the write path</td></tr>
+<tr><td>Pack small objects in extents</td><td>Solves metadata bloat</td><td>Tombstone+compact like LSM</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — leader-based replication on each index shard.</li>
+  <li>Ch. 6 Partitioning — range partitioning by key + auto-split on heat.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — Raft on each index shard for linearizable single-key reads.</li>
+  <li>Ch. 3 Storage Engines — LSM on the index, log-structured extents on storage nodes.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The bet that defines this design is splitting the index plane from the data plane and demanding linearizability only on the index — that's how you get 11-9s without paying 3x for replication."</li>
+  <li>"At 280 trillion objects the metadata is itself a 70 PB database; small-object packing is not optional."</li>
+  <li>"I'd staff a separate team just for the repair / scrubber pipeline because that's where durability is actually earned."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Reed-Solomon 10+4 erasure coding</td><td>At 56 EB user data, 3x replication costs 168 EB while 10+4 EC costs 78 EB — a ~90 EB physical-disk delta worth tens of billions of dollars. Tolerates simultaneous loss of any 4 of 14 shards, which covers full-AZ loss when shards are spread across 3 AZs. Hits the &lt;1.5x raw-bytes NFR.</td><td>3x replication (3.0x cost; rejected on economics); LRC codes (lower repair traffic but more complex placement and asymmetric durability).</td></tr>
+    <tr><td>FoundationDB-class sharded LSM KV for the index</td><td>Range-partitioned by <code>bucket||key</code> so LIST is a single-shard prefix scan capped at 1,000 keys. Auto-split on heat handles the legacy 3,500 PUT / 5,500 GET per-prefix cliff. Index alone is 70 PB at 280 T objects — only an LSM family scales to this.</td><td>DynamoDB (hash-partition kills LIST locality); Spanner (cost and write amplification at 70 PB); MySQL sharding (no auto-split on heat).</td></tr>
+    <tr><td>Raft per index shard for linearizable single-key reads</td><td>Strong read-after-write (which AWS shipped Dec 2020) is achievable only if the index is the single source of truth and offers linearizable single-key reads. Raft on each shard is the simplest path to that property.</td><td>Paxos (equivalent semantics; harder ops); leaderless quorum (read-repair complexity on the hot path).</td></tr>
+    <tr><td>Log-structured ext4 with periodic CRC scrub</td><td>Append-only writes match EC shard semantics (immutable, never overwrite). Scrubbing every 14 days catches bitrot before a second failure compounds — earning the 11 nines durability NFR.</td><td>XFS (fine but no append-bias); ZFS (excellent integrity but heavier RAM/ARC for our 78 EB fleet); raw block devices (loses checksum tooling).</td></tr>
+    <tr><td>8 MB chunk size before EC</td><td>10 data shards of 800 KB each — large enough that fixed per-IO overhead stays small, yet small enough that a single chunk's reconstruction is fast (10 parallel 800 KB reads). Aligns with multipart upload part minimums.</td><td>1 MB chunks (too many manifest entries per object); 64 MB chunks (poor parallelism on 5 GB+ objects).</td></tr>
+    <tr><td>64 MB extent packing for small objects</td><td>A 1 KB object with 14 shards costs more in metadata than data; with 280 T objects and 200 KB median, billions are tiny. Packing into 64 MB extents amortizes manifest cost; index points to <code>(extent_id, offset, length)</code>.</td><td>Per-object EC (metadata bloat dominates); single global blob (compaction nightmare).</td></tr>
+    <tr><td>Anycast / GSLB front door</td><td>100 M req/s peak globally with a 100 ms p99 in-region NFR demands routing to the nearest healthy region in &lt;5 ms — anycast does this at the IP layer for free.</td><td>DNS-based geo-routing (slow TTL recovery on failover); CDN-only (doesn't help PUT path).</td></tr>
+    <tr><td>Token-bucket per-rack repair throttling</td><td>A rack failure can require regenerating petabytes; uncontrolled repair starves the 90 M GET/s user path. Per-rack token buckets cap repair IO to a fraction of capacity so user QoS holds.</td><td>Global throttle (under-utilizes healthy racks); no throttle (user-visible latency spikes during repair storms).</td></tr>
+    <tr><td>Cross-region replicator tailing the index change log</td><td>~3 PB/day of opt-in CRR is replayed by a stream consumer on the index's CDC log — exactly the DDIA Ch. 11 stream-processing pattern. Naturally idempotent because PUTs are key-addressed.</td><td>Synchronous cross-region writes (kills p99 latency); periodic batch sync (RPO too loose for compliance use cases).</td></tr>
+    <tr><td>HMAC-SHA256 signed URLs (SigV4)</td><td>Bucket-level IAM checks + per-request signature lets us authorize 100 M req/s without a stateful session — every request is independently verifiable at the front-end.</td><td>OAuth bearer tokens (revocation harder); cookie sessions (impossible at REST scale).</td></tr>
+    <tr><td>SSE-KMS for server-side encryption</td><td>Per-bucket key with envelope encryption: data key encrypts the chunks, KMS encrypts the data key. Lets us rotate KMS roots without re-encrypting 78 EB of physical storage.</td><td>SSE-S3 (no customer-controlled rotation); SSE-C (customer-managed; rejected as default for ops simplicity).</td></tr>
+    <tr><td>BLAKE3 / MD5 ETag computation</td><td>ETag is a content fingerprint clients use for integrity and caching; computing it streaming during the chunker is essentially free CPU. MD5 retained for legacy SDK compatibility.</td><td>SHA-256 (slower; not needed for ETag use case); CRC32 (too weak as an integrity claim).</td></tr>
+  </tbody>
+</table>

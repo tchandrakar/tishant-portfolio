@@ -1,0 +1,150 @@
+<h1>Design Video Transcoding Pipeline (multi-bitrate, multi-codec)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">file-storage</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the transcoding pipeline that takes a raw mezzanine file (the producer-supplied master) and emits a fan-out of encoded variants for adaptive streaming: multiple codecs (H.264, HEVC, VP9, AV1), multiple resolutions (240p → 4K), multiple audio tracks, and packaged HLS/DASH/CMAF manifests. The pipeline must handle an ingest rate of ~500 hours of source video per minute (YouTube-scale) at peak, while keeping per-asset turnaround under 30 minutes for the standard ladder.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Accept mezzanine in many input formats (MOV, MP4, MXF, ProRes).</li>
+  <li>Produce an ABR ladder per the codec/resolution policy.</li>
+  <li>Generate thumbnails (storyboard sprite + posters).</li>
+  <li>Extract closed captions, generate auto-captions.</li>
+  <li>Package into HLS &amp; DASH; encrypt with DRM keys.</li>
+  <li>Re-encode (back-fill) when a new codec is introduced (e.g., AV1).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Throughput:</b> 30,000 hours/hour ingest sustained.</li>
+  <li><b>Latency:</b> standard ladder ready &lt; 30 min; "fast publish" 720p variant &lt; 5 min.</li>
+  <li><b>Reliability:</b> exactly-once output (no duplicate variants); idempotent retries.</li>
+  <li><b>Cost:</b> encoding is the second-largest infra line after CDN; per-hour cost matters.</li>
+  <li><b>Quality:</b> VMAF target ≥ 93 for the top rung, ≥ 70 for the bottom rung.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Compute: a 1080p H.264 encode runs ~2× real-time on a CPU box; AV1 ~0.3× real-time. With 30k hours/hr ingest and ~10 variants each, raw encoding need ≈ 100k vCPU-hrs/hr → ~50k VMs steady state, GPU-accelerated where possible.</li>
+  <li>Storage: each finalized asset = ~10× source size aggregated across rungs. 720 TB/day source × 10 = 7 PB/day encoded.</li>
+  <li>Queue depth: at peak we accept 100k jobs/min; backlog must drain in &lt; 1 hour.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/jobs              {sourceUri, profileId}   → jobId
+GET   /v1/jobs/{jobId}                                → status, outputs[], vmaf[]
+POST  /v1/jobs/{jobId}/cancel                         → 204
+POST  /v1/profiles          {ladder[]}                → profileId
+GET   /v1/outputs/{assetId}/manifest.m3u8             → HLS manifest</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Upload Svc] ──► [Job Submit API] ──► [SQS / Pub-Sub: job queue]
+                                              │
+                                              ▼
+                                   [Orchestrator (DAG engine)]
+                                              │ splits into chunks
+              ┌───────────────────────────────┼───────────────────────────────┐
+              ▼                               ▼                               ▼
+     [Probe worker]                 [Chunk encoder pool]               [Caption worker]
+   (ffprobe, scene detect)          (CPU + GPU, spot fleet)            (ASR + format)
+              │                               │
+              └────────► [Chunk store (S3)] ◄─┘
+                                              │
+                                              ▼
+                                [Mux / package / DRM worker]
+                                              │
+                                              ▼
+                              [Final asset bucket] → [CDN origin]
+                                              │
+                                              ▼
+                                  [Manifest Svc + Catalog]
+</div>
+<p>The orchestrator splits the source on GOP boundaries (typically 2–6 s chunks), fans out parallel encodes across a worker pool, then re-muxes the results. This <i>distributed-encode-then-stitch</i> pattern is what gives us short turnaround on long videos.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Job table (DynamoDB / Cassandra)</h3>
+<pre>CREATE TABLE jobs (
+  job_id uuid PRIMARY KEY,
+  asset_id uuid,
+  state text,        -- queued|probing|encoding|packaging|ready|failed
+  attempts int,
+  created_at timestamp,
+  updated_at timestamp
+);
+CREATE TABLE chunk_results (
+  job_id uuid, chunk_idx int, rung text,
+  s3_key text, sha256 text, vmaf double,
+  PRIMARY KEY ((job_id), rung, chunk_idx)
+);</pre>
+<h3>7.2 Why Cassandra/Dynamo?</h3>
+<p>Job state is write-heavy and TTL-friendly; we never query across jobs by anything other than job_id. Chunk_results clustered by (rung, chunk_idx) so the muxer can range-scan in stitch order.</p>
+<h3>7.3 Object storage</h3>
+<p>Source mezzanine and output variants live on S3/GCS with intelligent-tiering. Frequently re-accessed mezzanines stay on Standard; older ones tier down to Glacier-IR (instant retrieval) so we can re-encode for AV1 backfill without restoring from cold archive.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Orchestrator</h3>
+<p>Modeled as a DAG: probe → split → encode (fan-out per rung × chunk) → mux → package → publish. Built on a workflow engine (Temporal / Airflow / Cadence) so each step is idempotent and retriable. Failed chunks retry with exponential backoff; the asset isn't published until all rungs reach 100%.</p>
+<h3>8.2 Worker pool</h3>
+<p>Stateless containers running ffmpeg/SVT-AV1/x265. Scheduled on Kubernetes with mixed instance types: GPU nodes for AV1/HEVC, CPU spot fleet for H.264. We bid on spot/preemptible because chunks are short and idempotent — losing a chunk costs &lt; 1 vCPU-min.</p>
+<h3>8.3 Per-title encoding</h3>
+<p>Rather than a fixed bitrate ladder, we run a "complexity probe" pass and choose target bitrates per scene. Saves 15–25% bandwidth at equivalent VMAF — Netflix popularized this approach and it's now industry-standard.</p>
+<h3>8.4 Quality gate</h3>
+<p>After mux, we compute VMAF against the source. If any rung scores below threshold we re-encode that rung with a higher bitrate. Prevents publishing visually broken assets due to encoder bugs.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Long single videos:</b> a 3-hour movie, encoded serially, would take hours. Chunking parallelizes it down to wall-clock = chunk_size / parallelism.</li>
+  <li><b>Spot eviction:</b> chunks are stateless; lost chunks just retry. The orchestrator tracks attempts and circuit-breaks after N failures.</li>
+  <li><b>Storage I/O:</b> chunk read/write to S3 is the next bottleneck; we pipe directly between containers when chunks are co-located.</li>
+  <li><b>AV1 backfill:</b> a sweep across the catalog could DoS the encoder fleet. We rate-limit the backfill at 5% of capacity and prioritize titles by view-count.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Chunked parallel encoding</td><td>Linear speedup</td><td>Stitch-time artifacts at GOP boundaries</td></tr>
+<tr><td>Spot/preemptible workers</td><td>~70% cost savings</td><td>Eviction handling complexity</td></tr>
+<tr><td>Per-title encoding ladder</td><td>20% bandwidth saving</td><td>Probe pass adds latency</td></tr>
+<tr><td>VMAF quality gate</td><td>Catches encoder regressions</td><td>Adds compute &amp; latency</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 10 Batch Processing — the fan-out/fan-in DAG of chunked encoding maps directly to MapReduce semantics.</li>
+  <li>Ch. 11 Stream Processing — job-state transitions modeled as a stream of events into the orchestrator's log.</li>
+  <li>Ch. 8 Trouble with Distributed Systems — exactly-once via idempotent chunk keys (job_id, rung, chunk_idx) so retries don't duplicate work.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with chunked encoding — it's the lever that turns wall-clock from O(duration) to O(duration/parallelism)."</li>
+  <li>"The hardest part is exactly-once: spot evictions retry, encoders are non-deterministic across versions, and we need idempotent output keys keyed on (asset, rung, chunk, encoder_version)."</li>
+  <li>"For new codecs like AV1 I'd ship hardware-accelerated encoders (NETINT, NVidia) before doing a catalog backfill — software AV1 is too slow for sustained throughput."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>FFmpeg</b></td><td>The Swiss Army knife of video — handles input demux from MOV/MP4/MXF/ProRes and orchestrates encoder invocations across H.264, HEVC, VP9, AV1; the GOP-aligned chunk split for the distributed-encode pattern is built directly on FFmpeg's segment muxer.</td><td>GStreamer — fewer codec backends; commercial encoders — vendor lock-in</td></tr>
+    <tr><td><b>SVT-AV1 / x265</b></td><td>SVT-AV1 is the only software AV1 encoder fast enough for sustained 30k hr/hr throughput; x265 fills the HEVC slot when AV1 isn't supported by the client. AV1 at 0.3× real-time means GPU acceleration is mandatory.</td><td>libaom — too slow; rav1e — newer, less proven at production scale</td></tr>
+    <tr><td><b>NVIDIA NVENC / NETINT ASICs</b></td><td>Hardware-accelerated H.264/HEVC encoding at 10–20× real-time per chip; without ASIC offload the 100k vCPU-hr/hr requirement balloons to a quarter-million CPUs.</td><td>Pure CPU — 5× cost; Intel QuickSync — quality regression on high-motion content</td></tr>
+    <tr><td><b>Temporal (or Cadence/Airflow)</b></td><td>Workflow engine for the probe → split → encode → mux → package DAG; durable state survives worker crashes and exactly-once chunk keys (job_id, rung, chunk_idx) make retries safe.</td><td>Step Functions — AWS-locked; raw queues — orchestration logic scattered everywhere</td></tr>
+    <tr><td><b>Kubernetes</b></td><td>Stateless encoder containers across a 50k-VM steady-state fleet; mixed instance pools (GPU for AV1/HEVC, CPU spot for H.264) need k8s-native scheduling and topology spread.</td><td>Mesos — declining ecosystem; Nomad — smaller GPU scheduler maturity</td></tr>
+    <tr><td><b>Spot / Preemptible VMs</b></td><td>~70% cost savings on the largest infra line after CDN; chunks are short and idempotent so eviction loses &lt; 1 vCPU-min, retried by the orchestrator.</td><td>On-demand only — cost prohibitive at 50k VMs steady-state; reserved — locks capex</td></tr>
+    <tr><td><b>SQS / Pub-Sub</b></td><td>100k jobs/min with backlog drain in &lt; 1 hour requires a durable queue with visibility timeout for lease semantics; SQS scales without partition planning.</td><td>Kafka — overkill for job queue without replay needs; RabbitMQ — operational overhead</td></tr>
+    <tr><td><b>DynamoDB / Cassandra (jobs)</b></td><td>Single-key access by job_id, write-heavy state transitions, TTL-friendly cleanup; chunk_results clustered by (rung, chunk_idx) so the muxer range-scans in stitch order without sorting.</td><td>Postgres — no horizontal write scale at 100k jobs/min; etcd — wrong cardinality</td></tr>
+    <tr><td><b>S3 (mezzanine + chunks)</b></td><td>11 nines durability for irreplaceable masters at 720 TB/day; intelligent-tiering drops cold mezzanines to Glacier-IR so AV1 backfill years later doesn't pay hot-tier rates.</td><td>HDFS — durability requires triple-replicate; GCS — multi-cloud fragmentation</td></tr>
+    <tr><td><b>VMAF (quality gate)</b></td><td>Perceptual-quality metric correlates with viewer satisfaction far better than PSNR; gating rungs at VMAF≥93 (top) and ≥70 (bottom) catches encoder regressions that PSNR would silently pass.</td><td>PSNR/SSIM — known to mispredict viewer perception; manual review — doesn't scale to 720k titles/day</td></tr>
+    <tr><td><b>CMAF (HLS + DASH packaging)</b></td><td>Single fragmented-MP4 asset serves both <code>HLS</code> and <code>DASH</code> manifests; cuts storage in half vs maintaining separate TS and MP4 ladders.</td><td>Separate HLS-TS and DASH-MP4 — 2× storage; <code>HLS</code>-only — locks out Android/Smart-TV DASH players</td></tr>
+    <tr><td><b>Whisper / commercial ASR</b></td><td>Auto-caption generation for accessibility and search; Whisper provides multi-language support out of the box, reducing per-language model maintenance.</td><td>Per-language acoustic models — model zoo maintenance pain; manual captions — doesn't scale</td></tr>
+    <tr><td><b>Per-title encoding</b></td><td>Complexity probe + per-scene bitrate saves 15–25% bandwidth at equivalent VMAF; on a CDN bill at scale, that's the highest-ROI encoder change available.</td><td>Fixed ladder — wastes 20% of bytes; per-shot encoding — 5× probe cost for 1% extra savings</td></tr>
+  </tbody>
+</table>

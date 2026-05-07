@@ -1,0 +1,132 @@
+<h1>Design File Deduplication System (content-defined chunking, hash dedup)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">file-storage</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a global deduplication tier that sits behind a backup product (Veeam, Druva, Backblaze) or a sync product (Dropbox, OneDrive). Its job is to take an arbitrary byte stream from a client, split it into chunks, and store only the chunks that have never been seen before — anywhere in the fleet. Typical workloads (VM backups, OS images, build artifacts, photo libraries) yield 5x – 30x dedup ratios; getting close to that ratio at exabyte scale without making the index a bottleneck is the whole problem.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Ingest a byte stream and return a manifest (ordered list of chunk hashes).</li>
+  <li>Reconstruct the original byte stream from a manifest.</li>
+  <li>Reference-count chunks; safely garbage-collect chunks reachable by zero manifests.</li>
+  <li>Support both fixed-size and content-defined chunking; expose the choice per tenant.</li>
+  <li>Per-tenant or global dedup pool (configurable for security).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Throughput:</b> 10 GB/s ingest per region.</li>
+  <li><b>Dedup ratio:</b> &gt; 10x on typical backup workloads.</li>
+  <li><b>Index lookup:</b> p99 &lt; 5 ms per chunk.</li>
+  <li><b>Scale:</b> 500 B unique chunks across the fleet, 5 EB physical storage.</li>
+  <li><b>Durability:</b> 11-9s on chunks, 13-9s on the index (it's the root of trust).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Avg chunk size 8 KB (variable, content-defined). 5 EB / 8 KB = ~625 trillion chunks pre-dedup; with 10x dedup → 62 T unique.</li>
+  <li>Index row: 32 B hash + 8 B ref-count + 16 B location = 56 B; 62 T x 56 B = 3.5 PB index.</li>
+  <li>10 GB/s ingest / 8 KB = 1.25 M chunk lookups/s sustained, 5 M peak.</li>
+  <li>Bloom filter to skip storage: 62 T entries x 10 bits = 78 TB filter (sharded).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/manifest/begin                             → {manifest_id}
+POST /v1/chunks/exists  body=[hash...]               → bitmap
+POST /v1/chunks/put     body=[{hash, bytes}]         → ok
+POST /v1/manifest/append {manifest_id, hashes[]}     → ok
+POST /v1/manifest/seal  {manifest_id}                → {root_hash}
+GET  /v1/manifest/{root_hash}                        → ordered hash list
+GET  /v1/chunks/{hash}                               → bytes</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] ─chunker─► [Bloom Filter Tier] ─miss─► [Hash Index (sharded LSM)]
+   │                                                     │
+   │ if "exists"=false                                   │ commit ref-count
+   ▼                                                     ▼
+ upload chunk ──► [Chunk Store (object/EC)] ◄── [GC: ref=0 sweeper]
+                                                   ▲
+                                                   │
+                            [Manifest Store] ──── decrements on delete
+</div>
+<p>Walk-through: the client (or a server-side ingest worker) chunks the stream, computes BLAKE3 of each chunk, and asks <code>/chunks/exists</code> in batches of 256. The server first probes a sharded Bloom filter (in RAM); on a probable hit it consults the persistent hash index; on a definite miss the client uploads the chunk. Manifests are themselves chunked and dedup'd, so a backup that's 99% identical to yesterday's stores almost no new bytes.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Hash index (sharded LSM, RocksDB-class)</h3>
+<pre>key:    chunk_hash (32 B BLAKE3)
+value:  { ref_count u32, location { extent_id u64, offset u32, len u32 }, created_ts u32 }
+sharded by: first 2 bytes of hash (65,536 shards)</pre>
+<h3>7.2 Chunk store (extent-packed)</h3>
+<p>Chunks are too small to store as individual objects (8 KB avg). Pack into 64 MB extents on EC 10+4 storage; the index points at <code>(extent_id, offset, len)</code>.</p>
+<h3>7.3 Manifest store</h3>
+<p>Manifests are also dedup'd content (recursive Merkle tree). Root hash uniquely identifies a backup snapshot.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Content-defined chunking (CDC)</h3>
+<p>FastCDC over a 64-byte rolling window with a min-chunk gate of 2 KB and max of 64 KB. The boundary depends only on local content, so an inserted byte at offset 0 only invalidates the chunk it lands in — every later chunk re-aligns. Fixed-size chunking, in contrast, would invalidate everything after the insert.</p>
+<h3>8.2 Bloom filter tier</h3>
+<p>10 bits/element, 1% false-positive rate. Sits in front of the LSM and absorbs ~99% of "this chunk doesn't exist" lookups without touching disk.</p>
+<h3>8.3 Reference counting &amp; GC</h3>
+<p>Naive ref-counts have a race between "manifest commits" and "GC scans". Solution: epoch-based GC. Each manifest commit is tagged with epoch E; GC only reclaims chunks whose ref_count reached zero in epoch &lt; E - 2. This avoids deleting a chunk that is being referenced by an in-flight manifest.</p>
+<h3>8.4 Per-tenant vs global dedup</h3>
+<p>Global dedup gives 10x – 30x ratios but lets a tenant prove what another tenant has stored (a privacy hole). Compromise: dedup within a "trust pool" (e.g., per enterprise customer). Hash-key salt is per-pool.</p>
+<h3>8.5 Hash collisions</h3>
+<p>BLAKE3 is 256-bit. Probability of one collision in 62 T chunks is ~2^-180 — negligible. We do <i>not</i> verify by full byte compare on dedup hits; SHA-256/BLAKE3 strong-collision resistance is the contract.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Index hot shards:</b> a popular blob (e.g., a default OS install ISO) gets every backup hitting the same hash. Cache top-K hot keys in Redis.</li>
+  <li><b>Small-chunk overhead:</b> 8 KB chunks → 56 B index entry → ~0.7% metadata overhead. Acceptable.</li>
+  <li><b>GC cost:</b> sweeping 62 T entries is expensive; partition GC by hash prefix and run continuously.</li>
+  <li><b>Network round-trips:</b> batch <code>/chunks/exists</code> at 256 hashes per RPC — collapses 256 RTTs into 1.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>FastCDC over fixed-size</td><td>Robust to insertions; better dedup</td><td>~5% client CPU</td></tr>
+<tr><td>Global dedup</td><td>30x ratios possible</td><td>Cross-tenant existence side channel</td></tr>
+<tr><td>Trust BLAKE3 (no byte compare)</td><td>One round-trip on dedup hit</td><td>Theoretical collision risk</td></tr>
+<tr><td>Extent packing</td><td>Solves small-object overhead</td><td>Compaction needed (LSM-like)</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage Engines — LSM trees as the chunk index.</li>
+  <li>Ch. 6 Partitioning — partition by hash prefix, naturally uniform.</li>
+  <li>Ch. 5 Replication — multi-AZ replication on the index; EC on chunks.</li>
+  <li>Ch. 12 The Future of Data Systems — content-addressed storage as a generalization of immutable log.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The single biggest lever for dedup ratio is content-defined chunking — fixed-size chunking with a 1-byte insert collapses to 1x."</li>
+  <li>"At 62 trillion unique chunks, the index <i>is</i> the system. I'd treat its design (Bloom + LSM + epoch GC) as the centerpiece, not the data plane."</li>
+  <li>"Global dedup is a privacy decision, not a performance one — I'd default to per-pool unless the customer explicitly opts in."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>FastCDC content-defined chunking (2 KB min, 8 KB target, 64 KB max)</td><td>The single biggest lever on the &gt;10x dedup ratio NFR. A 1-byte insert with fixed-size chunking shifts every later boundary, collapsing dedup toward 1x. FastCDC's gear-hash is ~3x faster than Rabin at the same statistical quality — critical at 10 GB/s ingest.</td><td>Fixed-size chunking (catastrophic on insertions); Rabin/Buzhash (slower CPU; same quality); fixed + sliding hybrid (complex with little gain).</td></tr>
+    <tr><td>BLAKE3 (256-bit) chunk hashing</td><td>Doubles as the storage key and the dedup key. At 62 T unique chunks, a 256-bit hash gives ~2^-180 collision probability — we trust it without byte-compare on dedup hits, saving a round-trip per chunk. BLAKE3 runs ~5 GB/s/core, keeping the 1.25 M lookups/s sustained CPU budget feasible.</td><td>SHA-256 (slower; same security); xxHash (not collision-resistant; would force byte-compare); MD5/SHA-1 (broken; unsafe for dedup).</td></tr>
+    <tr><td>Sharded RocksDB-class LSM for the hash index</td><td>62 T entries × 56 B = 3.5 PB index; only an LSM family handles point lookups at this scale with reasonable RAM. Sharded by first 2 bytes of hash gives 65,536 naturally uniform partitions (DDIA Ch. 6) — no hot-shard problem from key-space skew.</td><td>B-tree (random-write amplification kills SSD endurance); DynamoDB (cost prohibitive at 3.5 PB); FoundationDB (great fit; chose RocksDB for ops familiarity).</td></tr>
+    <tr><td>Sharded Bloom filter tier (10 bits/element, 1% FP)</td><td>~99% of "this chunk doesn't exist" lookups are absorbed in RAM, never touching the LSM. At 1.25 M lookups/s, this is the difference between a few-thousand-node disk fleet and a few-hundred. Total filter is 78 TB sharded across the cluster.</td><td>Cuckoo filter (supports delete but lower density at our FP rate); no filter (LSM disk reads dominate; latency NFR fails).</td></tr>
+    <tr><td>Reed-Solomon 10+4 EC on chunks</td><td>5 EB physical at 11 nines durability with 1.4x overhead instead of 3.0x — saves roughly 8 EB of disk vs replication. Tolerates loss of 4 of 14 shards across AZs, the standard cloud-fault model.</td><td>3x replication (cost prohibitive); LRC (lower repair cost but asymmetric durability complicates SLO).</td></tr>
+    <tr><td>64 MB extent packing on EC storage</td><td>8 KB avg chunks are too small to EC individually (the 14 shards would dwarf the data). Packing into 64 MB extents amortizes EC and metadata overhead so per-chunk overhead lands at ~0.7%, the stated tolerable budget.</td><td>Per-chunk EC (overhead exceeds payload); single huge blob (compaction nightmare; loses per-chunk addressability).</td></tr>
+    <tr><td>Recursive Merkle-tree manifests (also dedup'd)</td><td>A backup that's 99% identical to yesterday's stores almost no new manifest bytes either; the manifest itself is chunked and hashed. Root hash uniquely identifies a snapshot, enabling cheap O(1) "is this snapshot known?" checks.</td><td>Flat manifest blob (redundant storage on tiny day-over-day deltas); inline manifest in DB row (rows blow past page-size limits).</td></tr>
+    <tr><td>Epoch-based GC with E-2 lag</td><td>Naive ref-count + GC has a TOCTOU race with in-flight manifest commits. Epoch GC only reclaims chunks whose ref_count hit zero in epoch &lt;E-2, guaranteeing in-flight manifests cannot reference a chunk we're about to delete — essential at 13-9s index durability.</td><td>Mark-and-sweep (full scan of 62 T entries is months); immediate ref-count GC (race window causes data loss).</td></tr>
+    <tr><td>Per-pool hash salting for tenant isolation</td><td>Global dedup leaks "tenant B has a chunk identical to one tenant A just uploaded" — a real privacy bug. Per-pool salt makes hashes unjoinable across trust boundaries while preserving dedup within a pool. Default to per-pool, opt in to global.</td><td>Global dedup (existence side-channel); per-tenant only (loses 30x ratios on shared OS image data).</td></tr>
+    <tr><td>Redis cache for top-K hot chunk hashes</td><td>A popular blob (default Windows ISO, base Docker layer) gets every backup hitting the same hash, creating a hot LSM shard. Caching top-K in Redis collapses these to RAM lookups and protects the index shard.</td><td>Larger Bloom filter (doesn't help — these <i>are</i> hits); LSM block cache only (cache pollution from cold scans).</td></tr>
+    <tr><td>Batched <code>/chunks/exists</code> RPC (256 hashes/call)</td><td>Single-chunk RPCs at 1.25 M/s would multiply network round-trips beyond reason; batching collapses 256 RTTs into 1, hitting the &lt;5 ms p99 lookup SLO. The Bloom probe on the server side is also vectorized over the batch.</td><td>Per-hash RPCs (latency budget blown); push-stream uploads (loses the "does it exist?" optimization).</td></tr>
+    <tr><td>Multi-AZ Raft replication on the index</td><td>Index is the root of trust at 13 nines durability — a chunk we still reference but lose the index entry for is unrecoverable. Per-shard Raft across 3 AZs with synchronous quorum writes hits that bar; chunks themselves only need 11 nines via EC.</td><td>Async replication (RPO too loose for 13-9s); single-AZ Raft (AZ failure = data loss).</td></tr>
+  </tbody>
+</table>

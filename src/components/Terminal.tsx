@@ -45,6 +45,8 @@ export default function Terminal({ onOpenApp }: TerminalProps) {
             { type: 'output' as const, content: '  projects    - My projects' },
             { type: 'output' as const, content: '  contact     - Contact information' },
             { type: 'output' as const, content: '  certifications - Certifications' },
+            { type: 'output' as const, content: '  atlas       - Open the Architect\'s Atlas (system design vault)' },
+            { type: 'output' as const, content: '  learn       - Alias for atlas' },
             { type: 'output' as const, content: '  neofetch    - System information' },
             { type: 'output' as const, content: '  whoami      - Current user' },
             { type: 'output' as const, content: '  pwd         - Print working directory' },
@@ -174,13 +176,20 @@ export default function Terminal({ onOpenApp }: TerminalProps) {
             skills: 'skills',
             contact: 'contact',
             resume: 'resume',
+            atlas: 'atlas',
+            learn: 'atlas',
           };
           const appId = appMap[args[1]];
           if (appId) {
             onOpenApp(appId);
             return [{ type: 'output' as const, content: `Opening ${args[1]}...` }];
           }
-          return [{ type: 'error' as const, content: `open: '${args[1] || ''}' not found. Try: terminal, files, about, projects, skills, contact, resume` }];
+          return [{ type: 'error' as const, content: `open: '${args[1] || ''}' not found. Try: terminal, files, about, projects, skills, atlas, contact, resume` }];
+
+        case 'atlas':
+        case 'learn':
+          onOpenApp('atlas');
+          return [{ type: 'output' as const, content: "Launching Architect's Atlas — 132 problems · 30 lessons · DDIA-grounded." }];
 
         case 'history':
           return history.map((h, i) => ({

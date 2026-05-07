@@ -1,0 +1,57 @@
+<h1>Replication: single-leader, multi-leader, leaderless</h1>
+<div class="meta-row">
+  <span class="tag diff-Easy">Easy</span>
+  <span class="tag">replication</span>
+  <span class="tag">availability</span>
+  <span class="tag">consistency</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Replication keeps the same data on multiple machines so reads can fan out, failures don't lose state, and users near different regions get fast service. The hard part isn't copying bytes — it's deciding <em>who is allowed to accept a write</em>. That single decision splits replication into three families: single-leader (one node owns writes), multi-leader (several do), and leaderless (any node will take a write if a quorum agrees).</p>
+
+<h2>Why it matters</h2>
+<p>Every durable system you'll design — Postgres, Kafka, DynamoDB, Cassandra, MySQL behind your favorite app — is one of these three shapes. Picking the wrong shape locks you into either painful conflict resolution, a global write bottleneck, or weaker consistency than you advertised. Knowing the trade-offs is the difference between "we lost an order" and "we recovered cleanly".</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Single-leader:</b> Postgres streaming replication, MySQL primary/replica, MongoDB replica sets. Easy to reason about; failover is the hard part.</li>
+  <li><b>Multi-leader:</b> Multi-region Cassandra with LOCAL_QUORUM in each region, CouchDB, calendar/notes sync. Great for write locality; conflicts must be merged.</li>
+  <li><b>Leaderless:</b> DynamoDB and Cassandra (within a region), Riak. Writes go to N replicas, R+W&gt;N gives quorum reads.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  SINGLE-LEADER          MULTI-LEADER             LEADERLESS
+  client                 client      client       client
+    |                      |            |           | | |
+    v                      v            v           v v v
+ [LEADER] --async--&gt;   [L-east] &lt;--&gt; [L-west]   [N1][N2][N3]
+   /  \                  |              |        write to W,
+[F1] [F2]              [F1]           [F2]       read from R,
+  followers           replicate         replicate  R+W &gt; N -&gt; quorum
+</div>
+<p>In single-leader, all writes serialize through one node, which gives you a clean total order at the cost of a single write bottleneck and failover risk. Multi-leader spreads writes across regions for latency, but two leaders can accept conflicting edits to the same row — you must resolve them (last-write-wins, CRDTs, app logic). Leaderless skips the leader entirely: clients write to W replicas, read from R, and as long as R+W&nbsp;&gt;&nbsp;N, every read intersects at least one fresh replica.</p>
+
+<h2>Sync vs async — the buried decision</h2>
+<p>Within any of the three shapes, replication can be <b>synchronous</b> (leader waits for follower acks before confirming the write) or <b>asynchronous</b> (leader confirms immediately, followers catch up). Sync gives durability but exposes you to follower latency and outages. Async is fast but can lose recently-acked writes during a leader crash. Most production systems pick a middle ground: <em>semi-sync</em> — wait for at least one follower, not all.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Treating "replicas" as automatic high-availability — without proper failover, a primary crash means downtime, not magic.</li>
+  <li>Reading from async replicas and being surprised by stale data (a classic read-your-writes violation).</li>
+  <li>Choosing multi-leader without a real conflict-resolution plan — "last writer wins" silently drops data.</li>
+  <li>Forgetting that quorum (R+W&gt;N) protects against stale reads but not against concurrent writes — you still need versioning.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're running a global SaaS where each tenant lives in one region but admins occasionally edit settings from anywhere. You want low-latency writes for admins and zero data loss. Which replication shape — and how do you handle the cross-region admin write?
+  <br/>
+  <b>Hint:</b> Think about whether the conflict surface is large (everything) or tiny (just the settings table). You can mix shapes per table.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-dynamodb">Design DynamoDB</a> — leaderless quorum replication with tunable R/W.</li>
+  <li><a href="#problem/design-spanner-style">Design a Spanner-style DB</a> — single-leader per shard via Paxos.</li>
+  <li><a href="#problem/design-google-docs">Design Google Docs</a> — multi-leader semantics with CRDTs/OT for merging.</li>
+</ul>

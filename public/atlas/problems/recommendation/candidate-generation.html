@@ -1,0 +1,198 @@
+<h1>Design Candidate Generation Pipeline (ANN, FAISS/HNSW, recall-focused)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">recommendation</span>
+  <span class="tag">search</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the candidate-generation stage of a large-scale recommender that retrieves a few thousand items from a corpus of hundreds of millions in under 50 ms, optimized for high recall (not precision). Multiple retrieval sources (collaborative-filtering ANN, content ANN, graph walks, popularity, follow-graph) feed a downstream ranker. Numbers: 500M items, 200M DAU, 580K rec QPS at peak, similar to TikTok's For You stack.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Retrieve top-2000 candidates per user/request from N sources, deduped and merged.</li>
+  <li>Support pluggable retrieval sources (two-tower, item-CF, graph, trending, follow).</li>
+  <li>Apply hard filters: blocked creators, region, language, age-gate, already-seen.</li>
+  <li>Allow per-source quotas tunable via experiment config.</li>
+  <li>Index new items within 10 minutes of publish.</li>
+  <li>Snapshot indexes nightly; support rollback to previous version.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 fan-out + merge under 50 ms.</li>
+  <li><b>Recall:</b> recall@2000 vs brute-force above 0.90 for two-tower source.</li>
+  <li><b>Scale:</b> 500M item corpus; 580K QPS peak; 8 retrieval sources in parallel.</li>
+  <li><b>Availability:</b> 99.95%; degrade to popularity when ANN degraded.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS per source: 580K (one fan-out per request); each source 580K QPS.</li>
+  <li>Index memory (HNSW, 128-d fp16): 500M * (256 + 64 graph) = 160 GB; sharded 64x = 2.5 GB/shard.</li>
+  <li>FAISS IVF-PQ alternative: ~32 GB; sharded 16x = 2 GB/shard.</li>
+  <li>Ingest: 5M new items/day -&gt; 60 items/sec; embedding inference 2 GPU nodes.</li>
+  <li>Filter set per user: avg 10K already-seen item IDs; bloom filter 12 KB at 1% FPR.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/candgen/retrieve  {userId, ctx, sources:[...], k=2000}
+                            -> [{itemId, source, score}]
+POST /v1/candgen/index/upsert  {itemId, embedding[], meta}    (internal)
+POST /v1/candgen/index/snapshot {modelVersion}                (admin)
+GET  /v1/candgen/health</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Rec Orchestrator]
+       |
+       v scatter
++------+----------+--------+--------+--------+
+|      |          |        |        |        |
+v      v          v        v        v        v
+[Two-tower ANN] [Item-CF ANN] [Graph walk] [Trending] [Follow]
+   |            |              |             |          |
+   shards       shards         redis-graph   redis      mysql
+       \________|______________|_____________|__________/
+                         merge + dedupe
+                                |
+                                v
+                        [Filter Svc] -- [Bloom: seen] [Block list]
+                                |
+                                v top-2000 to ranker
+
+Ingest:
+[Kafka items] -> [Embedding Svc (GPU)] -> [Index Writer]
+                                              |
+                                              +-> HNSW shards (in-mem)
+                                              +-> S3 snapshot (durable)
+</div>
+<p>Walk-through: orchestrator fans out to all configured sources in parallel with a 30 ms deadline, collects results, dedupes by item_id, applies filters, returns top-2000.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Index metadata (Postgres)</h3>
+<pre>CREATE TABLE indexes (
+  index_id text PRIMARY KEY,
+  source text, model_version text,
+  shard_count int, build_started_at timestamptz,
+  status text, s3_path text);
+CREATE TABLE shard_assignments (
+  index_id text, shard_id int, host text, PRIMARY KEY (index_id, shard_id));</pre>
+<h3>7.2 Why HNSW for high-recall source?</h3>
+<p>HNSW gives recall&gt;0.95 at 1ms latency without training. Cost is 3x memory of IVF-PQ, acceptable since the flagship two-tower source justifies the spend. Cheaper sources (CF) use IVF-PQ.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 ANN shard</h3>
+<p>Each shard is a stateful pod holding ~8M vectors in HNSW. Built from S3 snapshot at boot (5 min). Live writes stream from Kafka into a per-shard delta segment; query merges base + delta. Compaction every 30 min collapses delta into base.</p>
+<h3>8.2 Scatter-gather orchestrator</h3>
+<p>Async fan-out using gRPC streaming, hedged at 15 ms (send duplicate to a peer if no reply). Per-source budget configured: two-tower 30ms, CF 25ms, graph 20ms, trending 5ms. If a source misses budget, drop it; never block.</p>
+<h3>8.3 Filter service</h3>
+<p>Maintains per-user "seen" bloom filter in Redis (12 KB, 0.5% FPR). Updated by a Flink job consuming impression events with 30s lag. Block-list and creator-block joined inline.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Tail latency:</b> a slow shard ruins p99; use request hedging and tail-tolerant nprobe.</li>
+  <li><b>Index hot-spotting:</b> celebrity items pulled by every user; replicate hot shards 4x.</li>
+  <li><b>Memory pressure:</b> HNSW + delta segment can OOM during compaction; pre-allocate 1.5x headroom.</li>
+  <li><b>Snapshot stampede:</b> all shards loading from S3 at once saturates network; staggered boot with jitter.</li>
+  <li><b>New-item recall:</b> recently-added items miss CF signal; rely on content tower until first 100 impressions.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>HNSW</td><td>Recall&gt;0.95, no training</td><td>3x memory, slow build</td></tr>
+<tr><td>FAISS IVF-PQ</td><td>Compact, fast build</td><td>Recall 0.85-0.90</td></tr>
+<tr><td>Multi-source merge</td><td>Diversity, robustness</td><td>Complex tuning</td></tr>
+<tr><td>Single-source</td><td>Simple to operate</td><td>Coverage gaps, harder to A/B</td></tr>
+<tr><td>Bloom for seen-set</td><td>Tiny, fast</td><td>FPs hide some good items</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 10 Batch Processing — nightly index snapshot via Spark; bulk-loaded into shards.</li>
+  <li>Ch. 11 Stream Processing — Kafka-driven near-real-time index updates and seen-set bloom maintenance.</li>
+  <li>Ch. 6 Partitioning — hash partitioning of item_id across ANN shards.</li>
+  <li>Ch. 8 Trouble with Distributed Systems — hedged requests for tail-latency mitigation.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Recall, not precision, is the goal here. The ranker downstream is precision-optimized. Mixing them confuses tuning."</li>
+  <li>"I split sources by cost: HNSW for the flagship two-tower (recall matters), IVF-PQ for cheap CF sources, hand-rolled lookups for trending/follow."</li>
+  <li>"The hardest production issue is index rebuild stampedes. Rolling shard swap with snapshot pinning is the move."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>HNSW</td>
+      <td>The flagship two-tower source needs Recall@2000 above 0.90 against a 500M corpus; HNSW delivers &gt;0.95 at 1ms latency without a training step, fitting 8M vectors per shard in 2.5 GB. Worth the 3x memory because retrieval recall directly bounds downstream ranker quality.</td>
+      <td>FAISS Flat (256 GB, infeasible); Annoy (worse build time and tail latency).</td>
+    </tr>
+    <tr>
+      <td>FAISS IVF-PQ</td>
+      <td>Used for cheaper CF retrieval sources where 0.85-0.90 recall suffices; compresses 500M vectors to ~32 GB total (16 shards * 2 GB) so we can run 4 secondary retrieval sources without 4x'ing the memory bill.</td>
+      <td>HNSW everywhere (3x memory waste on cheap sources); brute-force (250x too slow at 580K QPS).</td>
+    </tr>
+    <tr>
+      <td>ScaNN</td>
+      <td>On-deck alternative for the IVF-PQ tier; anisotropic quantization gives 5-10% better recall at the same compute, useful when CF source quality becomes the bottleneck after the two-tower source is saturated.</td>
+      <td>FAISS (chosen now for tooling parity); HNSW (memory cost not justified for CF).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka</td>
+      <td>5M new items/day stream into the embedding service; Kafka partitions by item_id so each ANN shard consumes only its assigned partition for incremental upserts, preserving the 10-minute publish-to-discoverable SLO.</td>
+      <td>AWS Kinesis (per-shard write cap insufficient); Pulsar (smaller ecosystem of Flink connectors).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink</td>
+      <td>Maintains the per-user "seen" bloom filter with 30s lag from impression events; keyed-state on user_id keeps the 12 KB bloom local to one operator, avoiding 580K QPS round-trips to Redis on every filter update.</td>
+      <td>Spark Streaming (micro-batch lag too high); Kafka Streams (less mature large-state handling).</td>
+    </tr>
+    <tr>
+      <td>Apache Spark (snapshot build)</td>
+      <td>Nightly batch over the full Iceberg item-feature lake produces the S3 HNSW snapshot ANN shards bulk-load at boot; Spark's wide cluster handles the 500M-vector embedding inference parallelism.</td>
+      <td>Beam (vendor lock-in); ad-hoc Python (cannot scale to 500M items in the nightly window).</td>
+    </tr>
+    <tr>
+      <td>Redis (bloom filters + trending)</td>
+      <td>Per-user 12 KB seen bloom * 200M DAU = 2.4 TB; Redis Cluster sharded by user_id keeps lookups sub-1ms, fitting inside the 50ms scatter-gather budget. RedisGraph variant powers the graph-walk source.</td>
+      <td>Memcached (no native bloom, no cluster mode at 2.4 TB); DynamoDB (10ms tail).</td>
+    </tr>
+    <tr>
+      <td>S3 (snapshot durability)</td>
+      <td>HNSW shard snapshots (500M * 320 bytes = 160 GB) live on S3; staggered boot loads with jitter prevent the snapshot-stampede problem when 64 shards restart simultaneously.</td>
+      <td>EBS (not multi-attach); HDFS (operational overhead).</td>
+    </tr>
+    <tr>
+      <td>PostgreSQL (index metadata)</td>
+      <td>Index-version, shard-assignment, and rollback metadata is small (&lt;1 GB) but needs strong consistency for the rolling shard swap; Postgres ACID guarantees no two shards claim the same shard_id during a swap.</td>
+      <td>etcd (overkill for relational data); MySQL (less rich JSONB for shard params).</td>
+    </tr>
+    <tr>
+      <td>gRPC streaming + hedged requests</td>
+      <td>8-way scatter-gather at 580K QPS with a 30ms budget cannot tolerate one slow shard; hedging at 15ms (send dup to peer) cuts p99 by 30-50% per published Google research and fits the DDIA Ch.8 mitigation pattern cited.</td>
+      <td>Plain REST (no streaming primitives); Thrift (smaller hedging tooling).</td>
+    </tr>
+    <tr>
+      <td>NVIDIA T4 GPUs (item embedding)</td>
+      <td>2 T4 nodes embed the 60 items/sec ingest stream with 200ms per item, well within the 10-minute publish SLO; T4's INT8 inference path doubles throughput vs CPU and is cheaper per item than A100 at this rate.</td>
+      <td>CPU inference (would need 30+ nodes); A100 (overprovisioned for 60 items/sec).</td>
+    </tr>
+    <tr>
+      <td>Bloom filters (seen-set)</td>
+      <td>Per-user 10K already-seen IDs encoded in 12 KB at 1% FPR is the only structure that meets both memory (200M users * 12 KB = 2.4 TB feasible) and 50ms latency targets; the 1% false positive rate is an acceptable recall cost.</td>
+      <td>Exact set in Redis (10x memory); Cuckoo filter (similar but more complex write path).</td>
+    </tr>
+    <tr>
+      <td>RedisGraph</td>
+      <td>Graph-walk retrieval source needs sub-20ms multi-hop traversals over the follow graph; RedisGraph's in-memory adjacency representation hits this where Neo4j on disk would not at 580K QPS.</td>
+      <td>Neo4j (disk-based, 5-10x slower); custom adjacency lists in Redis (no graph query language).</td>
+    </tr>
+  </tbody>
+</table>

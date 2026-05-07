@@ -1,0 +1,145 @@
+<h1>Design TikTok For You feed (heavy ML-driven recommendation)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">social-network</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design TikTok's For You Page (FYP): an infinite vertical feed of short videos personalized per user, where the candidate set is the entire global corpus (not just followed accounts). The system must turn every micro-interaction (watch-time, scroll-away, like, share, replay) into near-real-time signals that retrain ranking, while serving 1B+ DAU at p95 first-frame &lt; 600 ms.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Upload short video (≤3 min), client-side trim/effects.</li>
+  <li>FYP feed (algorithmic, global corpus). Following feed (graph-based).</li>
+  <li>Engagement events: watch_time_ms, completion, like, comment, share, follow, "not interested".</li>
+  <li>Search by hashtag, sound, creator. Discover trending sounds.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Scale:</b> 1.5B MAU, 1B DAU, ~50M uploads/day, ~100B video plays/day, ~500B engagement events/day.</li>
+  <li><b>Latency:</b> first-frame p95 &lt; 600 ms; ranking budget 100 ms p99 server-side; signal-to-model fresh in &lt;5 min.</li>
+  <li><b>Availability:</b> 99.95% on read; ranking degrades to popularity if model serving is down.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Uploads: 50M/day = 580/sec avg; avg 5 MB → 250 TB/day raw, ~500 TB/day after ABR.</li>
+  <li>Plays: 100B/day = ~1.2M plays/sec avg, ~5M/sec peak. Each play emits ~5 engagement events → ~25M events/sec peak.</li>
+  <li>Candidate corpus: ~5B videos eligible at any time; ANN index per region must scale to billions.</li>
+  <li>Inference: 1.2M plays/sec × 500 candidates ranked = 600M scoring ops/sec → distributed GPU/TPU farm with batched inference at ~200 QPS/instance.</li>
+  <li>CDN egress: 100B × 4 MB ≈ 400 PB/day egress; cache hit ratio target &gt; 95%.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/upload/init       {sizeBytes, mime}             → uploadUrl, videoId
+POST  /v1/videos             {videoId, caption, soundId}   → postId
+GET   /v1/fyp?cursor=...                                   → [video] (preloaded N+1, N+2)
+POST  /v1/events             [{videoId, type, watchedMs, ts}]   (batched)
+POST  /v1/feedback/not_interested  {videoId, reason}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Mobile] → [Edge POP/CDN] ──────────► [Video CDN tiers]
+   │                                       ▲
+   │ events (batched, every 2s)            │ ABR segments
+   ▼                                       │
+[API GW] ──► [Event Collector] ──► [Kafka events] ──► [Flink: feature updater] ──► [Online Feature Store (Redis/Cassandra)]
+                                                  └─► [Realtime Counters]
+                                                  └─► [Training Sample Builder] ──► [Hourly model retrain → Model Registry]
+                                                                                          │
+[FYP Svc] ──► [Candidate Generator (multi-source)] ──► [Ranker (DNN, GPU)] ──► [Diversity reranker] ──► [Pre-fetcher] ──► response
+                ├─ ANN: user-embedding × video-embedding (FAISS/ScaNN)
+                ├─ Trending pool, Locale pool, Creator-affinity pool
+                └─ "Cold-start fresh content" pool (50%-injected for exploration)
+</div>
+<p>Walk-through: client batches engagement events. Flink jobs update online features (recent watch ratio, completion ratio, locale, time-of-day). At feed open, FYP Svc runs candidate generation from ~6 retrieval sources (each returning ~200 ids), unions to ~1000 candidates, sends them to a DNN ranker that emits a single score blending P(complete), P(like), P(share), P(comment), P(follow). Diversity reranker (MMR) deduplicates by sound/creator/topic. Top-N returned with prefetch URLs for the next 2 videos.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Video metadata (sharded by video_id)</h3>
+<pre>CREATE TABLE videos (
+  video_id   bigint PRIMARY KEY,
+  creator_id bigint, sound_id bigint, hashtags array,
+  duration_ms int, lang text, region text, status enum,
+  created_at timestamp
+);</pre>
+<h3>7.2 Engagement event log (Kafka → ClickHouse for analytics, Redis for online)</h3>
+<pre>event {
+  user_id, video_id, ts_ms,
+  type, watched_ms, completion_ratio, device, network
+}</pre>
+<h3>7.3 Embeddings &amp; ANN</h3>
+<p>Two-tower model. User tower output (256-d) cached per user, refreshed every few minutes. Video tower output stored in a sharded ANN index (FAISS HNSW or ScaNN). Index rebuilt incrementally as new videos arrive; videos enter the index within 60 s of upload.</p>
+<h3>7.4 Feature store</h3>
+<p>Online: Redis (low-latency point lookup, &lt;2 ms p99). Offline: Parquet on HDFS for training. Same feature definitions via a feature registry to prevent train-serve skew.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Multi-source candidate generation</h3>
+<p>No single retrieval covers exploration + exploitation. Sources: ANN-by-embedding (personal taste), Trending (popularity-weighted recent), Locale/Language pool, Creator-affinity, Hashtag-co-occurrence, Fresh-uploads (cold-start exploration). Each contributes a quota; the union is deduped before ranking.</p>
+<h3>8.2 Ranker</h3>
+<p>Multi-task DNN: shared bottom + task-specific heads for completion, like, share, comment, long-view. Final score = weighted sum tuned per the business objective (engagement, retention). Inference batched at 64–128 candidates/request on GPU; p99 budget 30 ms ranking + 20 ms feature fetch.</p>
+<h3>8.3 Cold-start: videos &amp; users</h3>
+<p>New videos: forced exposure to small "exploration slots" (~5% of feed) to gather initial signal. New users: locale + popularity + onboarding interests bootstrap until ~20 watched videos generate a stable user embedding.</p>
+<h3>8.4 Real-time signal loop</h3>
+<p>Watch-time logged every 2 s while user watches. Flink updates the user's recent-watch ratio in Redis within seconds, so the next request reflects current taste — that's why TikTok feels "scary good" after a few swipes.</p>
+<h3>8.5 Pre-fetch &amp; CDN</h3>
+<p>Server returns N=3 next videos with signed URLs; client pre-fetches segment 0 of N+1 and N+2 over WiFi to hide latency. CDN keys are content-hashed for cacheability; popular video is shielded with a small origin protect-tier.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>ANN index freshness:</b> shard by video_id range; incremental insert HNSW; full rebuild offline weekly.</li>
+  <li><b>Hot video:</b> CDN edge cache; same-DC origin shield; pre-warm via predicted virality score.</li>
+  <li><b>Train-serve skew:</b> single feature definition library, replayable from log.</li>
+  <li><b>Filter bubble:</b> exploration quota and "not interested" hard-negative signal kept in feature store.</li>
+  <li><b>Ranker p99 spikes:</b> graceful fallback to last-known-good model, then to popularity baseline.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Multi-source retrieval</td><td>Robust to one source's bias; supports exploration</td><td>More to operate; quota tuning is hard</td></tr>
+<tr><td>Real-time feature loop</td><td>Feels uncannily personalized</td><td>Operational complexity; Flink lag = bad UX</td></tr>
+<tr><td>HNSW ANN over exact</td><td>Sub-ms search at billion scale</td><td>Approximate, recall tuning needed</td></tr>
+<tr><td>Multi-task ranker</td><td>One model, many objectives</td><td>Calibration across heads is fiddly</td></tr>
+<tr><td>Heavy CDN prefetch</td><td>Instant playback feel</td><td>Wasted bandwidth for skipped videos</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-region replicated feature store; per-region ANN indexes for locality.</li>
+  <li>Ch. 6 Partitioning — sharding event stream by user_id; range partitioning ANN by video_id.</li>
+  <li>Ch. 11 Stream Processing — Flink stateful jobs for online features; exactly-once for training-sample joiners; replayable Kafka log as the source of truth.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"FYP isn't a feed problem, it's a recommendation problem; the architecture is dominated by the retrieval-then-ranking pattern, not the social graph."</li>
+  <li>"The differentiator is real-time features — most systems retrain daily; here we update user features in seconds and that's the magic."</li>
+  <li>"Cold-start gets its own quota in candidate generation; without that, new creators starve and the platform stagnates."</li>
+  <li>"I'd discuss the train-serve skew problem because it's the operational footgun that bites every ML team."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Apache Flink</b> (stateful streaming)</td><td>Watch-time logged every 2 s must update user features in &lt;5 min for the "scary good after a few swipes" effect; Flink's stateful operators with exactly-once semantics handle 25M events/sec peak join (impression × engagement) for training-sample assembly.</td><td>Spark Streaming (micro-batch latency too coarse for 5 min freshness SLO), Kafka Streams (lacks sophisticated stateful join primitives at this scale), Storm (no exactly-once).</td></tr>
+    <tr><td><b>FAISS / ScaNN HNSW</b> (ANN candidate gen)</td><td>5B-video corpus needs sub-ms nearest-neighbor lookup of user-embedding × video-embedding to fit the 100 ms p99 ranking budget; HNSW gives us tunable recall vs latency and supports incremental insert so new uploads enter the index within 60 s.</td><td>Exact kNN (impossible at 5B videos), Annoy (lower recall), Elasticsearch dense vector (slower per-query and higher RAM at this scale).</td></tr>
+    <tr><td><b>Multi-task DNN ranker</b> (GPU/TPU)</td><td>600M scoring ops/sec requires batched accelerator inference; shared-bottom DNN with task heads for completion, like, share, comment, long-view lets the policy layer rebalance objectives without retraining for every product change.</td><td>GBDT (cannot share representations across tasks), per-task models (5× the inference cost), CPU inference (would need ~30K instances vs 2,300 GPU).</td></tr>
+    <tr><td><b>Two-tower model</b> (user/video embeddings)</td><td>Decoupled towers let video embeddings be precomputed at upload and stored in the ANN index, while user embeddings refresh every few minutes from the real-time signal loop — necessary because joint encoding billions of (user, video) pairs is computationally infeasible.</td><td>Joint cross-encoder (cannot precompute, blows latency), bag-of-features only (loses semantic similarity), single tower (cannot separate retrieval from ranking).</td></tr>
+    <tr><td><b>Redis</b> (online feature store)</td><td>Feature lookup at &lt;2 ms p99 for 1.2M plays/sec is the only way to fit feature fetch + ranking + diversity in the 100 ms budget; recent watch ratio, completion ratio, locale must be point-lookup-able.</td><td>Cassandra (single-digit-ms point read too slow at this rate), DynamoDB (cost prohibitive), DB direct (latency blowup).</td></tr>
+    <tr><td><b>Cassandra</b> (durable feature backup + counters)</td><td>Online Redis is RAM-bound; Cassandra holds the durable copy and serves cold features when Redis evicts, plus realtime counters that need write throughput at 25M events/sec without single-shard hot keys.</td><td>Postgres (cannot shard at this rate), Redis-only (loses durability on cluster failure), HBase (operational complexity vs Cassandra OSS).</td></tr>
+    <tr><td><b>ClickHouse</b> (engagement analytics)</td><td>500B engagement events/day need columnar OLAP for ad-hoc queries (creator dashboards, cohort analysis, A/B significance); ClickHouse aggregates billion-row queries in seconds where row-store DBs would crawl.</td><td>BigQuery (vendor lock + per-query cost), Druid (similar but weaker SQL), Postgres analytics (cannot scale beyond TB).</td></tr>
+    <tr><td><b>Apache Kafka</b> (event log + retraining source)</td><td>Replayable log is the source of truth for hourly model retrain — can replay any time window to rebuild training samples after a feature bug; consumer-lag drives Flink autoscaling and serves as the kill-switch for retraining when upstream is broken.</td><td>Kinesis (vendor lock + per-day retention limits), RabbitMQ (no replay), in-process queues (lose all of the above).</td></tr>
+    <tr><td><b>Parquet on HDFS</b> (offline feature store)</td><td>Same feature definitions via a feature registry must be readable in batch for nightly retraining; columnar Parquet projects only the features the trainer needs from 5 TB/day of training data, cutting IO 10×.</td><td>Avro (row-wise, slower scan), JSON (uncompressed bloat), per-feature CSV (no schema evolution).</td></tr>
+    <tr><td><b>CDN</b> (multi-tier with origin shield)</td><td>400 PB/day egress with &gt;95% cache hit ratio is the only way to fit Reels economics; per-region origin shields collapse misses for the same hot video into a single origin pull, and pre-warming via predicted virality avoids the cold-cache spike.</td><td>Single-tier CDN (cache miss storm on viral video), origin-only (impossible at 400 PB/day), peer-to-peer (mobile network unfriendly).</td></tr>
+    <tr><td><b>HLS ABR</b> (adaptive video)</td><td>First-frame p95 &lt; 600 ms across cellular and WiFi requires the client to start with a low-bitrate ladder and adapt; segment-0 prefetch of N+1 and N+2 reels works only with chunked segmented streams.</td><td>Progressive MP4 (no adaptation), DASH (interchangeable but HLS has stronger iOS support), WebRTC (overkill for one-way playback).</td></tr>
+    <tr><td><b>MMR diversity reranker</b></td><td>Filter-bubble kills retention; greedy <code>λ·score − (1−λ)·sim(picked)</code> over sound/creator/topic similarity is auditable and predictable in the 100 ms budget where heavier global optimization isn't feasible.</td><td>Determinantal Point Processes (more principled but expensive), no diversity (filter bubble), client-side rerank (cannot use global similarity).</td></tr>
+    <tr><td><b>Feature registry</b> (DRY transforms)</td><td>Train-serve skew is "the silent killer" — the same transform code must run online (Flink) and offline (Spark batch); a registry-versioned library prevents the divergence that destroys model quality silently in prod.</td><td>Two implementations (skew bugs guaranteed), runtime feature-spec interpretation (slower), feature-as-DB-view (cannot share Flink stateful logic).</td></tr>
+    <tr><td><b>Exploration quota</b> (fresh-uploads pool)</td><td>~5% of feed slots forced to new videos solves the cold-start problem (new creator gets initial signal) and keeps the corpus refreshing — without it, the platform stagnates on a small evergreen set and creator churn rises.</td><td>No exploration (creator starvation), pure-Thompson-sampling (computationally expensive at 5B corpus), random insert (no popularity prior, hurts UX).</td></tr>
+  </tbody>
+</table>

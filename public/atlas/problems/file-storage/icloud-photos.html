@@ -1,0 +1,138 @@
+<h1>Design iCloud Photos (cross-device sync, ML tagging, encryption)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">file-storage</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a photo &amp; video library that automatically syncs every shot from a user's iPhone, iPad, and Mac, while running on-device ML to tag faces, scenes, objects, and pets. The library must be searchable in natural language ("dog at beach 2023"), end-to-end encryptable, and storage-optimized so a 256 GB iPhone can act on a 2 TB library.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Auto-upload originals from camera roll; download on demand on other devices.</li>
+  <li>"Optimize device storage": keep only thumbnails + low-res locally if disk is tight.</li>
+  <li>On-device face/scene/object recognition; sync the resulting tags across devices.</li>
+  <li>Natural-language search ("red car"); shared albums; Memories (auto-curated reels).</li>
+  <li>End-to-end encryption (Advanced Data Protection) where the server cannot read pixels.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> tag-sync between devices p95 &lt; 30 s; thumbnail load p99 &lt; 200 ms.</li>
+  <li><b>Scale:</b> 850 M users, 4 trillion photos, 100 PB net new per month.</li>
+  <li><b>Durability:</b> 11-9s on stored originals.</li>
+  <li><b>Privacy:</b> all ML must run on-device; server holds only ciphertext &amp; opaque tag tokens.</li>
+  <li><b>Battery:</b> background indexing &lt; 5% device battery/day.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Ingest: 850 M users x 30 photos/day x 3 MB = 76 PB/day uploaded.</li>
+  <li>Storage: 4 T photos x 3 MB + videos at 30 MB avg → ~14 EB net of dedup.</li>
+  <li>Tag volume: 30 tags/photo x 4 T = 120 T tag rows; encrypted ≤ 100 B each = 12 PB.</li>
+  <li>Thumbnail derivative storage: 3 sizes x 200 KB avg x 4 T = 2.4 EB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/asset                {client_uuid, ciphertext, hash}    → asset_id
+GET  /v1/asset/{id}?size=thumb|preview|orig                       → ciphertext
+POST /v1/derivative           {asset_id, kind, ciphertext}        → ok
+POST /v1/index/upsert         {tokens[], asset_ids[]}             → ok  (E2EE-tokenized)
+GET  /v1/index/query          {token_query}                       → asset_ids[]
+GET  /v1/changes              {since_cursor}                      → {changes, cursor}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[iPhone Neural Engine] ──► tags/embeddings ──► encrypt locally
+        │                                            │
+        ▼                                            ▼
+  HEIC original ─► upload ─► [Asset Service] ─► [Object store EC 12+4]
+                                  │
+                                  ▼
+                        [Metadata KV: per-user tree]
+                                  │
+                                  ▼
+        [APNs / push] ◄── [Change-log Kafka] ──► [Search index (encrypted)]
+                                  │
+                                  ▼
+                          [iPad / Mac pulls deltas]
+</div>
+<p>Walk-through: the iPhone runs Core ML over each new asset, extracts face/scene embeddings, encrypts them with the per-user CloudKit key, and uploads both the ciphertext original and the encrypted tag bundle. The server never sees pixels or tag plaintext under Advanced Data Protection — it only stores opaque blobs keyed by deterministic search tokens (hashed with the user's key). Other devices receive a push, fetch the change log, and decrypt locally.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Asset metadata (CloudKit / FoundationDB-like KV)</h3>
+<pre>row key: user_id || asset_id
+value:   {
+  capture_ts, device_id, hash_blake3,
+  derivatives: {thumb_id, preview_id, orig_id},
+  ciphertext_size, encryption_record,
+  tombstoned: bool, change_seq: u64
+}</pre>
+<h3>7.2 Encrypted search index</h3>
+<p>Per user, an inverted index from <code>HMAC(user_key, term)</code> → list of <code>asset_id</code> ciphertexts. Server can answer "give me all asset_ids whose token bucket equals X" without ever knowing what X means in plaintext.</p>
+<h3>7.3 Originals</h3>
+<p>Stored as ciphertext objects in an S3-class object store, erasure-coded 12+4 across 4 AZs.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 On-device ML pipeline</h3>
+<p>Background task triggered when device is on Wi-Fi + charging + locked. Runs Vision framework: face detection (MTCNN-style) → 128-dim FaceNet embedding, scene classifier (1,000 classes), object detector. Embeddings are clustered locally to form "People" albums.</p>
+<h3>8.2 Tag sync across devices</h3>
+<p>Each device produces tags independently. Sync uses a CRDT-style OR-set per asset so tags merge without conflicts. Priority-based de-dup ensures the same face cluster identity propagates (the device with the lowest UUID wins ties).</p>
+<h3>8.3 Optimize device storage</h3>
+<p>When local free space drops below threshold, originals are evicted and replaced with previews. Re-fetched lazily on view; LRU + recency-of-shoot weighting.</p>
+<h3>8.4 Memories &amp; recommendation</h3>
+<p>Memory pipeline runs entirely on-device: scoring fn over (face quality, scene rarity, recency, manual favorites) selects 8–12 photos per "Memory". Music selection is server-suggested by genre token (a non-PII signal).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Ingest spikes:</b> Christmas/New Year ingest is 4x baseline; pre-warm regional capacity, throttle non-favorites first.</li>
+  <li><b>Cross-device tag drift:</b> two devices may compute slightly different face clusters; resolve with a deterministic global salt + Hungarian matching.</li>
+  <li><b>Encrypted search recall:</b> deterministic tokens leak frequency; add per-user dummy tokens to flatten the histogram.</li>
+  <li><b>Battery cost:</b> ML jobs gated by Core ML scheduler; never run on cellular.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>On-device ML</td><td>Privacy, no server GPU bill</td><td>Slow first-time index on big libraries</td></tr>
+<tr><td>End-to-end encryption</td><td>Server breach is harmless</td><td>Lost key = lost photos forever</td></tr>
+<tr><td>CRDT tag merge</td><td>Conflict-free across N devices</td><td>Set grows; needs periodic compaction</td></tr>
+<tr><td>Encrypted search index</td><td>Useful queries without plaintext</td><td>Token-frequency side channel</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-leader (each device is a leader for tags).</li>
+  <li>Ch. 6 Partitioning — partition by user_id; user is the unit of locality.</li>
+  <li>Ch. 12 The Future of Data Systems — CRDTs for offline-first device sync.</li>
+  <li>Ch. 11 Stream Processing — change log feeds notification + Memories.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Pushing ML to the device is the strongest privacy lever; once you commit to it, the rest of the architecture follows because the server is now blind."</li>
+  <li>"The thorny bit is tag sync: I'd model it as a per-asset OR-set CRDT and define a deterministic face-cluster identity so devices converge."</li>
+  <li>"For encrypted search I'd accept the frequency side channel and pad it with dummy tokens — it's a classic privacy-vs-utility trade."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Apple Neural Engine + Core ML on-device</td><td>Privacy NFR forbids server-side pixel access; with 76 PB/day uploaded across 850 M devices, server GPU inference would also cost a fortune. Running face/scene/object models on the Neural Engine costs &lt;5% battery/day, the stated budget.</td><td>Server-side GPU inference (privacy violation; cost prohibitive); cloud inference on encrypted pixels via FHE (orders of magnitude too slow).</td></tr>
+    <tr><td>Reed-Solomon 12+4 erasure coding across 4 AZs</td><td>14 EB net of original ciphertext at 11 nines requires more redundancy than 10+4; 12+4 keeps overhead at 1.33x while tolerating 4 simultaneous shard losses including a full AZ. Sweet spot for photo originals where loss is unrecoverable.</td><td>10+4 (slightly cheaper but tighter durability margin); 3x replication (3.0x cost on 14 EB is untenable).</td></tr>
+    <tr><td>FoundationDB / CloudKit-class KV for asset metadata</td><td>Per-user partitioning of <code>(user_id, asset_id)</code> means every device's pull is a single-shard scan. With 4 T photos, only a transactional KV with range scans handles per-user "give me changes since cursor" cheaply.</td><td>DynamoDB (hash-only partitions break range scan); Cassandra (no transactions, painful for change-seq monotonicity).</td></tr>
+    <tr><td>BLAKE3 content hashing</td><td>Identifies duplicate uploads (the same photo airdropped to two devices) so we only store one ciphertext object. BLAKE3 is ~3x faster than SHA-256 on iPhone — important when chunking is gated by battery.</td><td>SHA-256 (slower; CPU/battery cost matters here); xxHash (not collision-resistant for a content-addressed store).</td></tr>
+    <tr><td>HMAC-tokenized inverted index for encrypted search</td><td>Server can answer "which assets match token bucket X?" without ever knowing X in plaintext, satisfying the Advanced Data Protection NFR. Tokens are <code>HMAC(user_key, term)</code> so they're per-user and not joinable across users.</td><td>Plaintext index (privacy violation); searchable encryption with full security (orders of magnitude slower); FHE (untenable latency).</td></tr>
+    <tr><td>OR-set CRDT for tag merging</td><td>Tags are produced concurrently on iPhone, iPad, and Mac with no central coordinator under E2EE. OR-set guarantees conflict-free union across N devices and survives offline edits — the only data structure that fits the multi-leader topology in DDIA Ch. 5.</td><td>Last-writer-wins (loses tags); operational transform (overkill for set semantics); 2P-set (cannot re-add a deleted tag).</td></tr>
+    <tr><td>APNs for push notifications</td><td>Tag-sync between devices p95 &lt;30 s requires a wake-up channel that survives the iOS background-execution policy. APNs silent pushes are the only mechanism Apple permits to wake an app outside foreground.</td><td>Long-poll WebSocket (drained on backgrounding); FCM (not available cross-platform inside Apple ecosystem); SMS triggers (cost prohibitive).</td></tr>
+    <tr><td>Kafka change-log per user</td><td>Change log feeds APNs fan-out, the encrypted-search updater, and cross-device delta cursors as independent stream consumers (DDIA Ch. 11). At ~76 PB/day ingest, decoupling fan-out from the write path is essential.</td><td>DB triggers (couples writers to consumers); per-device polling (battery cost violates &lt;5%/day budget).</td></tr>
+    <tr><td>Vision framework: MTCNN + 128-dim FaceNet embeddings</td><td>Face clustering identity must be deterministic across devices for the OR-set merge to converge; FaceNet embeddings + a deterministic global salt enable Hungarian matching to align clusters between iPhone and Mac.</td><td>Server-side ArcFace (no pixel access); raw pixel similarity (catastrophic recall on lighting changes).</td></tr>
+    <tr><td>HEIC + HEVC compression for originals</td><td>30 photos/day × 850 M users at JPEG would be ~150 PB/day uploaded; HEIC roughly halves that to the stated 76 PB/day. Same quality, ~50% bandwidth — directly impacts the Christmas/New Year 4x ingest spike capacity.</td><td>JPEG (~2x larger; doubles storage and bandwidth); AVIF (decode support uneven on older devices).</td></tr>
+    <tr><td>Per-user CloudKit envelope encryption</td><td>Lost-key recovery NFR conflicts with E2EE; envelope encryption with per-user keys held in iCloud Keychain (recoverable via trusted-device chain) is the practical compromise that keeps the server blind under ADP.</td><td>Per-photo keys (key sprawl, no recovery); single account password as key (catastrophic loss on forget).</td></tr>
+    <tr><td>Local LRU cache with recency-of-shoot weighting</td><td>"Optimize device storage" lets a 256 GB iPhone surface a 2 TB library; LRU alone evicts recent vacation photos the user actively browses. Weighting by shoot recency keeps the last 30 days of originals local with high probability.</td><td>Pure LRU (evicts active browsing); pure FIFO (keeps stale content); manual pinning (unusable UX).</td></tr>
+  </tbody>
+</table>

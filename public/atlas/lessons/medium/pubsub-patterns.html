@@ -1,0 +1,64 @@
+<h1>Pub-sub patterns: fanout, topic, exchange</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">pubsub</span>
+  <span class="tag">fanout</span>
+  <span class="tag">routing</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Pub-sub flips the queue model on its head: producers don't know who consumes, and consumers don't know who produced. The broker sits in between with a routing rule. Three rules cover 90% of real systems — <b>fanout</b> (everyone gets every message), <b>topic</b> (subscribers filter by a key or pattern), and <b>direct/exchange</b> (explicit binding from a routing key to a queue). Knowing which one to reach for is the difference between a clean fan-out architecture and a tangle of point-to-point HTTP calls.</p>
+
+<h2>Why it matters</h2>
+<p>Once you have more than two services that care about the same domain event ("order placed", "user signed up"), you need pub-sub or you're back to the N-squared integration mess. The pattern you pick determines who can subscribe later without redeploying producers, how filtering happens, and whether a slow consumer can stall everyone else.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Fanout:</b> A "user.deleted" event broadcast to billing, search, audit, and email-unsubscribe — each service maintains its own queue from the same exchange.</li>
+  <li><b>Topic:</b> Logs routed by <code>service.environment.severity</code>; a dashboard subscribes to <code>*.prod.error</code> while a per-service team binds to <code>checkout.#</code>.</li>
+  <li><b>Direct/exchange:</b> RabbitMQ direct exchange routing job types — <code>image.resize</code> goes to GPU workers, <code>email.send</code> goes to SMTP workers, both from one producer.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  fanout                topic                       direct
+  ┌─────┐               ┌─────────────┐              ┌─────────┐
+  │ P   │               │ P  key=...  │              │ P  key=A│
+  └──┬──┘               └──────┬──────┘              └────┬────┘
+     │ everyone               │ pattern match              │ exact match
+   ┌─┴─┬─┐             ┌──────┼──────┐              ┌─────┴────┐
+   ▼   ▼ ▼             ▼      ▼      ▼              ▼          ▼
+  Q1  Q2 Q3           order.* *.eu  audit.#        Q-A        (no Q-B)
+</div>
+<p>Fanout copies blindly. Topic uses wildcards (<code>*</code> = one segment, <code>#</code> = zero+ segments) to pull a slice. Direct is a hash-map lookup from key to queue.</p>
+
+<h2>Designing the routing key</h2>
+<ul>
+  <li><b>Hierarchical, dotted, low-cardinality on the left:</b> <code>domain.action.region</code> — left-to-right wildcards work better when the broadest dimension is leftmost.</li>
+  <li><b>Don't put user IDs in the key.</b> You'll create a binding explosion. Use payload fields and per-consumer filtering for that.</li>
+  <li><b>Version your topics.</b> <code>order.placed.v1</code> lets you ship a v2 alongside without breaking subscribers.</li>
+</ul>
+
+<h2>Failure & backpressure</h2>
+<p>Pub-sub doesn't eliminate slow consumers — it isolates them. Each subscriber gets its own queue, so one stuck consumer fills its queue without blocking siblings. But the broker's disk is finite: set per-queue length limits, dead-letter exchanges for poison messages, and a TTL so abandoned queues don't grow forever. Fanout is especially dangerous here — N consumers means N copies, so a 1KB event becomes NKB of storage.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Using fanout when you actually want a topic — every service receives events it doesn't care about and has to filter in code.</li>
+  <li>Encoding business logic in routing keys (<code>order.amount.&gt;100</code>). Routing keys are addresses, not predicates.</li>
+  <li>Sharing one queue across consumer types. You then can't scale image-resize workers independently of email workers.</li>
+  <li>Forgetting that pub-sub is at-least-once. Subscribers must be idempotent or you'll double-process.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> A travel site emits <code>booking.created</code>. Five services care: payments, inventory, email confirmation, analytics, fraud. Inventory only cares about flights, fraud only cares about bookings &gt; $5000. Sketch the exchange + queue + binding topology.
+  <br/>
+  <b>Hint:</b> Use a topic exchange. Some bindings are routing-key based (<code>booking.flight.*</code>); the dollar threshold doesn't belong in the key — push that to a consumer-side filter or a dedicated fraud-evaluator queue.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-event-collector">Design an event collector</a> — fanout topology for downstream consumers.</li>
+  <li><a href="#problem/design-twitter-trending">Design Twitter trending</a> — topic-based subscribers per region/language.</li>
+  <li><a href="#problem/design-notification-service">Design a notification service</a> — multi-channel pub-sub with consumer-specific filtering.</li>
+</ul>

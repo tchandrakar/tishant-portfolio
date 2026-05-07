@@ -1,0 +1,141 @@
+<h1>Design Large File Upload (chunked, resumable, multipart, virus scan)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">file-storage</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the upload pipeline behind products like WeTransfer, Slack file-share, GitHub LFS, or video-platform ingest. The system must accept files from 1 MB up to 5 TB over flaky residential and mobile networks, survive disconnects without restarting from byte 0, scan every byte for malware before the file becomes downloadable, and bill the customer accurately for storage and egress.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Resumable uploads: client can pause / network can drop / browser can crash, then continue.</li>
+  <li>Multipart parallel uploads (8–32 concurrent parts) for throughput.</li>
+  <li>Pre-signed direct-to-storage upload URLs (do not proxy bytes through app servers).</li>
+  <li>Server-side virus scan + content-type sniffing before publishing the file.</li>
+  <li>Per-user upload quotas and abuse rate-limits.</li>
+  <li>Webhook on upload completion for downstream consumers.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Throughput:</b> saturate a 1 Gbps client link; sustain 5 GB/s aggregate per region.</li>
+  <li><b>Latency:</b> first part accepted within 50 ms after handshake.</li>
+  <li><b>Scale:</b> 50 K concurrent uploads, 5 PB ingested per day.</li>
+  <li><b>Durability:</b> 11-9s once the upload is finalized.</li>
+  <li><b>Cost:</b> abandoned uploads must be GC'd within 24 h.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Ingest: 5 PB/day = ~58 GB/s sustained; peak 4x = ~230 GB/s.</li>
+  <li>Parts: 8 MB part size, 5 PB / 8 MB = 625 M parts/day → ~7 K parts/s.</li>
+  <li>Init / complete control-plane RPS: 50 K uploads/min x 2 = ~1.7 K RPS.</li>
+  <li>Virus scanner CPU: 5 PB/day / 200 MB/s per worker = ~290 worker-days/day → ~290 always-on workers.</li>
+  <li>Abandonment: assume 12% of started uploads never complete → 600 TB/day GC.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/uploads                          {filename, size, mime}    → {upload_id, part_size, urls[]}
+PUT  {presigned-storage-url}/?part=N      body=bytes                → ETag(part)
+POST /v1/uploads/{id}/complete            {parts:[{n, etag}]}       → {file_id, status:"scanning"}
+POST /v1/uploads/{id}/abort                                          → 204
+GET  /v1/uploads/{id}/status                                         → {bytes_received, parts_received[]}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] ──init──► [Upload API] ──► [Upload State DB (Redis+Postgres)]
+   │                  │
+   │   pre-signed URLs│
+   ▼                  ▼
+[Object Store: staging bucket] ◄─── parts ──── [Client uploads in parallel]
+   │
+   │ on /complete
+   ▼
+[Assembler] ──► [Virus Scanner pool] ──► [Final bucket (durable)] ──► [Webhook fanout]
+                                                ▲
+                                                │
+                                          [GC: abandoned > 24h]
+</div>
+<p>Walk-through: the client calls <code>POST /uploads</code> with file size; server creates an <code>upload_id</code>, picks a part size (8 MB for &lt; 100 GB, 64 MB for larger), and returns a batch of presigned URLs. The client uploads parts directly to the staging bucket — no bytes traverse the app tier. Each PUT is idempotent on its part number, so retries are safe. <code>/complete</code> validates ETags, triggers the assembler, then scans, then publishes.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Upload state (Postgres + Redis cache)</h3>
+<pre>CREATE TABLE upload (
+  upload_id   UUID PRIMARY KEY,
+  user_id     BIGINT NOT NULL,
+  filename    TEXT,
+  size_bytes  BIGINT,
+  part_size   INT,
+  state       TEXT,    -- INIT | UPLOADING | ASSEMBLING | SCANNING | DONE | ABORTED
+  parts_received JSONB,
+  staging_key TEXT,
+  final_key   TEXT,
+  created_at  TIMESTAMPTZ,
+  expires_at  TIMESTAMPTZ
+);
+CREATE INDEX ON upload (state, expires_at);  -- for GC sweep</pre>
+<h3>7.2 Staging vs final bucket</h3>
+<p>Staging bucket has 24 h lifecycle policy; final bucket is durable. Two buckets so we never accidentally serve unscanned bytes.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Resumability</h3>
+<p>The state of "what parts have arrived" lives both in the upload-state DB and is also derivable from <code>ListParts</code> on the staging bucket — that redundancy means a crashed app server cannot lose progress.</p>
+<h3>8.2 Idempotency</h3>
+<p>Every part PUT carries the part number in the URL. The same part can be uploaded twice with different bytes; the last write wins. Final commit verifies size + per-part hash sum against the manifest.</p>
+<h3>8.3 Virus scan pipeline</h3>
+<p>On <code>/complete</code> the file moves into a "scanning" state. A pool of ClamAV (or commercial) workers stream the object via range reads, scan in 64 MB windows, and on success rename it (server-side copy) into the final bucket. On detection, the file is quarantined and the user is notified. We never run the scanner in-line with the upload — that would force the client to wait for hundreds of MB/s of scan time.</p>
+<h3>8.4 Abuse / quotas</h3>
+<p>Token-bucket per user_id in Redis — caps bytes/hour and concurrent uploads. The <code>POST /uploads</code> handler also rejects if Content-Length exceeds the user's tier.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Tail-end stragglers:</b> on 1,000-part uploads, one slow part stalls /complete. Solution: client speculatively re-uploads the slowest 2 parts in parallel.</li>
+  <li><b>Hot upload-state shard:</b> one viral campaign can hammer one user's row. Cache hot rows in Redis with write-through.</li>
+  <li><b>Scanner backlog:</b> autoscale on queue depth; SLO is "scanned within 5 min of complete".</li>
+  <li><b>GC correctness:</b> sweeper must respect "still uploading" — uses Redis lease that the client refreshes every 60 s.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Direct-to-storage presigned PUTs</td><td>App tier doesn't see bytes</td><td>Coupling to a specific object-store SDK</td></tr>
+<tr><td>Async scan after assembly</td><td>Fast user-perceived completion</td><td>Brief window where file exists but isn't shareable</td></tr>
+<tr><td>8 MB default part size</td><td>Good for residential up-links</td><td>Many parts → manifest cost on huge files</td></tr>
+<tr><td>Two-bucket (staging/final) design</td><td>Clear safety boundary</td><td>Extra server-side copy</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — leader-based replication on the upload-state DB.</li>
+  <li>Ch. 8 The Trouble with Distributed Systems — duplicate / out-of-order part PUTs handled by idempotent design.</li>
+  <li>Ch. 11 Stream Processing — Kafka-backed scanner queue with at-least-once delivery.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Two design choices win you 80% of the points: presigned direct uploads, and idempotent parts. Everything else is operational hygiene."</li>
+  <li>"I'd not block /complete on the AV scan — it pushes p99 latency through the roof. Instead I'd make 'shareable' a separate state."</li>
+  <li>"GC of abandoned uploads is where this system bleeds money in production; I'd put SLOs on staging-bucket size."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>S3-compatible object store with presigned PUT URLs</td><td>At 5 PB/day ingest (~58 GB/s sustained, 230 GB/s peak), proxying bytes through app servers would require an absurd app tier. Presigned PUTs send bytes directly to storage, leaving the app tier handling only ~1.7 K control-plane RPS.</td><td>Proxied uploads through app tier (huge fleet cost); FTP/SFTP (no resumable semantics, no presigned auth).</td></tr>
+    <tr><td>Two-bucket (staging vs final) layout with 24 h lifecycle on staging</td><td>Abandoned uploads are 12% of starts → 600 TB/day garbage; lifecycle on staging auto-expires them at zero engineering cost. Separation also guarantees we never accidentally serve unscanned bytes to a download URL.</td><td>Single bucket with state flag (one bug exposes unscanned content); two-bucket with manual GC (operational burden).</td></tr>
+    <tr><td>Postgres for upload state</td><td>Resumability requires durable state for which parts arrived; the index <code>(state, expires_at)</code> drives the GC sweep. Modest scale (~50 K concurrent uploads × tens of rows per upload) fits comfortably in a single primary with read replicas.</td><td>MySQL (equivalent; team chose Postgres for JSONB on <code>parts_received</code>); DynamoDB (range scans on expires_at less natural).</td></tr>
+    <tr><td>Redis for hot upload-state cache + token-bucket quotas</td><td>Status checks during a 1,000-part upload hit the same row repeatedly; Redis write-through caches absorb that. Same Redis cluster runs token-bucket quotas (bytes/hour, concurrent uploads) at sub-millisecond latency — essential when the API gateway must reject before issuing presigned URLs.</td><td>In-memory app cache (no cross-pod coherence); pure DB (hot-row contention).</td></tr>
+    <tr><td>Reed-Solomon 10+4 EC on the final bucket</td><td>11 nines on finalized data with cost-effective storage at PB scale; 1.4x overhead vs 3.0x for replication. Identical to the underlying object-store guarantees we'd otherwise rebuild ourselves.</td><td>3x replication (3x cost); RAID-6 (rack-local; no AZ tolerance).</td></tr>
+    <tr><td>ClamAV worker pool with range-read streaming</td><td>5 PB/day at 200 MB/s per worker = ~290 worker-days/day, sized as ~290 always-on workers. Range reads in 64 MB windows let workers scan without buffering 5 TB objects in memory; pulling from the staging bucket means scan and finalize never block ingest.</td><td>Inline scan during PUT (forces client to wait hundreds of seconds); commercial AV-as-a-service (cost prohibitive at 5 PB/day).</td></tr>
+    <tr><td>Kafka-backed scanner queue</td><td>At-least-once delivery is acceptable (scans are idempotent on object hash) and Kafka's partition-by-upload_id gives natural ordering and back-pressure when the scanner pool is undersized. Autoscaling on queue depth meets the "scanned within 5 min" SLO.</td><td>SQS (works; team standardized on Kafka for stream-processing parity); RabbitMQ (lower throughput at this volume).</td></tr>
+    <tr><td>Idempotent part PUTs keyed by part number</td><td>Direct consequence of the "out-of-order / duplicate part" reality on flaky residential and mobile uplinks (DDIA Ch. 8). The same part can arrive twice with different bytes; last-writer-wins on object-store PUT semantics handles it natively.</td><td>Sequence-numbered append (forces serialization, kills 8–32 concurrent parts NFR); content-hash addressing per part (loses simple manifest).</td></tr>
+    <tr><td>SHA-256 / MD5 part-hash manifest</td><td><code>/complete</code> validates per-part hash sum vs the manifest, catching truncated or corrupted parts before promotion. MD5 retained for legacy SDK ETag compatibility; SHA-256 used for tamper-resistance against adversarial replay.</td><td>Size-only validation (silent corruption risk); CRC32 (too weak for adversarial settings).</td></tr>
+    <tr><td>HTTP/2 with parallel streams (8–32)</td><td>Saturating a 1 Gbps link with 8 MB parts requires multiple in-flight requests; HTTP/2 multiplexing avoids the per-request TCP setup cost on every part. Tail-end stragglers are mitigated by speculatively re-uploading the slowest 2 parts.</td><td>HTTP/1.1 (head-of-line blocking, lots of TCP connections); HTTP/3/QUIC (great for mobile but uneven middlebox support today).</td></tr>
+    <tr><td>Webhooks via signed POSTs for completion notifications</td><td>Downstream consumers (transcoder, indexer, CRM) shouldn't poll the upload-state DB; signed webhook POSTs deliver completion events with HMAC verification. Retries + idempotency keys keep at-least-once delivery safe.</td><td>Long-poll (couples consumers to our DB); shared Kafka topic (cross-tenant exposure concerns).</td></tr>
+    <tr><td>Redis lease for "still uploading" GC interlock</td><td>Naive expiry-based GC could delete an in-flight 5 TB upload mid-stream; clients refresh a Redis lease every 60 s, and the GC sweeper respects it. Bounds worst-case bleed of orphaned bytes to one lease window.</td><td>DB-only TTL (chatty, hot row); no lease (data loss risk on slow uploads).</td></tr>
+  </tbody>
+</table>

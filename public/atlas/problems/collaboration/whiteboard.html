@@ -1,0 +1,142 @@
+<h1>Design Real-time Whiteboard (Miro / Excalidraw — strokes, selection sync)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">collaboration</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a multiplayer infinite canvas where users draw freehand strokes, drop sticky notes, connect arrows, and pan/zoom — all collaboratively in real time. The data model is a flat set of shapes (no deep tree like Figma), and the dominant op is "append a stroke at 60 Hz." The right tool is a CRDT keyed by shape-id (Yjs Y.Map), but with extra care for streaming partial strokes.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Freehand pen strokes, shapes, sticky notes, arrows, text, images.</li>
+  <li>Multiplayer cursors and laser pointer.</li>
+  <li>Pan/zoom on an infinite canvas (no fixed pages).</li>
+  <li>Selection box, group move, copy/paste.</li>
+  <li>Offline drawing with merge on reconnect.</li>
+  <li>Export to PNG/PDF, embed videos / iframes.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> stroke render echo &lt; 50 ms p99 same-region.</li>
+  <li><b>Scale:</b> 30 M MAU, 500 K concurrent boards, max 200 editors per board.</li>
+  <li><b>Board size:</b> p99 = 50 K shapes, 200 MB serialized.</li>
+  <li><b>Convergence:</b> strong eventual consistency.</li>
+  <li><b>Availability:</b> 99.9%.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Stroke point rate: 60 Hz × 16 B per point × 50 K active drawers = ~50 MB/s in-flight.</li>
+  <li>Finalized strokes: 50 K drawers × 1 stroke/3 s × 2 KB compressed = ~33 MB/s persisted.</li>
+  <li>Cursor pings: 500 K sessions × 30 Hz × 16 B = 240 MB/s aggregate.</li>
+  <li>Storage: 100 M boards × avg 5 MB = 500 TB.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>WS /v1/board/{id}/session         → { snapshot, vectorClock }
+WS C2S { type:"stroke-begin", id, color, width }
+WS C2S { type:"stroke-point", id, x, y, t, pressure }   // 60 Hz, unordered
+WS C2S { type:"stroke-end",   id, points:[...] }        // canonical
+WS C2S { type:"shape-op",     op, shapeId, props }
+WS S2C { type:"op", origin, op, clock }
+WS S2C { type:"cursor", peer, x, y }</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──WebTransport──&gt;[Edge PoP]──&gt;[Board Actor]
+                                          │   (one per active board)
+                                          ├─&gt;[Yjs Doc in RAM]
+                                          ├─&gt;[Op log: ScyllaDB]
+                                          ├─&gt;[Snapshot: S3]
+                                          └─&gt;[Cursor relay (no persist)]
+</div>
+<p>Each board has a single owning actor. Streaming stroke points are relayed instantly without going through the CRDT (low latency, lossy ok). Only the final stroke (`stroke-end`) is committed to the CRDT and persisted.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 CRDT</h3>
+<pre>Board = Y.Map&lt;ShapeId, Shape&gt;
+Shape = {
+  type: "stroke" | "rect" | "sticky" | "arrow",
+  bounds: {x, y, w, h},
+  z: fractional-index,
+  data: type-specific (e.g. compressed point array)
+}</pre>
+<h3>7.2 Op log (ScyllaDB)</h3>
+<pre>CREATE TABLE board_ops (
+  board_id uuid,
+  bucket   int,        -- ts/3600
+  ts       timeuuid,
+  peer_id  uuid,
+  op_blob  blob,
+  PRIMARY KEY ((board_id, bucket), ts)
+);</pre>
+<p>Bucketing prevents unbounded partitions on long-lived boards. ScyllaDB chosen for write-heavy throughput (~1M ops/s/cluster) at low cost.</p>
+<h3>7.3 Why Yjs?</h3>
+<p>Yjs encodes a Y.Map update in ~30–60 B, has a mature WASM build for the browser, and ships with vector-clock-based GC. We don't need OT — concurrent edits to a stroke don't really happen (it's owned by one drawer).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Streaming strokes</h3>
+<p>The 60 Hz partial points are pure relay — server forwards to peers, drops on backpressure. The drawing client also sends `stroke-end` with the canonical compressed polyline; that's what becomes a CRDT shape. Trade-off: a viewer who joins mid-stroke sees nothing until end — acceptable.</p>
+<h3>8.2 Cursors / laser pointer</h3>
+<p>Pure pub/sub fanout via Redis Streams. 30 Hz, no persistence, server simply rate-limits per peer.</p>
+<h3>8.3 Selection sync (optional)</h3>
+<p>Selection state is ephemeral per peer, broadcast at 5 Hz. We do NOT CRDT it — different users have different selections.</p>
+<h3>8.4 Z-ordering</h3>
+<p>Fractional index per shape. "Bring to front" = max(z) + 1. Periodic rebalance.</p>
+<h3>8.5 Garbage collection</h3>
+<p>Shapes deleted &gt; 30 days ago and acknowledged by all known peers are tombstone-collected via Yjs's GC, shrinking the doc.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot board (workshop with 200 editors):</b> single actor saturates at ~10k shape ops/s; cursor relay scales horizontally separately.</li>
+  <li><b>Massive boards (100k shapes):</b> client uses spatial index (R-tree) to render only the viewport; server streams shapes by viewport too.</li>
+  <li><b>Network jitter:</b> WebTransport with QUIC tolerates packet loss on partial strokes; UI uses dead reckoning to interpolate.</li>
+  <li><b>Image / video embeds:</b> uploaded to S3, only the URL stored in the CRDT (small payload).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>CRDT (Y.Map) over OT</td><td>True offline, simple shape semantics</td><td>Tombstone bloat on heavily-edited boards</td></tr>
+<tr><td>Stroke streaming out-of-CRDT</td><td>60 Hz feels native</td><td>Mid-stroke joiner misses partial; lossy</td></tr>
+<tr><td>WebTransport vs WebSocket</td><td>Lower latency on lossy networks</td><td>Browser/server support still maturing</td></tr>
+<tr><td>ScyllaDB op log</td><td>Cheap, fast writes</td><td>No multi-key txn; eventual consistency on reads</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — leaderless replication for the op log; per-board single-writer for ordering.</li>
+  <li>Ch. 9 Consistency — strong eventual consistency suffices; no need for linearizability.</li>
+  <li>Ch. 11 Stream Processing — Redis Streams as ephemeral cursor channel.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The 60 Hz stroke-streaming is a separate concern from the CRDT; conflating them murders latency."</li>
+  <li>"I'd cap board size with a soft warning at 50k shapes — beyond that the CRDT's RAM footprint hurts mobile."</li>
+  <li>"If asked about precision: stroke points are quantized to 0.1px and delta-encoded, ~5× compression."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Yjs CRDT (Y.Map of shapes)</td><td>Concurrent edits to a stroke don't really happen — each shape has one owning drawer — so CRDT's strong eventual consistency is plenty. Y.Map encodes a shape update in 30–60 B and supports vector-clock GC, vital for boards that live for years.</td><td>OT (rejected: requires central writer, no real benefit on flat shape model); Automerge (rejected: heavier wire format than Yjs at our 33 MB/s persisted rate).</td></tr>
+    <tr><td>WebTransport / QUIC</td><td>60 Hz partial stroke points (50 MB/s) tolerate loss but not head-of-line blocking. WebTransport datagrams skip TCP retransmits, beating WebSocket by ~30 ms p99 on 5% packet-loss links — the difference between a smooth and a janky stroke.</td><td>WebSocket (rejected: TCP HoL stalls strokes); WebRTC (rejected: SFU/TURN ops complexity for relay-only).</td></tr>
+    <tr><td>WebSocket (committed ops)</td><td>The canonical stroke-end and shape-op need ordered, reliable delivery. WebSocket over TLS is the right tool for the durable path; we run it side-by-side with WebTransport so committed state is never lost while streaming stays lossy-fast.</td><td>WebTransport reliable streams (viable; redundant given we already need WS for browser fallback); HTTP/2 server push (rejected: no client→server reliable channel).</td></tr>
+    <tr><td>ScyllaDB (op log)</td><td>Write-heavy: 33 MB/s persisted ops with bursts during workshops. Scylla's shard-per-core architecture hits ~1 M ops/s/cluster at &lt; $100/TB/mo, far cheaper than Spanner. We don't need multi-key txns — each op is independent.</td><td>Spanner (rejected: 5× cost, latency overhead unnecessary); Cassandra (rejected: same model, Scylla 5–10× faster on same hardware).</td></tr>
+    <tr><td>Bucketed partitioning (board_id, bucket)</td><td>Long-lived boards would create unbounded partitions (Scylla's pain point). Bucketing by ts/3600 keeps partitions to ~hour-sized, capping any single partition at &lt; 100 MB and avoiding hot-row compaction stalls.</td><td>Single (board_id) partition (rejected: unbounded growth); per-day buckets (rejected: too coarse for hot boards).</td></tr>
+    <tr><td>Redis Streams (cursor relay)</td><td>240 MB/s aggregate of cursor pings, ephemeral, sub-50 ms latency required. Redis Streams gives consumer groups for edge fan-out, automatic backpressure via XADD MAXLEN, and zero persistence cost — we throw away history.</td><td>Kafka (rejected: 5–10 ms publish latency too high); NATS (viable; chose Redis for shared infra reuse).</td></tr>
+    <tr><td>S3 (snapshots + image embeds)</td><td>500 TB total, 100 M boards. S3 at 11 9s is the only sane target for "boards from 2018 still load." Snapshot every 5,000 ops keeps S3 GET p99 (50–80 ms) on the cold path off the hot 50 ms render-echo budget.</td><td>HDFS (rejected: ops cost); GCS (viable; chose S3 for AWS PoP overlap).</td></tr>
+    <tr><td>Single board actor (Rust/Go)</td><td>Per-board ordering of CRDT ops requires one writer. A Rust actor saturates at ~10k shape-ops/s, which exceeds our 200-editor cap by 50×. No GC pauses keep p99 stroke-render echo under 50 ms.</td><td>Multi-writer + CRDT merge (viable but complicates op log layout); Go (rejected: GC pauses on 200-editor hot boards).</td></tr>
+    <tr><td>Fractional indexing (z-order)</td><td>"Bring to front" is max(z) + 1, "send between" is midpoint — no global reordering. With ~50 K shapes per board, integer z-rewrites would cause write storms; fractional cuts that to a single shape update.</td><td>Integer z-index (rejected: write amplification on reorder); linked-list z (rejected: O(n) traversal for render).</td></tr>
+    <tr><td>R-tree spatial index (client)</td><td>Boards with 100k shapes can't render fully on screen. Client-side R-tree gives O(log n) viewport queries, rendering only ~500 visible shapes per frame at 60 fps even on the 200 MB p99 board.</td><td>Linear scan (rejected: 5+ ms per frame at 100k shapes); quadtree (viable; R-tree better for arbitrary-aspect rectangles).</td></tr>
+    <tr><td>etcd (board-actor lease)</td><td>Single-writer requires a fencing lease so a stale actor can't append after partition. etcd's lease + revision number gives a 2 s replay-and-resume window with no split-brain risk.</td><td>Redis Redlock (rejected: not consensus-grade); ZooKeeper (rejected: heavier ops).</td></tr>
+    <tr><td>Vector-clock tombstone GC</td><td>Boards live for years; without GC the Y.Map balloons with deleted-shape tombstones, hitting our 1.5 GB RAM mobile limit. Per-peer vector-clock tracking lets us drop tombstones older than the slowest acked clock — bounded RAM, infinite history.</td><td>No GC (rejected: unloadable boards after a year); time-based purge (rejected: breaks long-offline merge).</td></tr>
+    <tr><td>Delta + quantize point encoding</td><td>Each stroke point is 16 B raw at 60 Hz. Quantizing to 0.1 px and delta-encoding shrinks ~5× to ~3 B/point on the wire, cutting our 50 MB/s in-flight bandwidth to ~10 MB/s without visible quality loss.</td><td>Float32 raw (rejected: 4× wire cost); Bezier-fit (rejected: CPU cost on phone clients).</td></tr>
+  </tbody>
+</table>

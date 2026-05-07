@@ -1,0 +1,129 @@
+<h1>Design Google Web Search (crawler + indexer + serving)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">search</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a planet-scale web search engine: crawl ~100B unique URLs on the open web, build a fresh inverted index that covers tens of trillions of postings, and serve ~100B queries per month at sub-300 ms p99 with relevance that matches a senior IR system. The system must keep the index reasonably fresh (minutes for news, days for the long tail) and survive the inevitable spam, soft-404s, infinite calendars, and adversarial SEO.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Crawl: discover, fetch, and re-fetch HTML across the public web while respecting <code>robots.txt</code> and politeness windows.</li>
+  <li>Parse and normalize: extract anchor text, links, titles, structured data, language, charset.</li>
+  <li>Build an inverted index keyed on normalized terms with positions and per-document features (PageRank, freshness, anchor weights).</li>
+  <li>Serve keyword + phrase + filter queries with ranking (BM25 + LTR + freshness signals).</li>
+  <li>Snippets, spellcheck/did-you-mean, autocomplete, knowledge panels.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 ~120 ms, p99 &lt; 300 ms end-to-end including snippet generation.</li>
+  <li><b>Scale:</b> ~100B queries/month (~38 K QPS avg, ~150 K QPS peak), ~100B URLs crawled, ~10T postings.</li>
+  <li><b>Freshness:</b> news indexed in &lt; 5 min; long-tail re-crawl &lt; 30 days.</li>
+  <li><b>Availability:</b> 99.99% serving; crawler may degrade gracefully.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 100B/month / 2.6M sec ≈ 38 K avg, 150 K peak. Each query fans out to ~50 index shards.</li>
+  <li>Storage: 100B docs × 50 KB compressed HTML ≈ 5 PB raw; inverted index ~1–2 PB after compression.</li>
+  <li>Crawl: 100B URLs / 30 days ≈ 38 K fetches/sec sustained; 5 PB/month egress on the crawl fleet.</li>
+  <li>Index shards: 50 KB postings × 100B docs / 1B postings per shard ≈ 5 K serving shards, 3 replicas → 15 K serving nodes.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET  /search?q=...&amp;hl=en&amp;num=10            → results, snippets, related
+GET  /complete?q=...                         → autocomplete suggestions
+POST /crawl/seed   {urls[]}                  → enqueue seeds (internal)
+GET  /index/doc/{docId}                      → forward doc record (internal)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Seeds] -> [URL Frontier]--politeness/robots--> [Crawler Fleet] -> [Raw HTML Store/GFS]
+                                                       |
+                                                       v
+                                       [Parser/Linker] -> [Link Graph (PageRank job)]
+                                                       |
+                                                       v
+                                       [MapReduce Indexer] -> [Inverted Index Shards]
+                                                                       |
+[User] -> [Edge/GFE] -> [Query Mixer] -> [Index Servers x N shards] -> [Doc Servers] -> [Snippet]
+                                  |-> [Spell] [Autocomplete] [Knowledge]
+</div>
+<p>Walk-through: the Mixer fans a query out to every index shard, each returns top-K doc IDs with feature vectors, the Mixer merges, calls Doc Servers for snippets, and the LTR ranker reorders.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Forward doc record (Bigtable / GFS)</h3>
+<pre>row_key   = fingerprint(url)
+columns   = content:html, meta:title, meta:lang, links:out[], rank:pagerank,
+            crawl:last_fetch, crawl:etag, crawl:status</pre>
+<h3>7.2 Inverted index (per shard, on local SSD)</h3>
+<pre>term -> { df, postings: [(docId, tf, positions[], field_mask, score_hint)] }
+        -> skip lists every 128 postings, delta+varint encoded</pre>
+<h3>7.3 Why this split?</h3>
+<p>Forward store is write-heavy and immutable per crawl; Bigtable's LSM matches that pattern (DDIA Ch. 3 — log-structured storage engines). Inverted shards are read-mostly, mmap'd, rebuilt offline, and swapped atomically.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Crawler &amp; URL frontier</h3>
+<p>Frontier is partitioned by registrable domain so politeness is local to one worker. Each domain has a token bucket (e.g., 1 req/sec by default, overridden by Crawl-Delay). Per-URL priority = f(PageRank, change-rate, freshness debt). Bloom filter (~1% FP) gates "have we seen this URL".</p>
+<h3>8.2 Indexer (offline, batch)</h3>
+<p>Classic MapReduce: map over forward docs emitting (term, posting); reduce sorts and writes per-shard segment files. Re-indexing the whole web is a multi-day batch job; incremental updates ride a real-time path that builds small in-memory segments and merges them log-structured-style (DDIA Ch. 10 — batch processing for the bulk job, Ch. 11 — stream processing for fresh-tier).</p>
+<h3>8.3 Serving</h3>
+<p>Two-tier: cheap candidate generation per shard (BM25 + static rank cutoff to top 1 K), then a heavier LTR model on the merged ~10 K candidates. Snippet generation reads the forward doc and highlights matched terms; capped at 30 ms.</p>
+<h3>8.4 Freshness pipeline</h3>
+<p>News and trending URLs go through a low-latency path: Pub/Sub → near-real-time indexer → small "fresh" shards queried in parallel with the main index and merged at the Mixer.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Tail latency:</b> shard fan-out of 50 means p99 of any shard becomes p~p50 of the query — use hedged requests after p95.</li>
+  <li><b>Hot terms ("the"):</b> truncate impact lists, use static rank early termination (WAND/BMW).</li>
+  <li><b>Crawl traps:</b> per-host budgets, content-hash dedup, URL canonicalization.</li>
+  <li><b>Index size:</b> compress with delta + varint + Roaring bitmaps; tier cold shards on slower storage.</li>
+  <li><b>Spam:</b> separate ranking signals trained on labeled spam; demote at LTR stage.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Document-partitioned index (vs term-partitioned)</td><td>Each shard is self-contained; easy to rebuild/replicate</td><td>Every query fans out to all shards</td></tr>
+<tr><td>Batch full re-index + small fresh tier</td><td>Bulk path is simple and cache-friendly</td><td>Two code paths; merge logic at Mixer</td></tr>
+<tr><td>BM25 candidates → LTR rerank</td><td>Cheap recall + expressive ranking</td><td>Two models to maintain; feature drift</td></tr>
+<tr><td>Bigtable forward store</td><td>Massive scale, schema flexible</td><td>No secondary indexes; range scans only by row key</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage and Retrieval — LSM/SSTables underpin both Bigtable and the inverted index segments.</li>
+  <li>Ch. 6 Partitioning — document-based partitioning of the inverted index and rebalancing strategy.</li>
+  <li>Ch. 10 Batch Processing — MapReduce for the bulk crawl→index pipeline and PageRank.</li>
+  <li>Ch. 11 Stream Processing — fresh-tier indexer fed by Pub/Sub for news.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I would deliberately separate the bulk and fresh paths because their SLOs differ by three orders of magnitude."</li>
+  <li>"The tail-latency problem from 50-way fan-out is the silent killer; hedged requests and WAND are the levers I'd pull first."</li>
+  <li>"Crawl politeness and frontier partitioning are usually under-discussed; they're where most real-world failures happen."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Bigtable / GFS (forward doc store)</td><td>Stores 100 B docs at ~50 KB each = 5 PB of write-once HTML; LSM matches the append-mostly crawl pattern, row-key fingerprint(url) gives O(1) lookup, and column families let us evolve crawl/meta/links independently without rewriting petabytes.</td><td>HBase (operationally heavier at this scale); Cassandra (no native column-family scans); plain HDFS files (no random row lookup for 100 B keys).</td></tr>
+    <tr><td>Lucene-style inverted index segments</td><td>~10 T postings compressed via delta + varint into ~1 PB across 5 K shards × 1 B postings/shard; mmap segment files give zero-copy reads at &lt;5 ms per shard, and immutable segments enable atomic rebuild-and-swap.</td><td>Postgres GIN (no shard fan-out at PB scale); building on raw RocksDB (would re-implement skip lists + scoring).</td></tr>
+    <tr><td>FST (term dictionary)</td><td>Stores tens of billions of unique terms in ~6 bytes/term, an order of magnitude smaller than a hash map; supports prefix iteration for query expansion and intersects cleanly with Levenshtein automata for fuzzy match.</td><td>Hash map of term→postings (3–5× memory); B-tree (pointer chasing kills cache locality).</td></tr>
+    <tr><td>MapReduce (bulk indexer)</td><td>Re-indexing 100 B docs is fundamentally an embarrassingly parallel sort: map emits (term,posting), reduce sorts/writes per-shard segments. The job runs for ~24 h on ~10 K mappers and is restartable, which matters when crashes are routine.</td><td>Spark (better dev ergonomics but higher per-node memory and weaker disk-shuffle scheduling for PB-shuffle); custom MPI (no fault tolerance).</td></tr>
+    <tr><td>Spark (PageRank, link graph)</td><td>PageRank needs ~30 iterations over a 100 B-edge graph; Spark's RDD caching avoids re-reading 5 PB on each iteration, cutting wall-time from days to ~6 h on a 1 K-node cluster.</td><td>MapReduce iterative (re-shuffles every iteration, 5–10× slower); Pregel/Giraph (operationally rare).</td></tr>
+    <tr><td>Kafka / Pub/Sub (fresh-tier ingestion)</td><td>News URLs need to be indexed in &lt;5 min; a 100 K-msg/s durable log buffers crawl-to-index hand-off, decouples crawler bursts from the NRT indexer, and provides replay for backfill.</td><td>RabbitMQ (no rewindable log at 100 K msg/s sustained); direct RPC (no replay, brittle backpressure).</td></tr>
+    <tr><td>Flink (real-time spam &amp; trending signals)</td><td>Computes 5-minute tumbling counts over the click+query stream at 150 K events/s with exactly-once semantics — needed because click-CTR drives the LTR features and double-counting biases ranking.</td><td>Spark Streaming (mini-batch latency 30 s+, no event-time windowing); Storm (no built-in state backend).</td></tr>
+    <tr><td>GBDT / LambdaMART (LTR L2 reranker)</td><td>~500 trees × depth 8 over 200 features score 10 K candidates in &lt;30 ms on one core via SIMD; pairwise NDCG loss directly optimizes the metric we care about, and feature contributions are explainable for debugging quality regressions.</td><td>Logistic regression (under-fits non-linear interactions); pure DNN (10–100× slower without distillation).</td></tr>
+    <tr><td>Bloom filter (URL frontier dedup)</td><td>Tracks "have we seen this URL" for 100 B URLs; at 1 % FP it costs ~120 GB of RAM total (~10 bits/URL) versus ~2 TB for an exact set, and false positives only mean we skip a fresh-but-already-seen URL — acceptable.</td><td>Cuckoo filter (slightly better but harder to merge across crawl shards); exact set in RocksDB (disk lookup per URL kills crawl rate).</td></tr>
+    <tr><td>WAND / Block-Max WAND (early termination)</td><td>For hot terms like "the" with billions of postings, WAND prunes &gt;90 % of postings using upper-bound scores, keeping per-shard query latency at ~30 ms regardless of term frequency.</td><td>Full-postings scan (10× slower on common terms); static caching of top-K per term (memory blowup, stale scores).</td></tr>
+    <tr><td>Roaring bitmaps (filter sets)</td><td>For boolean filters (lang, country, safe-search) over billion-doc shards, Roaring runs AND/OR at &gt;1 GB/s with 5–10× space savings vs uncompressed bitmaps.</td><td>Plain bitsets (4× memory); compressed-skip-list intersect (slower AND).</td></tr>
+    <tr><td>gRPC + hedged requests (Mixer→shards)</td><td>50-way fan-out means p99 of any one shard becomes the query's p~50; hedged requests fired after p95 cut tail latency by ~3×, which is the difference between a 300 ms and 900 ms p99.</td><td>HTTP/1.1 (no multiplexing); fire-and-cancel without hedging (no tail mitigation).</td></tr>
+  </tbody>
+</table>

@@ -1,0 +1,180 @@
+<h1>Design Datadog-style Metrics Pipeline (ingest &rarr; tsdb &rarr; dashboards)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a SaaS observability platform like Datadog that accepts numerical time-series metrics from hundreds of thousands of customer hosts, stores them in a purpose-built TSDB, evaluates alert rules in near-real-time, and renders dashboards over arbitrary time ranges (1 minute to 15 months). Datadog publicly reports ingesting on the order of <b>trillions of metric data points per day</b> across millions of hosts, so the design must be horizontally scalable and economically viable at petabyte scale.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Ingest metrics via a StatsD-compatible agent (counters, gauges, histograms, distributions) and via API push.</li>
+  <li>Tag-based dimensional model: <code>web.req.latency{env=prod, region=us-east-1, host=h-42}</code>.</li>
+  <li>Query API supporting filters, group-by, rollups (avg, p99, sum) over arbitrary windows.</li>
+  <li>Alerting: evaluate rules every 10s, trigger via PagerDuty/Slack.</li>
+  <li>Multi-tenant isolation, retention tiers (15s for 24h, 1m for 30d, 1h for 15mo).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Ingest latency:</b> point lands in queryable storage in &lt; 10s p99.</li>
+  <li><b>Query latency:</b> dashboard panel returns in &lt; 500 ms p99 for 1-day windows.</li>
+  <li><b>Scale:</b> 5T points/day, 50M unique series active, 200K agents.</li>
+  <li><b>Durability:</b> 99.999% (no silently dropped points).</li>
+  <li><b>Availability:</b> 99.95% query, 99.9% alerting.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS ingest: 5e12 / 86400 &asymp; <b>58M points/sec</b> globally; per region ~10M pps.</li>
+  <li>Wire size: ~25 B compressed per point &rarr; ~125 GB/s &rarr; ~10 PB/day raw, ~1 PB/day after Gorilla compression (10&times; per Facebook's paper).</li>
+  <li>Series cardinality: 50M active * 16 B series-id = 800 MB hot index per shard.</li>
+  <li>Query fan-out: dashboard with 30 panels &rarr; 30 parallel queries &rarr; each touches ~6 shards.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /api/v1/series          { series:[{metric, points:[[ts,v]], tags}] }
+GET   /api/v1/query?from=&amp;to=&amp;query=avg:web.req.latency{env:prod}by{host}
+POST  /api/v1/monitor         { query, threshold, window, notify }
+GET   /api/v1/dashboard/{id}                               &rarr; panels
+</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Agent (statsd)] -- HTTPS --&gt; [Edge Ingest LB]
+                                    |
+                                    v
+                        [Intake Svc] --&gt; [Kafka: metrics-raw, 1024 parts]
+                                                 |
+                       +-------------------------+-------------------+
+                       v                         v                   v
+              [Rollup Worker]          [Alert Evaluator]      [Indexer (tag KV)]
+                       |                         |                   |
+                       v                         v                   v
+              [TSDB shards (Gorilla)]     [Rule state RocksDB]  [Cardinality svc]
+                       ^
+                       |
+                 [Query Frontend] &lt;-- [Dashboards / API users]
+</div>
+<p>Agents batch every 10s, ship to the nearest region. The intake service authenticates, enriches with tenant ID, and produces to Kafka partitioned by <code>(tenant, metric_hash)</code>. Rollup workers consume, write the 15-second resolution to the TSDB, and emit downsampled 1m/1h streams. A separate alert evaluator consumes the same topic so alerting is decoupled from storage availability (DDIA Ch. 11 — stream consumers reading the same log).</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 TSDB shard layout</h3>
+<pre>Series-ID = murmur3(metric || sorted(tags))    // 64-bit
+Block file: per-shard, 2-hour blocks
+  +-- chunks[ ]   Gorilla-compressed (XOR + delta-of-delta on ts)
+  +-- index       postings: tag=value -&gt; [series-id...]
+  +-- meta        min_ts, max_ts, series count
+</pre>
+<h3>7.2 Why a custom TSDB?</h3>
+<p>Generic OLTP DBs fail because every point is an append, points are immutable, and reads scan billions of values. Gorilla's bit-packed format averages ~1.4 B/point, a 10&times; reduction over raw doubles. We borrow Prometheus/M3DB's inverted index for tag lookups — DDIA Ch. 3 secondary index discussion applies here.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Cardinality control</h3>
+<p>The killer failure mode is high-cardinality tags (e.g., <code>user_id</code>). The intake service maintains a per-tenant Bloom + count-min over series-IDs and rejects new series after a threshold (e.g., 1M unique series/metric). This protects neighboring tenants from one bad customer.</p>
+<h3>8.2 Query frontend</h3>
+<p>Two-tier fan-out: frontend splits the time range into 2-hour blocks, dispatches sub-queries to the owning shards, and merges. A "split-and-cache" layer (similar to Cortex) memoizes immutable old blocks in Redis for 24h.</p>
+<h3>8.3 Alerting</h3>
+<p>Each rule is sharded by hash(rule_id) onto evaluator nodes. State (last-fired, hysteresis) is kept in embedded RocksDB and replicated via Raft for HA — DDIA Ch. 9 quorum trade-off.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot tenants:</b> rebalance Kafka partitions hourly using consistent hashing with bounded loads.</li>
+  <li><b>Tag-explosion:</b> auto-quarantine offending metric, alert customer, throttle.</li>
+  <li><b>Long range queries (15mo):</b> served exclusively from 1h rollup tier in S3/Parquet.</li>
+  <li><b>Backfill:</b> rollup workers checkpoint Kafka offsets in ZooKeeper; on lag &gt; 5 min, autoscale.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Custom Gorilla TSDB vs. Cassandra</td><td>10&times; storage savings, 100&times; query speed</td><td>In-house engineering investment</td></tr>
+<tr><td>Push (agent) vs. pull (Prometheus)</td><td>Works behind NAT, no service discovery in customer cloud</td><td>Agent must be authenticated and rate-limited</td></tr>
+<tr><td>Same Kafka topic for storage + alerts</td><td>One source of truth, replayable</td><td>Slow consumer can pile up retention</td></tr>
+<tr><td>Lossy downsampling for &gt;30d</td><td>Cheap storage</td><td>Cannot reconstruct rare events</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 11 Stream Processing</b> — Kafka as the unbundled log; multiple independent consumers (rollup, alert, indexer) is the canonical pattern. Watermarks/event-time vs. processing-time matter for late-arriving agent data.</li>
+  <li><b>Ch. 10 Batch Processing</b> — nightly compaction of 2h blocks into day-blocks, and 1m&rarr;1h rollups, are textbook MapReduce-style batch jobs over immutable inputs.</li>
+  <li><b>Ch. 3 Storage and Retrieval</b> — LSM/SSTable principles directly inform 2-hour immutable blocks; inverted postings list mirrors Lucene.</li>
+  <li><b>Ch. 9 Consistency &amp; Consensus</b> — Raft for alert evaluator state; "at-least-once" delivery means alerts must be idempotent.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"At trillions of points/day the dominant cost is storage, so I'd lead with the Gorilla compression decision and only then talk about query."</li>
+  <li>"The hardest real-world problem is cardinality explosion from a single bad <code>user_id</code> tag — I'd build the rejector before I built the dashboard."</li>
+  <li>"I'd treat alerting as a Kafka consumer not a DB query so a TSDB outage never silences pages."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Gorilla TSDB compression (delta-of-delta + XOR)</td>
+      <td>At trillions of points/day, raw 16-byte (ts, val) tuples cost ~16 PB/day. Gorilla's delta-of-delta on monotonic timestamps and XOR on slowly-changing floats compresses to ~1.37 bytes/point, an &gt;10&times; reduction that turns a $50M/yr storage bill into a $5M one.</td>
+      <td>Snappy/LZ4 (general-purpose, ~3&times; only); gzip (CPU-heavy, kills ingest at 10M points/sec)</td>
+    </tr>
+    <tr>
+      <td>2-hour immutable in-memory blocks (Prometheus TSDB style)</td>
+      <td>Recent points are queried 100&times; more than old ones; keeping 2h hot in RAM serves p99 dashboard reads in &lt;50 ms across trillions of points/day. Immutability lets us ship blocks to object storage without locks and rebuild indexes offline.</td>
+      <td>B-tree on disk (random IO crushes ingest); always-RAM (cost-prohibitive past 24h)</td>
+    </tr>
+    <tr>
+      <td>Inverted index on label pairs (Lucene-style postings)</td>
+      <td>Queries like <code>cpu{env=prod,region=us-east}</code> at trillion-point scale must resolve to series IDs in &lt;5 ms. Postings lists per <code>k=v</code> intersected via roaring bitmaps are the only structure that scales to 100M+ active series per cluster.</td>
+      <td>Full-table scan (impossible at this cardinality); B-tree on (k,v) (no efficient AND across labels)</td>
+    </tr>
+    <tr>
+      <td>Cardinality rejector at ingest</td>
+      <td>One bad <code>user_id</code> tag can balloon series count from 10M to 1B in minutes and OOM the entire fleet. A pre-write Bloom-backed cardinality limiter per tenant is mandatory at trillions of points/day; it must run before the inverted index ever sees the label set.</td>
+      <td>Post-hoc cleanup (cluster already crashed); per-query limits (too late, write path is dead)</td>
+    </tr>
+    <tr>
+      <td>Kafka as ingest log (separate topic per shard)</td>
+      <td>Decouples 10M points/sec write spike from TSDB compaction. Lets alert evaluator, downsampler, and storage write all consume independently; a TSDB outage doesn't silence pages because alerts read Kafka, not the DB.</td>
+      <td>Direct gRPC to TSDB (back-pressure pushes to agents); RabbitMQ (no replay, ordering weak)</td>
+    </tr>
+    <tr>
+      <td>Object storage (S3) for blocks &gt; 2h</td>
+      <td>$23/TB/month vs. $80/TB on local SSD; at multi-PB scale this saves &gt;$10M/yr. 2-hour immutable blocks are perfect for object stores: write-once, read-many, range-GET friendly.</td>
+      <td>HDFS (operational burden); local SSD (10&times; cost); Glacier (retrieval latency kills queries)</td>
+    </tr>
+    <tr>
+      <td>Downsampling pipeline (1m &rarr; 5m &rarr; 1h rollups)</td>
+      <td>A year of 1-second resolution per series is 31M points; downsampled to 1h it's 8.7K points (3500&times; smaller). Long-range dashboards (30d, 1y) read the rollup tier, keeping query latency flat regardless of retention.</td>
+      <td>Query-time aggregation only (slow at 1y range); fixed retention (loses long-term signal)</td>
+    </tr>
+    <tr>
+      <td>Raft for alert evaluator state</td>
+      <td>"Is alert X currently firing?" must be consistent across replicas or PagerDuty gets duplicate or lost pages. Raft on a small alert-state group (~1 KB per alert) is cheap and gives linearizable reads at the rate alerts evaluate (~1k/sec).</td>
+      <td>Single leader (SPOF); eventual consistency in DynamoDB (causes alert flapping)</td>
+    </tr>
+    <tr>
+      <td>Consistent hashing for series &rarr; shard</td>
+      <td>At 100M+ active series, re-sharding on every node add/remove is a non-starter. Consistent hashing on <code>hash(metric+labels)</code> moves only 1/N of the keyspace per topology change, so we can scale ingest from 100 to 1000 nodes without ingestion stall.</td>
+      <td>Modulo hashing (full reshuffle); range partitioning (hot shards on popular metrics)</td>
+    </tr>
+    <tr>
+      <td>PromQL-compatible query layer</td>
+      <td>Engineers already know PromQL; a custom DSL would block adoption. PromQL's vector/matrix model maps naturally to the (series &rarr; timeseries) layout and lets us reuse Grafana out of the box.</td>
+      <td>SQL on TSDB (subqueries clumsy for rate/irate); custom JSON DSL (zero ecosystem)</td>
+    </tr>
+    <tr>
+      <td>RoaringBitmap for label-set intersection</td>
+      <td>Postings lists for popular labels (e.g. <code>env=prod</code>) hold 50M+ series IDs. Roaring's hybrid array/bitmap containers compress sparse and dense ranges, doing AND across 4-label queries in &lt;1 ms versus 50+ ms for sorted-array intersection.</td>
+      <td>Sorted int arrays (slow AND); plain bitmaps (memory blowup on sparse postings)</td>
+    </tr>
+    <tr>
+      <td>WAL on local NVMe before in-memory block</td>
+      <td>A node crash 1h into a 2h block would lose 600M points. A simple append-only WAL on NVMe (1 GB/sec write) makes recovery deterministic and lets us ack writes durably within 5 ms p99.</td>
+      <td>Replicate in-memory only (loses on dual-failure); fsync on every point (kills throughput)</td>
+    </tr>
+  </tbody>
+</table>

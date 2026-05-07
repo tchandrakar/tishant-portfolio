@@ -1,0 +1,207 @@
+<h1>Design Distributed Session Store (sticky vs shared, eviction, TTL)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a session store for a global web platform with 200M MAU and 20M concurrent sessions. The store must serve session reads in sub-ms, persist auth state across pod restarts, support sliding TTL, sign tokens to prevent forgery, and survive a single-AZ failure. Compare sticky-LB sessions, shared-cache sessions, and stateless JWTs and pick a hybrid.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>create(userId, deviceId, scopes) → sessionId, refreshToken.</li>
+  <li>get(sessionId) → {userId, exp, scopes, csrf}; sliding window TTL.</li>
+  <li>revoke(sessionId | userId | deviceId).</li>
+  <li>List active sessions per user; force-logout-all.</li>
+  <li>Multi-region read-anywhere with eventual consistency on revocation.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 200 us, p99 1 ms read; create/refresh p99 5 ms.</li>
+  <li><b>Throughput:</b> 500k reads/sec, 20k writes/sec (every page-view rolls TTL).</li>
+  <li><b>Availability:</b> 99.99% — session store outage must not log everyone out.</li>
+  <li><b>Durability:</b> revoke must propagate within 5s globally.</li>
+  <li><b>Memory:</b> 20M sessions * 1 KB = 20 GB resident.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>500k QPS / 100k QPS-per-Redis-shard = 6 shards minimum; over-provision to 12 across 3 AZs.</li>
+  <li>Write amplification: every page-view extends TTL → 20k writes/s * 2 replicas = 40k phys writes/s.</li>
+  <li>Refresh-token DB: 20M * 200 B = 4 GB in MySQL/Postgres + replicas.</li>
+  <li>Cross-region replication bandwidth: 20k writes/s * 1 KB = 20 MB/s; trivial.</li>
+  <li>JWT alternative: 1 KB token sent every request * 50k req/s/region = 50 MB/s ingress overhead.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/sessions      {userId, deviceId, scopes}    → {sid, refresh, exp}
+GET  /v1/sessions/{sid}                               → {userId, scopes, exp}
+POST /v1/sessions/{sid}/refresh {refresh}             → {sid, refresh, exp}
+DELETE /v1/sessions/{sid}                             → 204
+DELETE /v1/users/{u}/sessions  ?reason=password_reset → 204
+GET  /v1/users/{u}/sessions                            → [{sid, ua, geo, lastSeen}]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[client] ── cookie sid ──►[L7 LB]──►[stateless app pods]
+                                          │
+                                          ▼
+                            ┌────────── Redis (per-region) ──────────┐
+                            │  primary  ──async repl──► replica(AZ2) │
+                            │  cluster of 12 shards, 3 replicas/shard│
+                            └─────────────┬──────────────────────────┘
+                                          │ change-stream
+                                          ▼
+                              [Kafka revocation topic]──►other regions
+                                          │
+                                          ▼
+                       [Refresh-token DB (Postgres) — durable record]
+</div>
+<p>App pods are stateless. Session ID is an opaque random 128-bit token in an HttpOnly cookie. Read-path: cookie → Redis GET. Write-path (login/refresh): write to Redis + durable Postgres for refresh tokens. Revocations broadcast via Kafka so all regions invalidate within seconds.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Redis session record</h3>
+<pre>HSET sess:{sid} userId 42 scopes "read,write" csrf abc123 exp 1714903600
+PEXPIRE sess:{sid} 1800000      # 30 min sliding
+SADD user:42:sessions sid
+ZADD revoked:bloom &lt;ts&gt; sid     # short-term denylist for rotated sessions</pre>
+<h3>7.2 Postgres durable record</h3>
+<pre>CREATE TABLE refresh_tokens (
+  token_hash bytea PRIMARY KEY,
+  user_id bigint, device_id text,
+  created_at timestamptz, expires_at timestamptz,
+  revoked_at timestamptz NULL,
+  rotated_to bytea NULL  -- for token rotation chain
+);</pre>
+<p>Refresh tokens are durable for audit + revocation. Hash with SHA-256; never store plaintext (DDIA Ch.12 — security principles).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Sticky vs shared vs JWT</h3>
+<table>
+<thead><tr><th>Mode</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Sticky LB</td><td>In-process cache, zero hops</td><td>Pod loss = logout; uneven load</td></tr>
+<tr><td>Shared cache (Redis)</td><td>Pods stateless, easy revoke</td><td>Cache outage = global logout</td></tr>
+<tr><td>Stateless JWT</td><td>No store reads, scales free</td><td>Revoke is hard; JWT bloat in cookies</td></tr>
+</tbody>
+</table>
+<p><b>Hybrid:</b> short-lived signed JWT (5 min) + opaque refresh token in Redis. Most reads are JWT signature checks (no I/O). Revoke uses denylist + short JWT TTL bound. This is the "best of both" pattern.</p>
+<h3>8.2 Sliding TTL</h3>
+<p>On every authenticated request, app calls <code>EXPIRE sess:{sid} 1800</code> (Redis O(1)). To avoid 500k EXPIRE/s, batch: only refresh if remaining TTL &lt; 50% (probabilistic). Cuts writes 5x with no UX impact.</p>
+<h3>8.3 Eviction policy</h3>
+<p>Redis maxmemory-policy <code>volatile-lru</code> evicts the least-recently-used keys with TTL — perfect for sessions. Avoid <code>allkeys-lru</code> to protect non-session keys. Set <code>maxmemory</code> to ~80% RAM.</p>
+<h3>8.4 Revocation propagation</h3>
+<p>Local revoke = DEL in Redis + insert into Kafka topic. All regions consume and DEL their copies. JWTs use a short denylist of revoked-token JTIs (24h max), checked on the auth path. Bounded size since JWTs auto-expire.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot user (celebrity logged in many devices):</b> store SADD user-sessions; cap 1k devices/user.</li>
+  <li><b>Login storm after outage:</b> rate-limit /sessions; warm Redis with replicas; pre-shard by userId.</li>
+  <li><b>Cross-region read-after-write:</b> session created in region A, read in region B 20 ms later → may miss. Mitigation: write-through to global Redis active-active (Redis Enterprise CRDB) for tier-1 routes only.</li>
+  <li><b>Cookie size:</b> opaque 128-bit ids beat JWT for cookie hygiene; minimize Set-Cookie traffic.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Opaque token + Redis</td><td>Easy revoke, small cookie</td><td>Network hop per request (mitigated by L1 cache)</td></tr>
+<tr><td>JWT + refresh hybrid</td><td>Most reads are local CPU verify</td><td>Up to 5 min revoke window</td></tr>
+<tr><td>volatile-lru eviction</td><td>Predictable memory bound</td><td>Active users may be evicted under DDoS</td></tr>
+<tr><td>Async cross-region revoke</td><td>Cheap, scales</td><td>Up to 5s window for revoked sessions to honor (DDIA Ch.5 lag)</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch.3 Storage and Retrieval — in-memory hash map, LRU eviction discussed for caches.</li>
+  <li>Ch.5 Replication — async leader-follower for Redis; CRDB for active-active; revocation lag.</li>
+  <li>Ch.6 Partitioning — partition by sessionId (hash) and secondary by userId for "list all sessions".</li>
+  <li>Ch.8 Trouble — graceful degrade when session store is unreachable.</li>
+  <li>Ch.9 Consistency — read-your-writes after login requires sticky reads to primary.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd ship the JWT+refresh hybrid: it's auditable, revocable within 5 min, and removes one Redis hop from 95% of traffic."</li>
+  <li>"For payments and admin endpoints I'd force opaque-session reads with a stricter denylist — defense in depth."</li>
+  <li>"The trickiest tradeoff is read-your-writes after login across regions; I'd cookie-pin to the login region for 60s to avoid 'why am I logged out' bug reports."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Redis cluster (12 shards, 3 replicas/shard)</td>
+      <td>Sub-ms p50 GET hits the 200us session-read SLA; 12 shards give 1.2M ops/s headroom over the 500k QPS target. 3 replicas survive AZ loss without forcing global logout — the most user-visible failure mode (DDIA Ch.5 single-leader async replication).</td>
+      <td>Memcached (no replication = full logout on node loss); DynamoDB (5-10ms latency too slow).</td>
+    </tr>
+    <tr>
+      <td>Opaque 128-bit session ID</td>
+      <td>Random token in HttpOnly cookie is unforgeable, fixed-size (16 B encoded), and revocable by single Redis DEL. Compare to JWT which bloats cookies to 1KB+ and is non-revocable without an extra denylist hop. Best cookie hygiene at scale.</td>
+      <td>JWT-only (revocation hard); UUID v4 string (longer cookie); hash-of-userId (predictable).</td>
+    </tr>
+    <tr>
+      <td>JWT + opaque hybrid</td>
+      <td>Short-lived (5 min) signed JWT carries claims so 95% of reads avoid Redis entirely (CPU verify only). Refresh via opaque token in Redis happens once per 5 min — cuts session reads from 500k/s to ~100k/s while keeping revoke window bounded.</td>
+      <td>Pure JWT (no revoke); pure opaque (Redis hop on every request); Macaroons (overkill, complex).</td>
+    </tr>
+    <tr>
+      <td>Postgres for refresh tokens</td>
+      <td>Refresh tokens need durable audit + revocation history (token_hash, rotated_to chain) — 4 GB fits comfortably in Postgres with replicas. ACID transactions matter for rotation: old token invalidated and new one issued atomically (DDIA Ch.7).</td>
+      <td>Redis-only (no audit trail); MySQL (similar but Postgres has better partial indexes for revoked_at).</td>
+    </tr>
+    <tr>
+      <td>SHA-256 hashed token storage</td>
+      <td>Plaintext tokens in DB = breach exposes all sessions. SHA-256 hash is cheap (1 us) and one-way; rotated_to chain references hashes so audit trail is rebuildable. Defense in depth (DDIA Ch.12 security principles).</td>
+      <td>Plaintext (catastrophic on breach); bcrypt (slow, unnecessary for high-entropy random tokens).</td>
+    </tr>
+    <tr>
+      <td>HttpOnly + Secure + SameSite=Lax cookies</td>
+      <td>HttpOnly blocks JS access (XSS can't steal); Secure forces HTTPS; SameSite=Lax mitigates CSRF on state-changing routes. The minimum bar for a session cookie at 200M MAU — anything less is a CVE waiting to happen.</td>
+      <td>localStorage (XSS-readable); SameSite=Strict (breaks OAuth redirects).</td>
+    </tr>
+    <tr>
+      <td>Sliding TTL via probabilistic EXPIRE</td>
+      <td>Naive every-request EXPIRE = 500k writes/s → 5x cluster overhead. Refreshing only when remaining TTL &lt;50% (probabilistic) cuts writes to 100k/s with no UX impact since nobody notices a session that re-extended at 16 min vs 14 min.</td>
+      <td>Always EXPIRE (write storm); fixed TTL (forces re-login mid-session); per-request lambda update.</td>
+    </tr>
+    <tr>
+      <td>volatile-lru eviction policy</td>
+      <td>Evicts only TTL-bearing keys when memory hits 80% — protects non-session keys (rate limits, denylist) from session pressure. Pure LRU on access timestamp aligns with usage pattern: idle users get evicted first, active users stay resident.</td>
+      <td>allkeys-lru (evicts denylist, security risk); volatile-ttl (evicts about-to-expire — wasteful).</td>
+    </tr>
+    <tr>
+      <td>Kafka revocation topic</td>
+      <td>Cross-region revoke must propagate within 5s SLA — Kafka producer→consumer chain is ~1-2s p99 globally. Decouples revoke fan-out from request path; durable retention handles brief regional consumer outages without losing revocations.</td>
+      <td>Direct cross-region Redis writes (RTT cost on every revoke); polling DB (lag too high).</td>
+    </tr>
+    <tr>
+      <td>Bloom-style JWT denylist</td>
+      <td>Bounded by JWT max TTL (5 min) so the denylist stays small (~10k entries at typical revoke rate). Checked on auth path with O(1) lookup. Without it, a stolen JWT is valid until expiry — unacceptable for password-reset flows.</td>
+      <td>No denylist (5-min stolen-JWT window); long denylist (memory unbounded).</td>
+    </tr>
+    <tr>
+      <td>SADD user:{id}:sessions index</td>
+      <td>Secondary "list all my sessions" + "force-logout-all" requires a userId→[sessionId] index. SADD/SREM is O(1); cap 1k devices/user prevents pathological celebrity accounts from blowing memory. DDIA Ch.6 secondary partition strategy.</td>
+      <td>Scan all sessions (unscalable); separate scan-index DB (more moving parts).</td>
+    </tr>
+    <tr>
+      <td>HMAC-SHA256 JWT signing</td>
+      <td>HMAC is 10x faster than RSA verify (~5us vs 50us) — at 500k req/s with JWT verify on hot path that's 50% CPU saved. Symmetric key shared across regions via secrets manager; rotation via overlapping key set with kid header.</td>
+      <td>RS256 (slower verify, public key benefit not needed for first-party); none (insecure).</td>
+    </tr>
+    <tr>
+      <td>Region-pinned cookie for 60s post-login</td>
+      <td>Read-your-writes after login fails when login writes hit region A and next read hits region B before 20ms async replication catches up (DDIA Ch.5 lag). Cookie pin forces sticky reads to login region until propagation settles, eliminating the bug.</td>
+      <td>Sync cross-region replication (latency cost); always sticky (uneven load).</td>
+    </tr>
+    <tr>
+      <td>CSRF token in session record</td>
+      <td>Double-submit cookie pattern needs a per-session CSRF token returned via header and matched on state-changing requests. Storing in HSET sess:{sid} keeps it co-located with auth state — single Redis read covers both checks.</td>
+      <td>Per-request CSRF (extra round-trip); origin-only check (insufficient for legacy clients).</td>
+    </tr>
+  </tbody>
+</table>

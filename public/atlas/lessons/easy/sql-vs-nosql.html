@@ -1,0 +1,64 @@
+<h1>Database choice: SQL vs NoSQL, ACID vs BASE</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Easy</span>
+  <span class="tag">databases</span>
+  <span class="tag">acid</span>
+  <span class="tag">nosql</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>SQL databases store data in fixed tables with strong relationships and give you <b>ACID</b> guarantees — every transaction is Atomic, Consistent, Isolated, and Durable. NoSQL databases relax the schema and often the consistency, in exchange for horizontal scale and flexible data shapes; they typically advertise <b>BASE</b> — Basically Available, Soft-state, Eventually consistent. Choosing between them is mostly about what you need <i>more</i>: rock-solid invariants on every write, or the ability to grow data and traffic by 100x without rewriting.</p>
+
+<h2>Why it matters</h2>
+<p>The database is almost always the hardest part of any system to change later — schemas calcify, queries get tuned, ops teams build muscle memory. Picking the wrong category early means you pay for it every quarter. The good news: 80% of the choice is decided by two questions — "do I need multi-row transactions?" and "do I expect the data to outgrow one machine?".</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Postgres / MySQL (SQL, ACID):</b> banking, ledgers, anything where two rows must update or neither does.</li>
+  <li><b>DynamoDB / Cassandra (NoSQL, BASE):</b> shopping cart, user profile, IoT telemetry — huge volume, simple key-based access.</li>
+  <li><b>MongoDB (document, tunable):</b> flexible schemas; ACID on a single document, multi-doc since 4.0 with caveats.</li>
+  <li><b>Redis (key-value, in-memory):</b> caches, leaderboards, rate limiters; durability is opt-in.</li>
+  <li><b>Neo4j (graph):</b> social graphs, fraud detection — relationships are first-class.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  ACID (SQL world)                      BASE (NoSQL world)
+  +---------------------+               +---------------------+
+  | A: all-or-nothing   |               | Basically Available |
+  | C: invariants hold  |               | Soft state          |
+  | I: txns don't see   |               | Eventually          |
+  |    each other's WIP |               |   consistent        |
+  | D: survives crash   |               |                     |
+  +---------------------+               +---------------------+
+        strict, single-master                tunable, many nodes
+        scales VERTICALLY                    scales HORIZONTALLY
+
+  Decision flow:
+    Need multi-row txns / strict invariants? --> SQL
+    Need >1 TB and >50k QPS at low cost?     --> NoSQL
+    Need both? --> NewSQL (Spanner, CockroachDB) or careful sharded SQL
+</div>
+<p>Notice that ACID and BASE aren't opposites so much as endpoints of a spectrum. Modern systems (Spanner, CockroachDB, FoundationDB) try to give you ACID at horizontal scale by paying with latency.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Picking NoSQL "for scale" when you have 50 GB of data and need transactions. You're trading what you have for what you don't need.</li>
+  <li>Picking SQL and then doing application-side joins because you're afraid of relational queries. The DB does that better.</li>
+  <li>Confusing "schemaless" with "no schema". Document stores still have an implicit schema — it just lives in your application code, untyped.</li>
+  <li>Assuming "eventual consistency" means "a few milliseconds". Under partition, eventual can mean minutes — design for it.</li>
+  <li>Ignoring access patterns. NoSQL rewards designs where the query is known up front; if you need ad-hoc analytics, that's a warehouse, not a key-value store.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're building a ride-sharing app's two core tables: (1) <i>trips</i>, where money moves between rider and driver and a refund must never produce a partial state, and (2) <i>driver_locations</i>, updated every 4 seconds for 10M drivers worldwide. Would you put both in one database? If you split them, which engine for each — and why?
+  <br/>
+  <b>Hint:</b> Money is ACID-shaped. Location pings are firehose-shaped. They have nothing in common except the user.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-uber">Design Uber</a> — splits transactional and high-throughput stores.</li>
+  <li><a href="#problem/design-dynamodb">Design DynamoDB</a> — canonical BASE / leaderless design.</li>
+  <li><a href="#problem/design-amazon">Design Amazon</a> — orders in SQL, catalog and cart in NoSQL.</li>
+</ul>

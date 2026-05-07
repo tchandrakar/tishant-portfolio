@@ -1,0 +1,142 @@
+<h1>Design Notification Scheduler (cron + delayed jobs at billion-scale)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">notifications</span>
+  <span class="tag">misc</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a durable scheduler for notifications: arbitrary delay (5 s to 1 year), cron-style recurring jobs, and timezone-aware schedules ("send at 9am local time"). It must fire on time within ±2 s p99, never lose a job, deliver exactly-once at the orchestrator boundary, and scale to 1B in-flight scheduled jobs across 100k tenants.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Schedule one-shot job at <code>fireAt</code> (UTC or user-local).</li>
+  <li>Schedule recurring jobs with cron expressions and tz.</li>
+  <li>Cancel and reschedule before fire time.</li>
+  <li>Fan-out triggers to a target topic/queue with payload.</li>
+  <li>Idempotent firing — at-least-once with consumer-side dedup support.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Accuracy:</b> ±2 s p99, ±10 s p99.99 under failure.</li>
+  <li><b>Scale:</b> 1B active jobs, 200k fires/sec peak.</li>
+  <li><b>Durability:</b> jobs persisted with RF=3 across AZs; survive single-AZ loss.</li>
+  <li><b>Availability:</b> 99.99% (clock service), 99.95% scheduling API.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Active jobs: 1B × 256 B = 256 GB; with index ~600 GB shareded across 64 nodes.</li>
+  <li>Fires: 200k/sec × 1 KB = 200 MB/s into trigger Kafka topic.</li>
+  <li>Time-bucket index: 1B jobs ÷ 86,400 s/day = ~12k jobs/sec average; bursts 10×.</li>
+  <li>Memory for next-minute window: 60 s × 200k/s = 12M jobs ≈ 3 GB → easily in RAM per shard.</li>
+  <li>Recurring expansions: 100M cron jobs × next-1-week materialization → 700M derived rows.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/schedule         {fireAt, target, payload, idempotencyKey}   -> jobId
+POST /v1/schedule/cron    {cron, tz, target, payload}                 -> jobId
+DELETE /v1/schedule/{id}
+PUT  /v1/schedule/{id}    {fireAt}
+GET  /v1/schedule/{id}                                                -> status, nextFireAt</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]
+   |
+   v
+[Schedule API] --> [Job Store: Cassandra (sharded by job_id)]
+                       |
+                       v
+              [Time-bucket Index]
+              (per-minute partitions, sharded by user-hash)
+                       |
+                       v
+              [Tickers per shard]  -- watermark = wall-clock - skew
+                       |
+                       v
+              [Fire Worker pool] -- emits to Kafka: timer.fired
+                       |
+                       v
+              [Trigger Topic] -> [Orchestrator / Channel Services]
+</div>
+<p>Storage is partitioned by job_id for cancel/lookup. A separate <i>time-bucket index</i> partitioned by minute-bucket and user-hash is the hot path: each shard owns a contiguous slice of buckets and a goroutine ticks every second to load the next-minute slice into memory and fire as wall-clock crosses each item’s <code>fireAt</code>.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Job store (Cassandra)</h3>
+<pre>CREATE TABLE jobs (
+  job_id uuid PRIMARY KEY,
+  tenant_id text, fire_at timestamp,
+  cron text, tz text,
+  target text, payload blob,
+  status text, version int
+);
+CREATE TABLE bucket_index (
+  bucket_minute timestamp, shard int, job_id uuid,
+  fire_at timestamp,
+  PRIMARY KEY ((bucket_minute, shard), fire_at, job_id)
+);</pre>
+<h3>7.2 Why bucket index?</h3>
+<p>Querying "all jobs firing in the next minute" is the engine’s critical query. Bucketing by minute keeps partition sizes bounded (200k peak ≤ 200k rows per (minute, shard) with shard count tuned to 64). DDIA Ch. 11 motivates time-windowed indexes for stream processing.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Tickers and leases</h3>
+<p>Each shard is owned by exactly one ticker (Zookeeper / etcd lease, 30 s TTL). The ticker reads (bucket, shard) for the next two minutes into a min-heap keyed by <code>fire_at</code>. Every 100 ms it pops items with <code>fire_at ≤ now</code> and dispatches them. On lease loss it stops and another node takes over; the heap is rebuilt from the index, idempotent because Cassandra is the source of truth.</p>
+<h3>8.2 Cron expansion</h3>
+<p>A separate <i>materializer</i> walks recurring jobs and writes the next N=10 occurrences into <code>bucket_index</code>. A daily compaction trims expired rows. This avoids per-tick cron parsing.</p>
+<h3>8.3 Exactly-once at the boundary</h3>
+<p>At fire time, the worker writes <code>(job_id, occurrence_id)</code> to a <i>fired</i> table with a uniqueness constraint, then publishes to Kafka. Replays are detected by the dedup table; downstream consumers also dedupe on <code>idempotencyKey</code>. This implements the at-least-once-with-idempotent-consumer pattern from DDIA Ch. 11.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot minute:</b> "9am Monday" creates a thundering herd. Add jitter at schedule time (uniform 0–60 s) per tenant policy.</li>
+  <li><b>Tail latency:</b> shard reassignment on ticker crash must complete in &lt;30 s; hot-standby tickers pre-load buckets.</li>
+  <li><b>Cron explosion:</b> a tenant defining a per-second cron on 1M users generates 86M jobs/day. Enforce per-tenant cron-cardinality caps.</li>
+  <li><b>Clock skew:</b> NTP-synced; reject schedules with <code>fireAt &lt; now - 5s</code> as bad input.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Cassandra bucket index</td><td>Linear scale, durable</td><td>2 writes per schedule (jobs + index)</td></tr>
+<tr><td>Per-shard ticker lease</td><td>Simple ownership</td><td>Slow failover under network partitions</td></tr>
+<tr><td>Materialize next-N cron occurrences</td><td>Fast tick path</td><td>Materializer lag affects recurring jitter</td></tr>
+<tr><td>Add 0–60s jitter</td><td>Smooths thundering herd</td><td>User-visible imprecision</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 8 Trouble with Distributed Systems — handling clock drift and lease handoff.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — etcd/Zookeeper for shard ownership and fencing tokens.</li>
+  <li>Ch. 11 Stream Processing — fire events emitted to Kafka with idempotent producers; downstream consumers use exactly-once via transactional offsets and the <code>fired</code> dedup table.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with a single-region scheduler backed by Cassandra and add cross-region replicas in iteration 2; cross-region clock semantics get hairy fast."</li>
+  <li>"The hardest part is exactly-once firing across ticker failover; I'd use a fenced lease and a fired-dedup table."</li>
+  <li>"For very-long delays (months), I'd not keep them in the hot index; nightly job promotes near-due items into the bucket index."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Cassandra (jobs + bucket_index)</td><td>1B in-flight jobs × 600 GB needs linear-scale writes with multi-AZ RF=3 durability; <code>PRIMARY KEY ((bucket_minute, shard), fire_at, job_id)</code> makes "all jobs firing in next minute" a single bounded partition scan — exactly the engine's hot query.</td><td>Postgres (single primary caps near 30k writes/s, far below 200k peak fires); DynamoDB (per-item cost at 1B rows + 200k/s is uneconomical).</td></tr>
+<tr><td>Sharded bucket index (minute × shard=64)</td><td>200k peak/sec ÷ 64 shards = 3,125 jobs per (minute, shard) keeps Cassandra partition under the 100k-row soft limit; sharding by user-hash spreads "9am Monday" thundering herd evenly across 64 ticker nodes.</td><td>Single partition per minute (200k rows/partition causes hot-spot reads); shard by tenant (skew when one tenant dominates).</td></tr>
+<tr><td>etcd / Zookeeper (shard leases)</td><td>Exactly-one ticker per shard requires a fenced lease — etcd's Raft consensus gives correct ownership during network partitions, and the 30s TTL bounds failover time within the ±10s p99.99 accuracy goal.</td><td>Redis lock (no fencing token, split-brain risk); database row-lock (slow lease renewal at 64 shards).</td></tr>
+<tr><td>Apache Kafka (timer.fired trigger topic)</td><td>200k fires/sec × 1 KB = 200 MB/s of trigger events; Kafka's idempotent producer + transactional offsets implement exactly-once-at-the-boundary downstream, surviving ticker crashes mid-fire.</td><td>RabbitMQ (200k/sec straining single broker); HTTP webhook direct (loses durability when consumer is down).</td></tr>
+<tr><td>In-memory min-heap (per shard)</td><td>Each shard pre-loads next 2 minutes of due times into a heap; popping items with <code>fire_at ≤ now</code> every 100 ms achieves the ±2s p99 accuracy that a per-tick Cassandra range scan cannot match at 200k/s.</td><td>Per-tick Cassandra scan (latency &gt;1s, fails accuracy); Redis ZSET as primary store (RAM cost for 1B jobs prohibitive).</td></tr>
+<tr><td>Cron materializer (next-N occurrences)</td><td>100M cron jobs would need per-tick parsing, melting CPU; pre-materializing next 10 occurrences (~700M derived rows) into bucket_index converts cron-expansion into a daily compaction job and keeps the tick path zero-parse.</td><td>Per-tick cron evaluation (CPU bottleneck); fully expanded forever (storage explosion for /1s crons).</td></tr>
+<tr><td>Fired-dedup table (Cassandra LWT)</td><td>Exactly-once at boundary requires CAS — Cassandra lightweight transactions on (job_id, occurrence_id) reject double-fires across ticker failover, then publish to Kafka; cost is ~5 ms per fire which fits under 200k/s with 64 shards × ~3,125 fires/s/shard.</td><td>Idempotent consumers only (loses the dedup audit trail); distributed transaction (2PC across DB+Kafka — fragile and slow).</td></tr>
+<tr><td>NTP / chrony (clock sync)</td><td>±2s p99 accuracy requires nodes within ~200 ms of true time; chrony with stratum-2 sources keeps drift &lt;10 ms typical and rejects out-of-spec hosts before they fire jobs prematurely.</td><td>System default ntpd (slower convergence); GPS clocks (overkill cost at 64 shards).</td></tr>
+<tr><td>Per-tenant cron-cardinality cap</td><td>A tenant defining a per-second cron on 1M users = 86M jobs/day exceeding the 1B in-flight target alone; admission control caps protect the cluster from one-tenant-takes-all and preserve fair multi-tenant SLOs across 100k tenants.</td><td>No caps (single misconfig kills cluster); soft alerts only (damage already done by cleanup time).</td></tr>
+<tr><td>0–60s schedule jitter (per-tenant policy)</td><td>"Send daily digest at 9am" creates a thundering herd of millions; uniform jitter 0–60s spreads load 60× across the bucket index without user-visible imprecision for a daily-digest UX.</td><td>No jitter (200k/s spike compresses into 1s slot); larger jitter (UX violation for time-sensitive jobs).</td></tr>
+<tr><td>Hot-standby tickers per shard</td><td>Lease handoff target &lt;30s requires a warm replica that has already pre-loaded the next-2-minute heap; cold-start would re-scan Cassandra (~3s per shard) and miss fires inside the gap.</td><td>Cold-start on failover (misses fires in the gap); 3-replica active-active (fire duplication and complex de-dup).</td></tr>
+<tr><td>Long-delay cold tier (S3 + nightly promote)</td><td>Jobs scheduled months out shouldn't sit in the bucket index; a nightly job promotes near-due (within next 7 days) entries from a cheap S3+Parquet cold store into Cassandra, capping hot-index size near the 600 GB target.</td><td>All jobs in hot index (storage and operational cost balloon); per-tick cold lookups (latency unacceptable).</td></tr>
+<tr><td>IANA timezone library (tz-aware fires)</td><td>"9am local time" with DST transitions requires correct zoneinfo handling — pytz/zoneinfo correctly skips/duplicates ambiguous local times instead of misfiring 2× per year for hundreds of millions of jobs.</td><td>UTC-offset only (breaks DST); custom tz table (impossible to maintain across 400+ zones).</td></tr>
+</tbody>
+</table>

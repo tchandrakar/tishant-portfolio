@@ -1,0 +1,138 @@
+<h1>Design Zomato (restaurant discovery + delivery)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">food-delivery</span>
+  <span class="tag">search</span>
+  <span class="tag">maps-location</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build Zomato: a discovery-first food platform that started as restaurant reviews and expanded into delivery, dine-out, and Hyperpure (B2B supplies). The hard problem isn't just delivery — it's a <em>search engine</em> over 1.5 M restaurants ranked by location, cuisine, ratings, photos, ads, and Zomato Gold benefits, then a transactional flow on top of it.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Search and browse: cuisine, dish, locality, price, rating, "open now", offers.</li>
+  <li>Restaurant page: photos, menu, reviews, distance/ETA, dine-out booking.</li>
+  <li>Order: cart, checkout, payments (UPI/cards/Zomato Money), delivery tracking.</li>
+  <li>User-generated content: reviews, photos, follows, helpful votes.</li>
+  <li>Ads: sponsored placements, Gold subscription, restaurant analytics dashboard.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> search p99 &lt; 250 ms; home feed personalised &lt; 400 ms.</li>
+  <li><b>Scale:</b> 80 M MAU, 1.5 M restaurants, 5 M orders/day, 200 M reviews/photos.</li>
+  <li><b>Availability:</b> 99.95% search, 99.99% checkout.</li>
+  <li><b>Freshness:</b> menu/price changes visible &lt; 60 s; new review searchable &lt; 5 min.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: search 30 K peak; feed 25 K peak; orders ~350 peak.</li>
+  <li>Storage: 1.5 M restaurants × 5 KB metadata + 200 M photos × 250 KB ≈ 50 TB photos.</li>
+  <li>Reviews: 200 M × 1 KB = 200 GB; embeddings ~ 200 M × 256 floats = 200 GB.</li>
+  <li>Search index: ~30 GB primary, replicated 3x.</li>
+  <li>CDN egress for photos: ~5 Gbps peak.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v2/search?q=biryani&amp;lat=&amp;lng=&amp;sort=rating  → list[restaurant]
+GET   /v2/restaurants/{id}                          → details + menu
+POST  /v2/reviews     {restId, rating, text, mediaIds[]} → reviewId
+POST  /v2/orders      {cartId, addrId, payMode}     → orderId
+GET   /v2/feed?lat=&amp;lng=                         → personalised cards
+POST  /v2/ads/impression  {slotId, restId}          → ack</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App/Web] → [CDN (Cloudflare)] → [API GW]
+   ├─→ [Search Svc] ← [Elasticsearch (geo+text)] ← [Indexer] ← Kafka(restaurant.changes)
+   ├─→ [Feed/Reco Svc] ← [Feature Store] ← [Spark/Flink]
+   ├─→ [Restaurant Svc] → [MySQL (sharded)] ─┐
+   ├─→ [Order Svc]      → [Postgres]         │ Debezium → Kafka
+   ├─→ [Review Svc]     → [Cassandra]        │
+   └─→ [Media Svc]      → [S3 + Imgix]       │
+                                            ▼
+                                    [Data Lake / Snowflake]
+</div>
+<p>CDC via Debezium pumps every source-of-truth change into Kafka; the search indexer consumes restaurant + review streams to update Elasticsearch in near-real-time.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Restaurant (MySQL, shard by city_id)</h3>
+<pre>CREATE TABLE restaurants (
+  rest_id   bigint PRIMARY KEY,
+  name      varchar(200), city_id int,
+  lat decimal(9,6), lng decimal(9,6),
+  cuisines  json, avg_cost int, rating_avg decimal(3,2),
+  is_delivery tinyint, is_dineout tinyint,
+  updated_at timestamp
+);</pre>
+<h3>7.2 Reviews (Cassandra)</h3>
+<p>Partition <code>rest_id</code>, clustering <code>created_at DESC</code> — read-heavy "latest reviews" pattern.</p>
+<h3>7.3 Search index (Elasticsearch)</h3>
+<p>Doc per restaurant with <code>geo_point</code>, dense vector for semantic dish search, BM25 fields for name/menu/reviews. Cuisines and tags as keyword filters.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Search service</h3>
+<p>Hybrid retrieval: ES BM25 + ANN over dish embeddings (HNSW). Geo-filter (<code>geo_distance ≤ 7 km</code>) is the first pass; ranker fuses BM25 score, distance, rating, "open now", ad bid, personalisation. Final re-rank with LightGBM.</p>
+<h3>8.2 Feed personalisation</h3>
+<p>Two-tower model: user tower (history, time-of-day, locality) × restaurant tower (cuisine, price, rating). Candidates from ANN + business rules; ranked by xGBoost CTR/conversion blend.</p>
+<h3>8.3 Ads / sponsored slots</h3>
+<p>Real-time auction per slot — second-price among bids constrained by relevance threshold. Pacing service caps daily spend per advertiser using token buckets.</p>
+<h3>8.4 Photos pipeline</h3>
+<p>Uploaded via signed S3 URLs; Lambda triggers thumbnailing (Imgix) + NSFW + dish classification; metadata to Cassandra.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot search ("biryani Bengaluru"):</b> Redis edge cache keyed by <code>(geohash5, query)</code>, TTL 30 s.</li>
+  <li><b>Index lag:</b> dual-write tier — synchronous primary + async ES; rely on CDC for replay.</li>
+  <li><b>Photo egress:</b> CDN with origin shielding; pre-resize on upload.</li>
+  <li><b>Review write storm post-cricket-match:</b> Cassandra LWT only on dedup of (user, restaurant); rest is plain INSERT.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>ES for search</td><td>Mature geo+text, fast aggs</td><td>Hard to do strict relevance updates without reindex</td></tr>
+<tr><td>CDC indexer</td><td>Decoupled, replayable</td><td>End-to-end latency 5–30 s</td></tr>
+<tr><td>Cassandra for reviews</td><td>Cheap writes, time-ordered reads</td><td>Limited ad-hoc queries</td></tr>
+<tr><td>Ads in same ranker</td><td>One stack, blended UX</td><td>Risks user-trust if not labelled</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage &amp; Retrieval — inverted indexes (Lucene) underpin Elasticsearch.</li>
+  <li>Ch. 6 Partitioning — city-sharded MySQL; ES shard-per-region.</li>
+  <li>Ch. 11 Stream Processing — CDC + Kafka indexer; click-stream ETL for ranker.</li>
+  <li>Ch. 12 Future of Data Systems — search index as derived data from authoritative MySQL.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd separate read-paths (search/feed/ads) from write-paths (orders/reviews) and let Kafka be the join."</li>
+  <li>"Hardest part is ranking quality at 7-km radius density in metros — I'd invest in a learned ranker over hand-tuned scores."</li>
+  <li>"For ad load I'd budget impressions per session to protect organic relevance."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>MySQL (city-sharded)</td><td>1.5 M restaurants with relational menu/cuisine joins; city-shard keeps Mumbai/Delhi hot data isolated and supports the 350 peak orders/s OLTP path. Mature CDC story via Debezium feeds the search indexer.</td><td>Postgres (used downstream for orders); CockroachDB (overkill for catalog; cost); MongoDB (weak join support for menu trees).</td></tr>
+<tr><td>PostgreSQL (orders)</td><td>5 M orders/day needs ACID for payments + Zomato Money wallet ledger; 99.99% checkout SLA is met with a focused single-purpose DB free of catalog read load. Logical decoding feeds Kafka for downstream consumers.</td><td>MySQL (chose Postgres for richer constraints); DynamoDB (no multi-row transactions); Cockroach (extra cost in single-region).</td></tr>
+<tr><td>Cassandra (reviews)</td><td>200 M reviews × 1 KB = 200 GB; partition by <code>rest_id</code> with clustering on <code>created_at DESC</code> serves read-heavy "latest reviews" pattern. Cheap writes absorb post-cricket-match storms without LWT for non-dedup paths.</td><td>Postgres (write amplification on hot restaurants); MongoDB (no cluster-key ordering guarantees); HBase (heavier ops).</td></tr>
+<tr><td>Elasticsearch (geo+text+vector)</td><td>30 K peak search QPS over 1.5 M restaurants needs combined geo_distance, BM25 over name/menu/reviews, AND dense-vector ANN for "spicy chicken → chettinad" semantic recall. ES 8.x dense_vector ships all three in one query.</td><td>Vespa (smaller in-house expertise); Solr (older ANN story); pgvector (single-node bottleneck at 30 K QPS).</td></tr>
+<tr><td>Apache Kafka + Debezium</td><td>CDC from MySQL into Kafka decouples search indexing from OLTP; the &lt;60s menu-freshness SLA is met by streaming changes rather than batch ETL. Replayable for index rebuilds.</td><td>AWS DMS (vendor lock; cost); Maxwell (smaller community); periodic snapshot reindex (60s SLA impossible).</td></tr>
+<tr><td>S3 + Imgix CDN</td><td>200 M photos × 250 KB = 50 TB; S3 is the only cost-rational object store at this scale; Imgix on-the-fly resizing avoids storing N variants. CDN delivers ~5 Gbps peak egress without origin overload.</td><td>Self-hosted MinIO (capex + ops at 50 TB); Cloudinary (more expensive transformations); GCS (similar — chose S3 for AWS-first stack).</td></tr>
+<tr><td>Spark / Flink (feature pipelines)</td><td>Batch retraining of two-tower model + streaming feature freshness for personalisation feed (&lt;400 ms p99); 80 M MAU click-stream needs distributed compute that Snowflake-only cannot do efficiently.</td><td>Beam (smaller community); pure Spark (no streaming for fresh features); Hadoop MR (deprecated approach).</td></tr>
+<tr><td>LightGBM ranker</td><td>Final re-rank of ~300 candidates in &lt;25 ms via ONNX; gradient boosting beats DNN inference latency at the 30 K QPS feed traffic and trains nightly on 5 M orders/day click-labels.</td><td>XGBoost (similar; LightGBM faster on categorical); DNN (10x slower inference); hand-tuned weights (lower NDCG@10).</td></tr>
+<tr><td>HNSW (FAISS) for ANN</td><td>Dish embedding semantic search needs sub-10ms approximate nearest neighbour over 1.5 M vectors at 30 K QPS; HNSW gives recall@10 ~95% within latency budget.</td><td>IVF (lower recall); ScaNN (Google-only ergonomics); brute-force (impossible at 30 K QPS).</td></tr>
+<tr><td>Redis (edge cache)</td><td>Hot queries like "biryani Bengaluru" with TTL 30s; <code>(geohash5, query)</code> key pattern cuts ES load 5x during 8 PM IST dinner discovery rush.</td><td>Memcached (no TTL granularity per key family); Hazelcast (extra ops); CDN-only (insufficient for personalised pages).</td></tr>
+<tr><td>Razorpay + UPI / Zomato Money</td><td>UPI is dominant Indian payment rail; Zomato Money wallet supports closed-loop refunds without PSP roundtrip — critical for refunds at 5 M orders/day where each PSP call costs ~₹2.</td><td>Stripe (poor UPI); PayU (less reliable webhooks); building from scratch (regulatory burden).</td></tr>
+<tr><td>Snowflake (data lake)</td><td>200 M reviews + click-stream + photo metadata aggregated for partner analytics dashboards; columnar storage and concurrency scaling lets restaurant analytics queries run without touching OLTP.</td><td>Redshift (worse concurrency scaling); BigQuery (multi-cloud strategy); Databricks (more compute-than-SQL focus).</td></tr>
+<tr><td>Cloudflare CDN</td><td>5 Gbps peak photo egress + JS/CSS for 80 M MAU; edge POPs in India tier-1 cities reduce p99 home-feed latency from 600 ms to &lt;400 ms target.</td><td>Akamai (more expensive at this volume); CloudFront (worse India presence); Fastly (smaller India footprint).</td></tr>
+</tbody>
+</table>
+

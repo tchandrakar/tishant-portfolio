@@ -1,0 +1,148 @@
+<h1>Design WhatsApp (1:1, groups, E2E encryption, presence)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">messaging</span>
+  <span class="tag">notifications</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a globally distributed instant messenger that supports 1:1 chat, groups up to ~1024 members, voice notes, media, presence (online / last-seen / typing), read receipts, and end-to-end encryption. The real WhatsApp delivers about 100B messages a day to 2B+ MAU using a famously small server fleet, so the design must lean hard on long-lived TCP connections, simple stores, and offload work to clients.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Send / receive text, media, voice notes in 1:1 and group chats.</li>
+  <li>Delivery and read receipts (single tick, double tick, blue tick).</li>
+  <li>Presence: online, last-seen, typing indicator.</li>
+  <li>End-to-end encryption (Signal protocol, double ratchet) for all conversations.</li>
+  <li>Multi-device: phone primary plus up to 4 linked devices.</li>
+  <li>Offline delivery: messages queued until recipient reconnects.</li>
+  <li>Push notifications via APNs / FCM when client socket is closed.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 send-to-deliver under 200 ms intra-region, p99 under 1 s globally.</li>
+  <li><b>Scale:</b> 2B MAU, 1B DAU, 100B msgs/day, peak 2M msgs/sec.</li>
+  <li><b>Durability:</b> never lose an acknowledged message; deliver at-least-once.</li>
+  <li><b>Availability:</b> 99.99% for the chat plane.</li>
+  <li><b>Privacy:</b> server cannot read message bodies.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 100B msgs/day / 86400 ≈ 1.16M msgs/sec average; peak ~3x = 3.5M/sec.</li>
+  <li>Concurrent sockets: 1B DAU * 30% online = 300M long-lived TCP sockets.</li>
+  <li>Per server: 1M sockets/box (FreeBSD + Erlang) ⇒ 300 chat-edge boxes.</li>
+  <li>Storage: encrypted ciphertext is ephemeral on server (deleted after delivery). Media blob storage ~5 PB/day at 50 KB avg * 100B msgs * 1% media.</li>
+  <li>Bandwidth: 1 KB avg ciphertext * 3.5M/sec ≈ 28 Gbps for text alone.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Persistent XMPP-like binary frame over TLS:443
+CONNECT  {clientId, authToken, deviceId}
+SEND     {msgId, toJid, ciphertext, ts}        → ACK {msgId, serverTs}
+RECEIVE  {msgId, fromJid, ciphertext}          → DELIVERED {msgId}
+READ     {msgIds[]}                            → broadcast to sender
+PRESENCE {state: online|offline|typing}        → fan-out to subs
+GROUP_CREATE {groupId, members[]}              → groupJid
+
+// REST sidecar (HTTP/2):
+POST /v1/media/upload   → blobId, mediaKey
+GET  /v1/media/{blobId} → encrypted bytes</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Phone]──TLS──┐
+              │  (persistent socket)
+       [Chat-Edge / Erlang]──┬──[Auth Svc]
+              │              ├──[Mailbox Store: Mnesia/Cassandra]
+              │              ├──[Group Svc]
+              │              ├──[Presence Svc (in-mem)]
+              │              └──[Push Bridge → APNs/FCM]
+              │
+              └──[Media Svc]──[S3 / Object Store]──[CDN]
+</div>
+<p>Walk-through: client opens one TLS socket to its nearest chat-edge. Sender encrypts ciphertext per recipient device, ships it through the socket. Edge enqueues into the recipient's mailbox in Mnesia/Cassandra and pushes to the recipient's edge if online; otherwise sends a thin "you have mail" wake-up via APNs/FCM. Recipient pulls and ACKs, server then deletes the row.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Mailbox (Cassandra)</h3>
+<pre>CREATE TABLE mailbox (
+  user_id   bigint,
+  msg_id    timeuuid,
+  sender_id bigint,
+  ciphertext blob,
+  ts        timestamp,
+  PRIMARY KEY (user_id, msg_id)
+) WITH CLUSTERING ORDER BY (msg_id DESC);</pre>
+<h3>7.2 Why Cassandra / Mnesia?</h3>
+<p>Per-user partition is naturally bounded (queue drains on delivery), writes are append-only, no read-modify-write. WhatsApp historically used Mnesia (Erlang's in-VM store) for hot mailboxes. Multi-DC replication with LOCAL_QUORUM gives sub-region durability without cross-ocean RTT.</p>
+<h3>7.3 Identity / prekeys</h3>
+<pre>CREATE TABLE prekeys (
+  user_id bigint, device_id int, key_id int,
+  pubkey blob, used boolean,
+  PRIMARY KEY ((user_id, device_id), key_id));</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Chat-edge (Erlang/BEAM)</h3>
+<p>One Erlang process per connected user. The BEAM scheduler handles 1M+ lightweight processes per box; preemptive scheduling means a slow user can't block others. Frames are routed via a global registry (gproc / consistent-hash on userId) to find the recipient's edge box.</p>
+<h3>8.2 E2E encryption (Signal double ratchet)</h3>
+<p>On install, client generates an identity key, signed prekey, and 100 one-time prekeys, uploads pubkeys to server. Sender fetches recipient bundle, runs X3DH to derive a session, then double-ratchets per message: DH ratchet on every reply, symmetric KDF ratchet per send. Server only sees opaque ciphertext.</p>
+<h3>8.3 Group fan-out (sender keys)</h3>
+<p>Naive pairwise encryption for a 256-member group = 256 ciphertexts per send. WhatsApp uses "sender keys": one symmetric chain per (group, sender). Sender ships one ciphertext to the server, server fans out to N members, each member already has the chain key from a one-time pairwise distribution. Server-side fan-out is plaintext-of-routing, not plaintext-of-content.</p>
+<h3>8.4 Presence service</h3>
+<p>Strictly in-memory Redis-style ring keyed by userId. TTL 60s, refreshed via heartbeat. Subscribers (contacts who have the user's chat open) get pub/sub notifications. Typing is a soft signal with 6s TTL, never persisted.</p>
+<h3>8.5 Multi-device</h3>
+<p>Each linked device has its own identity key. Sender encrypts once per recipient device (4 devices = 4 ciphertexts), server fans out. History sync for new devices uses encrypted backup keyed off the primary device.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Connection storms:</b> after a regional outage, millions reconnect. Mitigate with jittered exponential backoff in the client and SYN-cookie + LB rate limits.</li>
+  <li><b>Hot groups (1024-member):</b> serialize fan-out per group through a single Erlang process; cap group size; pre-shard fan-out workers.</li>
+  <li><b>Push bridge backpressure:</b> APNs/FCM are external; use a bounded queue per device, drop duplicate "you have mail" wakes.</li>
+  <li><b>Mailbox hot partitions:</b> a celebrity getting 10k DMs has a fat partition. Bucket by msg_id day, drain fast.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Erlang + persistent sockets</td><td>1M conns/box, hot-code-swap</td><td>Niche talent pool</td></tr>
+<tr><td>Server deletes after delivery</td><td>Tiny storage, privacy</td><td>No server-side history</td></tr>
+<tr><td>Sender keys for groups</td><td>O(1) sender cost</td><td>Member churn invalidates chain</td></tr>
+<tr><td>At-least-once delivery</td><td>Simple, durable</td><td>Client must dedupe by msgId</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — leaderless multi-DC writes for the mailbox.</li>
+  <li>Ch. 6 Partitioning — userId-based hash partitioning, hot-partition mitigation.</li>
+  <li>Ch. 8 Trouble with distributed systems — clock skew in last-seen, partial failures during fan-out.</li>
+  <li>Ch. 11 Stream processing — push notification pipeline as an unbounded stream.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start single-region with one persistent-socket tier and a Cassandra mailbox; multi-region adds a routing layer that knows each user's home DC."</li>
+  <li>"The hardest part is presence at 300M concurrent sockets because naive fan-out is N*M; my mitigation is sub-graph filtering — only contacts who currently have your chat open subscribe."</li>
+  <li>"I would not put message bodies in any analytics pipeline — privacy is a contract, not an afterthought."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Erlang / BEAM</td><td>One lightweight process per connected user lets a single FreeBSD box hold ~1M persistent TCP sockets, so 300M concurrent users land on only ~300 chat-edge boxes. Preemptive scheduling stops one slow user from blocking others; hot-code-swap allows zero-downtime upgrades on a 24x7 plane.</td><td>Go (heavier goroutine + GC pauses), Java/Netty (JVM tuning hell at 1M conns), C++ (no preemption, harder ops)</td></tr>
+    <tr><td>Persistent TLS sockets (XMPP-like binary frames)</td><td>Long-lived connection avoids TCP+TLS handshake on every message and amortizes setup across 100B msgs/day. Binary frames keep per-message overhead near 1 KB, hitting the 28 Gbps text bandwidth target without HTTP header bloat.</td><td>HTTP/2 long-poll (more bytes per message), gRPC (heavier, designed for RPC not push), MQTT (used historically; XMPP-style chosen for richer presence semantics)</td></tr>
+    <tr><td>Mnesia (Erlang in-VM store)</td><td>Hot mailboxes live in the same VM as the user process, so a delivered-then-deleted message round-trips memory only — critical for the &lt;200 ms p50 target and "delete after delivery" privacy model. Native Erlang record format avoids serialization.</td><td>Redis (extra hop), in-process Java caches (would force JVM rewrite), local RocksDB (no cluster awareness)</td></tr>
+    <tr><td>Cassandra</td><td>Per-user mailbox partitions are naturally bounded (queue drains on delivery) and writes are append-only — a perfect fit for an LSM tree at peak 3.5M msgs/sec. LOCAL_QUORUM multi-DC replication gives sub-region durability without paying cross-ocean RTT inside the 200 ms p50 budget.</td><td>DynamoDB (vendor lock-in, cost), HBase (heavier ops), Postgres (poor write throughput at this QPS)</td></tr>
+    <tr><td>Signal protocol (X3DH + double ratchet)</td><td>Mandated by the privacy NFR ("server cannot read message bodies") and required for async first-message delivery — sender derives a session from a recipient bundle without the recipient online. Forward secrecy and post-compromise security are non-negotiable for 2B users.</td><td>OTR (no async support), PGP (no forward secrecy, key management nightmare), homegrown crypto (rejected on principle)</td></tr>
+    <tr><td>Sender keys (group encryption)</td><td>Naive pairwise E2E for a 1024-member group costs 1024 ciphertexts per send; sender keys collapse this to one ciphertext + server-side fan-out, making the encryption cost O(1) on the sender — essential for mobile-class CPU and battery on 1 KB texts.</td><td>Pairwise per-member encryption (O(N) cost), MLS / TreeKEM (overkill below ~50 members, more complex)</td></tr>
+    <tr><td>Redis (presence ring)</td><td>Presence is soft state with 60 s TTL refreshed by heartbeat — ideal for an in-memory keyed store, not a SQL DB. Microsecond reads support the contact-list bulk fetch from 300M concurrent users without ever hitting durable storage.</td><td>Cassandra (too slow, wasted durability), in-memory Mnesia (couples presence to chat-edge lifecycle), Memcached (no pub/sub for change notifications)</td></tr>
+    <tr><td>APNs / FCM push bridge</td><td>When the client socket is closed (≈70% of the 1B DAU at any moment) we still need to wake the device — only Apple/Google's push channels can reach a backgrounded mobile app. We send only a thin "you have mail" wake-up to keep payload privacy.</td><td>Web push (no iOS background coverage), SMS fallback (cost prohibitive at 100B/day), polling (drains battery)</td></tr>
+    <tr><td>S3-compatible object store + CDN</td><td>Media is 5 PB/day at 50 KB avg — far too big to push through chat-edge sockets. Encrypted blobs go to object storage and CDN edges so the chat plane stays text-only and tight to its 28 Gbps text bandwidth budget.</td><td>Local NAS (no global edge), HDFS (not optimized for many-small-blob reads), serving from chat-edge (saturates the message plane)</td></tr>
+    <tr><td>gproc / consistent-hash registry</td><td>Routing a frame from sender's edge to recipient's edge needs a global "where is user X connected?" lookup at every send. Consistent hashing on userId means re-balancing only ~1/N keys when an edge box fails, keeping the 99.99% availability SLO during rolling restarts.</td><td>ZooKeeper (write-throughput bottleneck), Redis cluster directory (extra hop, single point of cache miss), DNS-based routing (TTL too coarse)</td></tr>
+    <tr><td>FreeBSD on commodity hardware</td><td>FreeBSD's network stack and kqueue scale to ~1M concurrent sockets per box, which is what makes the 300-box fleet possible at 300M concurrent users. Stable ABI lets WhatsApp run identical binaries for years.</td><td>Linux + epoll (works but tuned worse historically for this case), Solaris (vendor risk), containerized clouds (per-conn overhead, NAT churn)</td></tr>
+    <tr><td>Per-device prekey bundles in Cassandra</td><td>Multi-device support (phone + 4 linked devices) means one logical user has up to 5 ratchet sessions; partition key (user_id, device_id) keeps each device's 100 one-time prekeys colocated and bounded — the queue drains as keys are consumed.</td><td>Single per-user key bundle (breaks multi-device security), Postgres row-per-key (poor at this fan-out), in-memory only (loses keys on restart)</td></tr>
+  </tbody>
+</table>

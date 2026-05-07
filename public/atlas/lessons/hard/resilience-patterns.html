@@ -1,0 +1,66 @@
+<h1>Resilience patterns: circuit breakers, bulkheads, timeouts</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">resilience</span>
+  <span class="tag">fault-tolerance</span>
+  <span class="tag">distributed-systems</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>In distributed systems, failures are not exceptional — they are the steady state. Resilience patterns are the small set of defensive techniques that turn one slow dependency into a contained nuisance instead of a system-wide outage. The three load-bearing primitives are <b>timeouts</b> (bound how long you wait), <b>circuit breakers</b> (stop calling something that is broken), and <b>bulkheads</b> (isolate resource pools so one failing path can't drown the others). Add retries with backoff, hedging, and load shedding, and you have most of what production needs.</p>
+
+<h2>Why it matters</h2>
+<p>The classic failure mode is <i>cascading collapse</i>: dependency D slows from 50ms to 5s, every caller's threadpool fills with stuck requests, callers' callers time out, and now the whole graph is yellow. None of those services "broke" — they were too patient. Resilience patterns are the explicit budget that says "I will wait at most X, then I will fail fast and shed load." Fail-fast is counter-intuitive but it is the only way a healthy service stays healthy when an unhealthy neighbor is still answering.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Netflix Hystrix / resilience4j:</b> popularized circuit breakers with thread-pool bulkheads per dependency.</li>
+  <li><b>Envoy / Istio:</b> implement outlier detection, retry budgets, and per-upstream connection pools at the proxy.</li>
+  <li><b>AWS SDKs:</b> ship adaptive retry mode with token-bucket-based backoff to avoid retry storms.</li>
+  <li><b>Google SRE book:</b> describes deadline propagation across RPC chains so every hop respects the original budget.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  caller                breaker            dependency
+   |---req-->|  CLOSED  |---req-->|        (healthy: pass through, count failures)
+   |<--ok----|          |<--ok----|
+
+   |---req-->|  OPEN    |  short-circuit   (>=N fails in window: refuse for cool-down)
+   |<--err---|          |  no call
+
+   |---req-->| HALF-OPEN|---probe->|       (after cool-down: let 1 in, then close or re-open)
+   |<--ok----|          |<--ok-----|
+
+  bulkhead view:
+   [pool A: 20 threads]  --> dep-A  (slow dep cannot starve pool B)
+   [pool B: 20 threads]  --> dep-B
+   [pool C: 10 threads]  --> dep-C
+</div>
+<p>The breaker has three states. <b>Closed</b> = normal traffic, but track failure rate. Cross a threshold (say 50% errors over the last 20 calls) and trip to <b>Open</b>: every call returns immediately with a fallback. After a cool-down (say 30s), move to <b>Half-Open</b> and let a few probes through. If they succeed, close again; if they fail, re-open. Bulkheads sit underneath: each downstream gets its own threadpool, semaphore, or connection pool, so a stuck dependency cannot consume all the caller's capacity.</p>
+
+<h2>Choosing timeouts and budgets</h2>
+<p>Pick timeouts from the latency distribution, not from gut feel. A reasonable default is <code>p99 of the dependency × 1.5</code>, capped by the caller's own deadline. Then <b>propagate the deadline</b>: if the user-facing request has 800ms left and you call service B, B should be told it has 800ms left, and B's own calls inherit whatever remains. Without deadline propagation, retries multiply: a 3-deep call chain with 2 retries each is 27 attempts in the worst case. Add a <i>retry budget</i> (e.g., "retries may not exceed 10% of normal traffic") so you never amplify a brownout.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li><b>Infinite or default timeouts.</b> Most HTTP clients default to "wait forever." Always set one explicitly.</li>
+  <li><b>Retrying non-idempotent writes.</b> A retry on a POST that already succeeded creates duplicates. Use idempotency keys.</li>
+  <li><b>One global threadpool.</b> Without bulkheads, one slow dependency starves every other code path in the process.</li>
+  <li><b>Synchronized retries.</b> Without jitter, all clients retry at the same instant and DDoS the recovering service.</li>
+  <li><b>Breaker thresholds based on count, not rate.</b> "5 failures" trips instantly under load; use rate over a sliding window.</li>
+  <li><b>No fallback story.</b> A breaker that returns 500 on open is just faster failure. Decide: cached value, default, degraded UX, or queued for later.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Your checkout service calls a fraud-scoring service whose p50 is 40ms but p99 is 4s and occasionally times out. Checkout itself has an 800ms SLA. Design the resilience layer: what timeout, what breaker thresholds, what fallback when fraud is unavailable, and how do you keep peak retry load below 10% of normal?
+  <br/>
+  <b>Hint:</b> Combine a tight per-call timeout (~250ms), a per-dependency bulkhead, a breaker that opens on >30% errors over 30s, and a fallback that ships the order to an async review queue when fraud is open. Use a token-bucket retry budget.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-payment-gateway">Design a payment gateway</a> — circuit breakers + idempotency keys are the core of safe retries.</li>
+  <li><a href="#problem/design-api-gateway">Design an API gateway</a> — bulkheads, deadlines, and outlier detection live at the gateway tier.</li>
+  <li><a href="#problem/design-uber">Design Uber</a> — many synchronous fan-outs to pricing, ETA, and matching all need independent resilience policies.</li>
+</ul>

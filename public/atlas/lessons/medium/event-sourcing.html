@@ -1,0 +1,80 @@
+<h1>Event sourcing &amp; CQRS</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">event-sourcing</span>
+  <span class="tag">cqrs</span>
+  <span class="tag">audit</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p><b>Event sourcing</b> stores the <i>history of changes</i> instead of the current state. Every mutation is an immutable event — <code>OrderPlaced</code>, <code>ItemShipped</code>, <code>RefundIssued</code> — appended to a log. Current state is a <i>projection</i>: replay the events through a fold and you get the current row. <b>CQRS</b> (Command Query Responsibility Segregation) is the natural partner: commands write to the event log, queries read from one or many derived views — each tuned for its read pattern.</p>
+
+<h2>Why it matters</h2>
+<p>For domains where "what changed and why" is part of the product — banking, accounting, healthcare, audit-heavy SaaS — event sourcing is the difference between a system that can answer "show me account state on March 14 at 2pm" in one query versus one that can never answer it at all. CQRS lets you serve a write-heavy command side from a normalized store and a read-heavy query side from denormalized projections, scaling them independently.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Stock exchanges:</b> the order book is a sequence of <code>NewOrder/Cancel/Fill</code> events. Replay reconstructs any moment.</li>
+  <li><b>Git:</b> the canonical event-sourced system. Commits are events; the working tree is a projection.</li>
+  <li><b>Kafka + ksqlDB / Materialize:</b> topics are the log; materialized views are projections.</li>
+  <li><b>Banking ledgers:</b> double-entry accounting is event sourcing in formalwear — never overwrite a balance, append a transaction.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  +-------------+     command       +-----------------+
+  |   Client    |------------------&gt;|  Command Side   |
+  +-------------+                   |  (validate +    |
+        ^                           |   append event) |
+        | query                     +-------+---------+
+        |                                   |
+  +-----+-------+                           v
+  | Query Side  |                  +------------------+
+  |  (read model|&lt;-----project---  |   Event Log      |
+  |   per view) |                  | OrderPlaced #1   |
+  +-------------+                  | ItemShipped #2   |
+                                   | RefundIssued #3  |
+                                   +------------------+
+</div>
+<p>Writes go through a small command handler that validates business rules against a loaded aggregate (replay events for that order), then appends one or more new events. A separate process tails the log and updates read models — a "current orders" table, an Elasticsearch index, a daily-revenue rollup — each optimized for one query.</p>
+
+<h2>Snapshots and replay</h2>
+<p>Replaying every event from genesis is slow once you have millions per aggregate. The fix is <b>snapshots</b>: every N events, persist the current state. To rehydrate, load the latest snapshot and replay events after it. Snapshots are an optimization — the event log remains the source of truth, so you can always rebuild a snapshot when the schema evolves.</p>
+
+<h2>What you actually gain</h2>
+<ul>
+  <li><b>Audit for free.</b> The log <i>is</i> the audit trail.</li>
+  <li><b>Time travel.</b> "What did the cart look like at 9:42?" — replay up to that point.</li>
+  <li><b>New read models without backfill pain.</b> Want a fraud-detection view? Replay the log into a new projection.</li>
+  <li><b>Natural integration story.</b> Other services subscribe to the same event stream.</li>
+</ul>
+
+<h2>What it costs</h2>
+<ul>
+  <li><b>Eventual consistency on reads.</b> Projections lag behind commands by tens to thousands of ms.</li>
+  <li><b>Schema evolution is hard.</b> Old events live forever; you need versioning + upcasters.</li>
+  <li><b>Operational complexity.</b> Two stores (log + projections), more moving parts, more rebuild scripts.</li>
+  <li><b>Privacy/GDPR friction.</b> Immutable logs and "right to be forgotten" don't naturally agree — solve with crypto-shredding (drop the per-user encryption key).</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Using event sourcing for a CRUD domain — the audit value is zero, the complexity is real.</li>
+  <li>Letting projections drift from the log — always make them rebuildable from scratch.</li>
+  <li>Embedding business logic in events ("UserBecameVIP") that ages badly — keep events factual ("UserSpent &gt; 1000").</li>
+  <li>Forgetting idempotent projection consumers — at-least-once delivery applies here too.</li>
+  <li>Treating Kafka as the system of record without retention discipline — set retention to "forever" for sourcing topics.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Your e-commerce app uses event sourcing for orders. Marketing wants a new "average time from PlaceOrder to Shipped, per region" dashboard going back 2 years. The current read model doesn't have it. How do you build it without writing migration scripts or backfill jobs?
+  <br/>
+  <b>Hint:</b> Spin up a new consumer that starts at the beginning of the order-events topic, projects into a new table, then catches up to head. Switch the dashboard to it. The event log is the backfill.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-distributed-transactions">Design distributed transactions</a> — outbox + CDC pairs naturally with event sourcing.</li>
+  <li><a href="#problem/design-paypal">Design PayPal</a> — append-only ledger as the canonical event-sourced domain.</li>
+  <li><a href="#problem/design-wal">Design a WAL</a> — same append-only-log mechanics, one layer down.</li>
+</ul>

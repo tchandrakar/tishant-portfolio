@@ -1,0 +1,139 @@
+<h1>Design Shopify (multi-tenant SaaS for 1M+ merchants)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">ecommerce</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a multi-tenant e-commerce platform that hosts 2M+ merchants ranging from a single-product store to enterprises selling 1M units/day. Each merchant gets their own storefront, theme, products, checkout, and admin, but the underlying infrastructure is shared. Tenants must be isolated for performance and blast-radius, yet operationally the platform is one fleet.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Storefront rendering with themes (Liquid templates), custom domains, SEO.</li>
+  <li>Admin panel: products, inventory, orders, customers, discounts, apps.</li>
+  <li>Multi-currency, multi-region checkout with Shopify Payments + 3rd-party PSPs.</li>
+  <li>App ecosystem (webhooks, GraphQL Admin API, embedded apps via OAuth).</li>
+  <li>Black Friday Cyber Monday (BFCM) survival across all merchants simultaneously.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> storefront p99 &lt; 300 ms TTFB; admin API p99 &lt; 500 ms.</li>
+  <li><b>Scale:</b> 2M merchants, 50M MAU buyers, BFCM peak 50k checkouts/min globally.</li>
+  <li><b>Tenant isolation:</b> a noisy-neighbor merchant cannot starve others.</li>
+  <li><b>Availability:</b> 99.99%; checkout 99.995% (merchant revenue depends on it).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 700k storefront reads/s peak globally, 80k admin API/s, 5k checkouts/s.</li>
+  <li>Storage: 2M merchants * 1 GB avg = 2 PB; orders ~10 PB lifetime; assets ~50 PB on object store.</li>
+  <li>Bandwidth: 1 Tbps CDN egress at BFCM peak.</li>
+  <li>Webhook fan-out: 2B events/day to apps.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/storefront/{shop}/products?cursor=...   → product list
+POST  /v1/admin/{shop}/products  {payload}        → product
+POST  /v1/checkout/{shop}        {cart}           → checkoutId
+POST  /v1/checkout/{id}/payment  {token, idemKey} → status
+POST  /v1/webhooks/subscribe     {topic, url}     → subId
+GraphQL  POST /admin/api/2025-01/graphql.json</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Buyer]            [Merchant Admin]            [3rd-party App]
+   |                    |                            |
+[Fastly CDN] -- per-shop key cache
+   |                    |                            |
+[Shop Router] -- maps shop.com -&gt; pod-id
+   |                    |                            |
+   v                    v                            v
++---- Pod (cellular) ------- Pod ------- Pod -------+
+| [Storefront] [Admin API] [Checkout] [Jobs]        |
+| [MySQL primary + replicas]  [Redis]  [Memcache]   |
+| [Object store refs] [Search ES]                   |
++---------------------------------------------------+
+   |
+   v
+[Kafka platform bus] -&gt; [Webhooks] [Reporting] [Fraud] [Analytics]
+</div>
+<p>Cellular architecture (a la "pods"): each pod hosts ~100k shops with its own DB and stateful services. Failure of one pod can't take down the platform.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Tenant routing</h3>
+<pre>shops(shop_id PK, domain UNIQUE, pod_id, plan, created_at)</pre>
+<h3>7.2 Per-pod schema (MySQL, schema-per-tenant or shared with shop_id)</h3>
+<pre>products(shop_id, product_id, ...) PK(shop_id, product_id)
+orders  (shop_id, order_id, ...)   PK(shop_id, order_id)</pre>
+<p>All tables prefixed by <code>shop_id</code> so every query is naturally tenant-scoped.</p>
+<h3>7.3 Why shared MySQL with shop_id keying?</h3>
+<p>Schema-per-tenant explodes at 2M shops (DDL becomes glacial). Shared schema with mandatory shop_id in every WHERE clause + linter at the ORM layer keeps tenants logically isolated while operationally manageable.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Pod (cell) routing</h3>
+<p>Edge layer looks up <code>domain → pod_id</code> from a globally-replicated KV (DynamoDB-like). Requests are pinned to the home pod. Rebalancing migrates a shop with a copy-and-cutover approach: dual-write window + final delta replay.</p>
+<h3>8.2 Storefront rendering</h3>
+<p>Liquid templates compiled per-shop and cached in Memcache. Surrogate keys per shop allow targeted CDN purges on theme/product update.</p>
+<h3>8.3 Checkout</h3>
+<p>Shared checkout service but per-pod data. PSP integration uses idempotency keys; payment state machine identical to the order saga in the order pipeline doc.</p>
+<h3>8.4 Webhook delivery</h3>
+<p>Events to Kafka → fan-out worker → outbound HTTP with exponential backoff (up to 48h). Per-app circuit breaker prevents one slow app from exhausting workers.</p>
+<h3>8.5 Noisy-neighbor controls</h3>
+<p>Per-shop token bucket at API GW; per-pod global limit; "shop in trouble" mode that shifts the shop to a quarantine pod.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Mega-merchants (Kylie, Allbirds):</b> graduate to dedicated "whale" pods.</li>
+  <li><b>Cross-shop search/reporting:</b> async ETL into a column store (BigQuery) — never on the OLTP path.</li>
+  <li><b>App webhooks during BFCM:</b> back-pressure with bounded queues per app; drop-with-DLQ rather than backlog forever.</li>
+  <li><b>DB hot rows:</b> orders and inventory partitioned by shop_id; hot shop fits in one pod's primary or splits to its own.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Pod (cellular) architecture</td><td>Blast-radius limited, scales linearly</td><td>Cross-pod queries painful</td></tr>
+<tr><td>Shared schema + shop_id</td><td>Easy DDL, dense storage</td><td>Risk of cross-tenant bugs</td></tr>
+<tr><td>MySQL primaries per pod</td><td>Familiar, mature, ACID</td><td>Vertical scaling ceiling</td></tr>
+<tr><td>Liquid server-rendered</td><td>SEO, fast TTFB</td><td>Slower theme iteration</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — sharding by shop_id; rebalancing strategies.</li>
+  <li>Ch. 7 Transactions — single-pod ACID for checkout; outbox pattern for events.</li>
+  <li>Ch. 9 Consensus — leader election for the shop-routing config service.</li>
+  <li>Ch. 11 Stream Processing — Kafka platform bus for webhooks &amp; analytics.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Multi-tenant SaaS lives or dies by isolation; pods are the unit of failure containment."</li>
+  <li>"I'd never run cross-tenant joins on the OLTP store — that path leads to a single SPOF."</li>
+  <li>"Migration tooling is a first-class system: moving a shop between pods must be safe and observable, not a heroic exercise."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Pod (cellular) architecture</td><td>2M merchants on one fleet creates a single blast radius. Pods of ~100k shops each, with their own MySQL primary and stateful services, mean a hot-row meltdown affects 5% of merchants, not 100%. BFCM peak of 50k checkouts/min spreads naturally across pods.</td><td>Single global cluster (any noisy neighbor takes everyone down); micro-VM-per-tenant (2M VMs is operationally infeasible).</td></tr>
+<tr><td>MySQL primaries (per pod)</td><td>Shopify's bet: mature, ACID, well-understood, easy DBA recruiting. Per-pod primary handles a pod's shops at p99 &lt; 500 ms admin API. Shared schema with shop_id PK prefix avoids 2M-schema DDL hell while keeping every query naturally tenant-scoped.</td><td>Postgres (also fine; team familiarity tipped it); CockroachDB (cross-pod scaling unnecessary, costs more); DynamoDB (Liquid templates need joins).</td></tr>
+<tr><td>Fastly CDN</td><td>1 Tbps egress at BFCM peak with 700k storefront reads/s. Fastly's surrogate-key purges (per-shop key) let a theme update purge only that merchant's HTML in &lt; 150 ms globally — critical for SEO and merchant trust. Edge VCL allows shop-domain routing without origin hops.</td><td>CloudFront (purge granularity weaker historically); Akamai (more expensive at this scale).</td></tr>
+<tr><td>Liquid (server-rendered)</td><td>2M storefronts need SEO-friendly HTML and fast TTFB on slow 3G. Liquid templates compile per-shop, cache in Memcache, render on the pod. SSR keeps p99 TTFB &lt; 300 ms; client-side React would push first-paint past 1 s on low-end devices.</td><td>React/Next.js SSR (heavier runtime, cold starts); pure SPA (kills SEO, slow TTFB).</td></tr>
+<tr><td>Memcache</td><td>Compiled Liquid templates and per-shop hot product fragments cache in Memcache for sub-ms reads. Pure cache (no persistence needed), high-throughput, cheap RAM. Per-pod cluster keeps blast radius local; eviction is fine because MySQL is authoritative.</td><td>Redis (more features than needed; we want compiled-template byte cache, not data structures); local in-process cache (pod-wide invalidation hard).</td></tr>
+<tr><td>Redis (per pod)</td><td>Per-shop token buckets (noisy-neighbor control), session state, and short-lived workflow data live in Redis. Per-pod isolation means one shop's burst can't starve another pod's Redis. Lua scripts implement atomic rate-limiter increments.</td><td>Memcached (no atomic ops for token buckets); DynamoDB (latency too high for per-request rate-limit check).</td></tr>
+<tr><td>Elasticsearch (search)</td><td>Per-pod ES index for storefront product search. 80k admin API/s and storefront search both need facets + typo tolerance. Indexing per-pod limits cross-tenant blast radius and keeps shard count manageable. Cross-shop search forbidden on this path — that's BigQuery's job.</td><td>Algolia (would 2M tenants and SaaS-on-SaaS economics work? expensive); Postgres FTS (no facets at scale).</td></tr>
+<tr><td>Kafka (platform bus)</td><td>2B webhook events/day fan out from a Kafka platform bus. Partition by shop_id keeps webhook ordering per-shop. Outbox pattern ensures DB write + Kafka publish are atomic — you can't get a webhook for an order that doesn't exist.</td><td>RabbitMQ (no replay for backfills); Kinesis (vendor lock to AWS, Shopify is GCP-heavy).</td></tr>
+<tr><td>DynamoDB-like KV (shop routing)</td><td>The domain → pod_id lookup must be globally replicated and sub-10 ms — every request hits it. A KV store (DynamoDB or BigTable) replicates to every region; failure of the routing tier would freeze the platform, so we replicate aggressively rather than rely on a Postgres primary.</td><td>Postgres (single-region latency); DNS-based routing (TTLs too coarse for fast cutover).</td></tr>
+<tr><td>OAuth + GraphQL Admin API</td><td>3rd-party app ecosystem must connect on behalf of merchants without sharing credentials. OAuth scopes per app limit blast radius; GraphQL lets apps fetch exactly the fields they need, reducing API egress vs REST overfetch at the 80k admin API/s ceiling.</td><td>API keys (no per-scope revocation); REST (overfetch problem at this scale).</td></tr>
+<tr><td>Object store (S3/GCS)</td><td>50 PB of merchant assets (images, videos, theme files) is impractical on block storage. S3-class with CDN-fronting handles 1 Tbps egress; per-shop prefix isolation simplifies billing and quota. MySQL stores only object refs, never blobs.</td><td>Block storage (50 PB cost prohibitive); HDFS (operational tax).</td></tr>
+<tr><td>BigQuery (cross-shop ETL)</td><td>Cross-tenant reporting (admin dashboards, fraud, finance) cannot run on per-pod OLTP MySQL — it would re-introduce the SPOF that pods exist to prevent. Async CDC into BigQuery decouples analytics from the request path; minutely freshness is acceptable for reporting.</td><td>Snowflake (similar fit; GCP-native ergonomics tipped it); per-pod OLAP queries (kills isolation).</td></tr>
+<tr><td>Per-app circuit breaker</td><td>Webhook delivery to slow apps could exhaust HTTP worker pools during BFCM. Circuit breaker per app + bounded queue + exponential backoff (up to 48h) + DLQ keeps one buggy app from blocking the other 999 apps' webhooks. Critical at 2B events/day.</td><td>Single global queue (head-of-line blocking); fire-and-forget (loses delivery guarantees).</td></tr>
+</tbody>
+</table>
+

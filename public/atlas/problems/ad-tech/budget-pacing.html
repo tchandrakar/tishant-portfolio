@@ -1,0 +1,137 @@
+<h1>Design Budget Pacing &amp; Frequency Capping (avoid overspend, cap frequency)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ad-tech</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the system that enforces (a) <b>budget pacing</b>: spend the daily budget evenly through the day rather than burning it in the first hour, and (b) <b>frequency capping</b>: limit how many times a given user sees the same ad in a window. Both must be checked inline in the auction (sub-millisecond) at 1 M+ QPS, but with strict enforcement so that no campaign overspends by more than ~1% and no user sees an ad more than the cap.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Per-campaign daily &amp; lifetime budgets; intra-day pacing (ASAP, even, accelerated).</li>
+  <li>Frequency caps: per ad, per campaign, per advertiser, in windows (1 h, 1 day, 7 days).</li>
+  <li>Real-time admission decision: pass / drop in &lt; 1 ms.</li>
+  <li>Reconcile asynchronous spend events (clicks, impressions) against budgets.</li>
+  <li>Recover gracefully from late events without permanent overspend.</li>
+  <li>Reset frequency caps at window boundaries; fast lookup at 5 M QPS read.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p99 admission &lt; 1 ms; cap lookup p99 &lt; 0.5 ms.</li>
+  <li><b>Scale:</b> 5 M auction QPS, 2 B users × 1 KB cap state = 2 TB.</li>
+  <li><b>Accuracy:</b> overspend ≤ 1% of daily budget; cap exceedance ≤ 0.5%.</li>
+  <li><b>Availability:</b> 99.99% — failures must "fail closed" (don't serve) rather than overspend.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Auction QPS: 5 M, each does ~3 cap lookups → 15 M Redis GETs/sec.</li>
+  <li>Spend events: 25k clicks/sec + 1.2 M impressions/sec → 1.25 M decrements/sec.</li>
+  <li>Frequency state: 2 B users × 100 ads/user × 16 B = 3.2 TB; sharded across 64 Redis clusters.</li>
+  <li>Budget state: 10 M campaigns × 1 KB = 10 GB, fits in a single Redis Cluster.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET  /admit?campaign=...&amp;user=...&amp;ad=...   → {ok:bool, reason}
+POST /spend  {campaign_id, amount_micros, event_id}   → idempotent decrement
+POST /freq/incr {user_id, ad_id, ts}                  → updates HLL/window
+POST /budget/reset (cron daily)                       → roll daily counters
+GET  /pacing/curve?campaign=...                       → expected vs actual</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">                ┌─────── Auction Hot Path ───────┐
+[Ad Mixer] ──► [Pacer Sidecar (in-mem)] ──► [Redis Cluster: budgets]
+       │              │                            │
+       │              └─────► [Redis Cluster: freq caps (HLL/Bitmap)]
+       │
+       ▼
+[Kafka: spend events] ──► [Flink: aggregate, dedup] ──► [Redis decrement]
+                                       │
+                                       ▼
+                          [Spanner: source-of-truth ledger]
+                                       │
+                                       ▼
+                          [Pacing Controller (PID)] tunes per-campaign
+                                                    admission rate
+</div>
+<p>The auction path checks an in-memory token bucket replenished by the Pacing Controller. Spend events flow asynchronously through Kafka → Flink → Redis decrement, then are persisted to Spanner as the audit ledger. The PID controller adjusts each campaign's admission probability every 1 minute based on actual vs target spend.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Budget state (Redis hash, per campaign)</h3>
+<pre>HSET cmp:{id}
+  daily_budget_micros 100000000
+  spent_micros 23450000
+  pacing_rate 0.85          # admission probability
+  reset_at 1714521600
+  status active</pre>
+<h3>7.2 Frequency cap (Redis bitmap or HLL)</h3>
+<p>Key = <code>freq:{user_id}:{ad_id}</code>; value = small list of (timestamp, count) within window. Or per-user bitmap of ads seen, expired by window.</p>
+<h3>7.3 Spend ledger (Spanner)</h3>
+<p>Append-only event_id-keyed table for idempotent reconciliation; daily reconcile vs Redis to detect drift.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Token-bucket pacer</h3>
+<p>Each campaign has a bucket capacity = budget × overshoot-tolerance. Refill rate = budget / day_seconds × multiplier(t) where multiplier(t) follows the expected impression curve (more during prime time). Decrement is best-effort; exact spend reconciles via Flink.</p>
+<h3>8.2 PID-controlled pacing</h3>
+<p>Target spend by minute t = budget × cdf(t). Error = actual − target. Output is a 0..1 admission probability that throttles auctions to keep error small. Anti-windup clamps so depleted budgets don't get a burst when refilled.</p>
+<h3>8.3 Frequency capping</h3>
+<p>Three options ranked by cost: (1) sorted-set of impression timestamps trimmed by window — exact, ~50 B/user/ad; (2) sliding-window counter via Redis Cell — approximate, ~16 B; (3) HLL per (user, window) for cap-by-distinct-creatives — very compact. Choose per cap type.</p>
+<h3>8.4 Reconciliation</h3>
+<p>Hourly Flink job compares Spanner ledger to Redis. If drift &gt; 0.5%, reset Redis from ledger. Catastrophic loss of Redis is recoverable by replaying spend topic.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot campaigns:</b> shard a single big-spender across multiple Redis keys; sum on read or split bucket.</li>
+  <li><b>Cap explosions:</b> bots cause huge user keys; cap key size and quarantine outliers.</li>
+  <li><b>Time skew:</b> use NTP-synced PTP-grade clocks at the pacer; reset windows on Redis-server time.</li>
+  <li><b>Cold start of new campaigns:</b> aggressive pacing first hour with low cap to learn CPM, then ramp.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Async spend</td><td>1 ms admission</td><td>Tolerates ≤1% overspend</td></tr>
+<tr><td>Token bucket vs PID</td><td>Bucket: simple</td><td>PID smoother, more tuning</td></tr>
+<tr><td>HLL freq cap</td><td>Tiny memory</td><td>Approximate (~2% err)</td></tr>
+<tr><td>Fail-closed on Redis outage</td><td>No overspend</td><td>Lost revenue during outage</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 7 Transactions — idempotent spend writes via event_id; ledger as the source of truth.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — relaxed consistency on the auction path with eventually-consistent reconciliation.</li>
+  <li>Ch. 11 Stream Processing — Flink windowed aggregation of spend; exactly-once into Redis via idempotent decrement keyed by event_id.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The trick is to admit that strong consistency at 1 ms is impossible at this scale — so I design for bounded overspend (~1%) and reconcile."</li>
+  <li>"Pacing is a control problem; I'd reach for a PID rather than ad-hoc rules because it generalizes across pacing modes."</li>
+  <li>"Frequency caps are where data structure choice matters most: HLL vs sorted set is a 10× memory difference at 2 B users."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Redis Cluster (budget hot path)</td><td>5 M auctions/sec × 3 cap lookups = 15 M Redis GETs/sec at p99 &lt;0.5 ms; Redis's single-threaded in-memory model gives deterministic sub-ms reads, and Lua scripts make decrement+check atomic without the round-trip cost of WATCH/MULTI.</td><td>Memcached (rejected: no Lua atomicity); Postgres (rejected: 100x too slow); DynamoDB (cross-region latency).</td></tr>
+<tr><td>Aerospike (frequency cap state)</td><td>2 B users × 100 ads × 16 B = 3.2 TB sharded; Aerospike's hybrid RAM/SSD storage holds frequency-cap state at sub-ms p99 reads cheaper than pure-RAM Redis at this scale, with auto-sharding across 64 nodes.</td><td>Pure Redis (rejected: RAM cost for 3.2 TB prohibitive); Cassandra (rejected: p99 too high for 0.5 ms target).</td></tr>
+<tr><td>Lua atomic decrement (Redis)</td><td>Spend decrement at 1.25 M decrements/sec must be idempotent (event_id-keyed) and atomic (no overspend race); Lua's atomic execution within Redis avoids the GET-CAS-SET race that would let two consumers double-decrement on Kafka rewind.</td><td>WATCH/MULTI (rejected: retry storms); client-side CAS (race window); external lock service (latency).</td></tr>
+<tr><td>HyperLogLog (HLL freq cap)</td><td>Cap-by-distinct-creatives uses HLL ~12 KB per (user, window) for ~2% error vs 5 KB exact sorted-set per cap; at 2 B users this is the difference between 24 GB and 10 TB — the approximation is acceptable for cap-by-distinct.</td><td>Exact sorted-set (rejected: 10TB+ memory cost); count-min sketch (similar, HLL chosen for distinct-count fit).</td></tr>
+<tr><td>Redis sorted-set (exact cap)</td><td>For exact cap-by-impression-count, sorted-sets keyed by (user, ad) trim by score (timestamp); ~50 B per (user, ad) is exact-correct and supports sliding-window via ZREMRANGEBYSCORE in &lt;0.3 ms.</td><td>Bitmap (rejected: ad-id sparse); Redis Cell module (approx, not exact); list (rejected: no efficient trim).</td></tr>
+<tr><td>Token-bucket pacer (per campaign)</td><td>Refill rate = budget/day_seconds × multiplier(t) gives smooth pacing without admit/deny flapping; the bucket model is well-understood, easy to reason about, and admits in O(1) — critical at the 5 M QPS auction rate.</td><td>Leaky bucket (similar perf, less flexible refill); naive rate-limit per second (rejected: bursts).</td></tr>
+<tr><td>PID controller (pacing)</td><td>Target spend by minute t = budget × cdf(t); PID's P-I-D terms react to current error, accumulate to fix bias, and dampen oscillation — a hand-tuned threshold rule would over- or under-pace under traffic shifts (Black Friday, time zone roll).</td><td>Bang-bang control (rejected: oscillates); ML-based pacer (overkill, slower to debug).</td></tr>
+<tr><td>Apache Kafka (spend events)</td><td>1.25 M decrements/sec from clicks + impressions need a durable replayable log so that a Redis cluster failure can replay missed decrements; partition-by-campaign avoids hotspots on big spenders.</td><td>RabbitMQ (rejected: no replay); Kinesis (shard limits at this rate).</td></tr>
+<tr><td>Apache Flink (spend aggregator)</td><td>1-minute aggregation windows of spend events keyed-by-campaign feed both Redis decrement and Spanner ledger; Flink's exactly-once + windowed sums prevent double-counting on Kafka rewind, and idempotent Redis decrement (keyed by event_id) survives retries.</td><td>Spark Streaming (rejected: micro-batch lag for 1-min PID loop); Kafka Streams (state-size limits at TB).</td></tr>
+<tr><td>Spanner (spend ledger / source-of-truth)</td><td>Append-only event_id-keyed ledger needs ACID for daily billing reconciliation; Spanner's external consistency means finance reads the same total all advertiser dashboards saw, even cross-region — and the ledger reconciles Redis drift hourly.</td><td>Postgres (rejected: no global ACID); Cassandra (no ACID); BigQuery (no idempotent UPSERT).</td></tr>
+<tr><td>Fail-closed on Redis outage</td><td>If Redis is unreachable, the auction admission decision returns "no" — a brief revenue loss is recoverable, but uncapped overspend is not (advertisers can't recover their dollars from a vendor); the SLA explicitly trades availability for accuracy.</td><td>Fail-open (rejected: catastrophic overspend); fallback to Spanner (rejected: too slow at 5 M QPS).</td></tr>
+<tr><td>NTP-PTP synced clocks</td><td>Pacing windows reset on a wall clock; clock skew &gt;100 ms across pacers causes per-shard drift in admission probability; NTP/PTP keeps hosts within ~1 ms, and reset operations use Redis-server time as the canonical clock.</td><td>Local clocks only (rejected: skew up to seconds); centralized time service (extra dependency).</td></tr>
+<tr><td>Hourly Flink reconciler</td><td>Drift between Redis (decrement) and Spanner (ledger) accumulates from late events / retries; an hourly reconciler resets Redis from ledger if drift &gt;0.5%, bounding total error to the &lt;1% SLA without blocking the auction path.</td><td>Real-time reconcile (rejected: latency cost); daily only (rejected: drift can exceed SLA mid-day).</td></tr>
+</tbody>
+</table>

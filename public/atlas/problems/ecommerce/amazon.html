@@ -1,0 +1,141 @@
+<h1>Design Amazon (product catalog + checkout + recs at scale)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">ecommerce</span>
+  <span class="tag">search</span>
+  <span class="tag">recommendation</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a planet-scale e-commerce platform like Amazon: 600M+ SKUs, 300M+ active customers, multi-region marketplaces, full-text product search, personalized recommendations, a transactional cart/checkout flow, and a payments pipeline that survives Black Friday traffic. Reads dominate (~95%) but the writes (orders, payments, inventory) must be ACID-correct.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Browse and search the catalog by keyword, category, brand, faceted filters.</li>
+  <li>Render product detail pages (PDP) with price, inventory, reviews, recs.</li>
+  <li>Add-to-cart, checkout, apply promotions/coupons, charge payment, place order.</li>
+  <li>Personalized recommendations on home page, PDP, and post-purchase.</li>
+  <li>Order tracking, returns, refunds, seller marketplace, Prime entitlements.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> PDP p99 &lt; 200 ms; search p99 &lt; 300 ms; checkout p99 &lt; 800 ms.</li>
+  <li><b>Scale:</b> 300M MAU, peak 600k RPS catalog reads, 50k orders/sec on Prime Day.</li>
+  <li><b>Availability:</b> 99.99% for browse; 99.995% for checkout/payments.</li>
+  <li><b>Durability:</b> 11 nines for orders &amp; payments (no lost transactions).</li>
+  <li><b>Consistency:</b> strong for inventory decrement &amp; payments; eventual for reviews/recs.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 600k catalog reads/s peak, 8k cart writes/s, 50k orders/s peak (Prime Day).</li>
+  <li>Storage: 600M SKUs * 4 KB metadata = ~2.4 TB hot; reviews ~50 TB; orders ~5 PB lifetime.</li>
+  <li>Bandwidth: 200 Gbps egress for images/CSS/JS via CDN; ~5 Gbps for JSON APIs.</li>
+  <li>Cache: 95% PDP hit rate at edge → origin needs ~30k RPS only.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/catalog/product/{asin}                  → product JSON
+GET   /v1/search?q=...&amp;f=brand:nike&amp;page=1        → results, facets
+POST  /v1/cart/{userId}/items   {asin, qty}        → cartId
+POST  /v1/checkout/{cartId}     {addressId, payId} → orderId, status
+GET   /v1/orders/{orderId}                         → order JSON
+POST  /v1/recs/home             {userId, ctx}      → [asin]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client] -&gt; [CloudFront CDN] -&gt; [API Gateway] -&gt; [BFF / GraphQL]
+                                                  |
+   +--------------+--------------+----------------+----------------+
+   |              |              |                |                |
+[Catalog]    [Search]      [Cart Svc]      [Checkout Svc]    [Reco Svc]
+   |          (ES/Solr)        |                |                |
+[DynamoDB]   [Index]      [Redis+DDB]      [Order Saga]    [Feature Store]
+                                                |
+                                          [Kafka bus]
+                                                |
+                          +--------+---------+--------+---------+
+                          |        |         |        |         |
+                       [Payments][Inv Svc][Fulfil] [Notif]   [Analytics]
+                          |        |
+                       [PSPs]  [Postgres + Redis lock]
+</div>
+<p>Walk-through: client hits the edge CDN; cacheable PDP HTML/JSON is served from POPs. Dynamic calls fan out from a BFF to micro-services. Orders flow as a saga over Kafka so failures roll back cleanly.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Catalog (DynamoDB)</h3>
+<pre>PK = asin (String)
+SK = "META" | "PRICE#region" | "OFFER#sellerId"
+attrs: title, brandId, categoryPath, dims, images[], gsi_brand_id</pre>
+<h3>7.2 Orders (sharded Postgres + S3 cold tier)</h3>
+<pre>orders(order_id PK, user_id, status, total_cents, created_at)
+order_items(order_id, asin, qty, unit_price_cents, seller_id)</pre>
+<h3>7.3 Why this split?</h3>
+<p>Catalog is read-heavy, key-value, eventually consistent → DynamoDB with global tables. Orders need ACID multi-row writes (item, payment, inventory) → relational. Search needs inverted indexes → Elasticsearch. Recs need vectors → feature store + ANN.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Search</h3>
+<p>Catalog updates publish to Kafka; an indexer denormalizes into Elasticsearch (sharded by category hash, replica factor 3). Query service rewrites with synonyms, runs BM25 + a learned-ranker re-rank step on the top 200. Facets are bitmap-cached.</p>
+<h3>8.2 Cart</h3>
+<p>Authoritative copy in DynamoDB keyed by userId; Redis write-through cache (TTL 7d) for fast reads. Guest carts use a signed cookie cart-id and merge on login.</p>
+<h3>8.3 Checkout saga</h3>
+<p>Choreographed saga: <i>ReserveInventory → ChargePayment → CreateShipment → ConfirmOrder</i>. Each step emits events; compensating events (release-inventory, refund) handle failure. Idempotency keys on every step.</p>
+<h3>8.4 Recommendations</h3>
+<p>Two-stage: candidate generation via ANN over user/item embeddings (FAISS), then a GBDT ranker scoring CTR * margin. Online features in Redis, offline in S3+EMR.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot SKUs (iPhone launch):</b> request coalescing at edge + per-key rate limit + pre-warmed shards.</li>
+  <li><b>Inventory contention:</b> single-item reservation row protected by DDIA Ch.7 transactional patterns; fall back to Redis Redlock for soft holds.</li>
+  <li><b>Search shard hotness:</b> route by (categoryHash, asin) so popular categories spread across shards.</li>
+  <li><b>Checkout spikes:</b> queue-based load leveling — orders enqueued to Kafka and processed at a stable rate downstream.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>DynamoDB for catalog</td><td>Predictable p99, multi-region</td><td>No joins, costly scans</td></tr>
+<tr><td>Saga over 2PC for orders</td><td>Loose coupling, scalable</td><td>Compensations are tricky, eventual</td></tr>
+<tr><td>Edge cache PDP</td><td>10x origin reduction</td><td>Stale price/stock risk; needs short TTL + purges</td></tr>
+<tr><td>ES for search</td><td>Rich faceting, BM25</td><td>Re-indexing is heavy; no transactions</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — DynamoDB global tables, ES replicas.</li>
+  <li>Ch. 6 Partitioning — composite keys for catalog, hash + range for orders.</li>
+  <li>Ch. 7 Transactions — serializable inventory decrement to prevent oversell.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — Redlock caveats, leader election in fulfilment.</li>
+  <li>Ch. 11 Stream Processing — Kafka bus for the order saga and search indexer.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I split the system by read/write profile: catalog/search optimized for reads at the edge; checkout/orders optimized for correctness via a saga."</li>
+  <li>"The hardest part is preventing oversell on hot items during a flash sale; my mitigation is a single-row authoritative reservation with idempotency keys, not Redlock alone."</li>
+  <li>"I would start single-region and add cross-region active-active for catalog only; orders stay home-region with async replication for DR."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>CloudFront CDN</td><td>With 200 Gbps egress and 600k catalog reads/s peak, edge caching delivers a 95% hit rate so origin sees only ~30k RPS. Surrogate keys per ASIN allow targeted purges when price/stock changes, keeping PDP p99 under 200 ms globally.</td><td>Self-hosted Varnish (operationally heavy at this scale); Cloudflare (fine, but AWS-native integration with S3/Lambda@Edge wins).</td></tr>
+<tr><td>DynamoDB (catalog)</td><td>600M SKUs at 4 KB each is a key-value workload with predictable single-digit ms p99. Global tables replicate across regions for 300M MAU. ASIN PK + SK pattern (META/PRICE/OFFER) avoids joins entirely and scales horizontally without re-sharding.</td><td>Cassandra (similar shape, more ops overhead); MongoDB (weaker p99 tail at this scale).</td></tr>
+<tr><td>Elasticsearch (search)</td><td>Inverted-index BM25 with faceted filters over 600M SKUs needs sub-300 ms p99 search. Sharded by category hash with replica factor 3 spreads hot categories. Bitmap-cached facets and learned re-rank on top 200 are first-class citizens.</td><td>Solr (similar but smaller community); Postgres FTS (no learned ranking, weak faceting at this scale).</td></tr>
+<tr><td>Sharded Postgres (orders)</td><td>Orders need ACID multi-row writes (order + items + payment) with 11 nines durability. Relational integrity prevents orphaned charges; serializable isolation prevents oversell at 50k orders/s on Prime Day. Hash-by-user_id keeps a checkout local to one shard.</td><td>DynamoDB (no multi-row tx); CockroachDB (cross-region latency hurts checkout p99).</td></tr>
+<tr><td>Redis (cart + features)</td><td>Cart needs read p99 &lt; 50 ms across 8k cart writes/s with write-through to DynamoDB. Also stores online recommendation features for sub-10 ms feature lookup during the GBDT ranker step. Redlock is used only for soft holds, never authoritative.</td><td>Memcached (no data structures, no persistence); local in-process cache (no cross-instance coherence).</td></tr>
+<tr><td>Kafka (event bus)</td><td>The order saga's ReserveInventory → ChargePayment → CreateShipment → ConfirmOrder steps need durable, ordered, partitioned events. Partition by order_id gives even spread; 7-day retention enables saga replay after orchestrator failure without losing in-flight orders.</td><td>RabbitMQ (no log replay, weaker throughput); SQS (no ordering per partition).</td></tr>
+<tr><td>FAISS (recs ANN)</td><td>Two-stage recommender candidate generation needs k-NN over hundreds of millions of user/item embedding vectors at sub-50 ms. FAISS IVF+PQ on a GPU box recalls 1000 candidates fast enough that a downstream GBDT can score in the latency budget.</td><td>Annoy (slower at billion-scale); Elasticsearch dense_vector (much higher tail latency).</td></tr>
+<tr><td>S3 + EMR (offline ML)</td><td>Reviews data (~50 TB) and offline feature engineering for recs run on cheap object storage with Spark/EMR. Decouples slow batch training from the online serving path; online features go to Redis, offline embeddings to FAISS index.</td><td>HDFS (operational tax); Snowflake (great for BI, expensive for raw ML feature pipelines).</td></tr>
+<tr><td>Saga (choreographed)</td><td>2PC across Payments, Inventory, Fulfilment is impractical at 50k orders/s. Choreographed saga with compensating events (release-inventory, refund) tolerates partial failures; idempotency keys per step give exactly-once-effect without locking distributed resources.</td><td>2PC (blocks under failure); orchestrated saga (we'd choose this if lifecycle ownership mattered more than coupling).</td></tr>
+<tr><td>API Gateway + BFF (GraphQL)</td><td>A PDP needs catalog + price + reviews + recs in &lt; 200 ms. The BFF parallelizes fan-out to micro-services and returns one payload. Per-route token buckets enforce 50k orders/s ceiling and protect downstream from thundering herds during launches.</td><td>REST aggregation in client (chatty over mobile); direct service-to-service from client (auth/security nightmare).</td></tr>
+<tr><td>Postgres + Redis lock (inventory)</td><td>Hot SKUs (iPhone launch) need a single authoritative reservation row with serializable isolation to prevent oversell. Redis Redlock is layered on top for soft holds only; the relational row is always the source of truth — never trade correctness for cache speed on stock.</td><td>Pure Redis counters (lost-update under partition); DynamoDB conditional writes (works, but Postgres SERIALIZABLE is simpler reasoning here).</td></tr>
+<tr><td>WAF + bot management at edge</td><td>Hot-product launches attract scalpers who can drain inventory in seconds. Edge rate limiting (per-IP, per-account) and fingerprinting drop bots before they hit the API GW, protecting the 50k orders/s budget for real customers.</td><td>App-layer rate limit only (too late, origin already burned); CAPTCHA-everywhere (kills conversion for legitimate users).</td></tr>
+</tbody>
+</table>
+

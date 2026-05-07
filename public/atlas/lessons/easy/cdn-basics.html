@@ -1,0 +1,77 @@
+<h1>CDN basics: how it works, push vs pull, edge caching</h1>
+<div class="meta-row">
+  <span class="tag diff-Easy">Easy</span>
+  <span class="tag">cdn</span>
+  <span class="tag">caching</span>
+  <span class="tag">latency</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>A CDN (content delivery network) is a fleet of caches scattered around the world, sitting close to your users. When a user asks for a file, DNS or anycast routes them to the nearest edge node; if that node has the file, it serves it directly — no trip to your origin. The result: faster page loads, lower bandwidth bills, and a shield in front of your servers when traffic spikes.</p>
+
+<h2>Why it matters</h2>
+<p>Most static assets — images, JS bundles, videos, fonts, even API responses — don't change often but get requested millions of times. Sending every request back to a single origin is wasteful and slow for users far from your data center. A CDN turns one global problem ("how do I serve everyone fast?") into a set of local problems ("how do I serve people in Frankfurt fast?"), each solved by the nearest edge.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Cloudflare / Fastly / Akamai:</b> general-purpose CDNs in front of websites and APIs.</li>
+  <li><b>CloudFront:</b> AWS-native CDN, often paired with S3 for static hosting.</li>
+  <li><b>Netflix Open Connect:</b> custom CDN appliances installed inside ISPs to serve video locally.</li>
+  <li><b>Spotify / YouTube:</b> tiered edge caches for media chunks; popular content is pre-warmed close to users.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">                    user (Tokyo)
+                        |
+                  DNS / anycast
+                        |
+                        v
+              +---------------------+
+              |  EDGE node (Tokyo)  |
+              |   cache HIT? --&gt; serve from disk
+              |   cache MISS -+
+              +----|----------+
+                   |  miss
+                   v
+              [REGIONAL shield] -- miss --&gt; [ORIGIN]
+                                              |
+                                            S3 / app
+</div>
+<p>An edge HIT serves the byte directly to the user. A MISS triggers a fetch up the hierarchy: edge → regional shield → origin. Once the asset is fetched, every subsequent request in that region is a cheap HIT until the TTL expires or it gets evicted.</p>
+
+<h2>Push vs pull</h2>
+<ul>
+  <li><b>Pull CDN (lazy):</b> the edge fetches from origin on first request, then caches. Easy to set up — just point CNAME and add cache headers. First user in each region pays the latency cost.</li>
+  <li><b>Push CDN (eager):</b> you upload assets to the CDN ahead of time. Used for huge media libraries (video) where you don't want any user to be the unlucky first-miss, and where origin bandwidth is precious.</li>
+</ul>
+<p>In practice, most teams start with pull and reach for push only when content is large, predictable, and expensive to miss.</p>
+
+<h2>Cache control — the headers that matter</h2>
+<ul>
+  <li><b>Cache-Control: max-age</b> — how long the edge may serve the asset without revalidating.</li>
+  <li><b>ETag / Last-Modified</b> — let the edge do a cheap conditional GET on revalidation.</li>
+  <li><b>stale-while-revalidate</b> — serve a stale copy while fetching a fresh one in the background. Smooths spikes nicely.</li>
+  <li><b>Vary</b> — split caches by Accept-Encoding, device, etc. Use sparingly: it multiplies cache entries.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Caching personalized HTML at the edge (now everyone sees Bob's account page).</li>
+  <li>Setting TTL=0 "to be safe" — every request becomes a MISS and you've turned the CDN into a slow proxy.</li>
+  <li>Forgetting to bust the cache on deploys — users get stale JS that breaks against new APIs. Use content-hashed filenames.</li>
+  <li>Trusting one CDN provider for 100% of traffic; outages happen. Multi-CDN with DNS failover for high-stakes sites.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Your video site has 10&nbsp;PB of content but 90% of views target only 1% of titles. How would you size and configure CDN caches, and what would you push vs pull?
+  <br/>
+  <b>Hint:</b> The long tail is the killer. Think about hot/cold tiering and what eviction policy preserves the working set.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-youtube">Design YouTube</a> — tiered CDN with hot-content pre-warming.</li>
+  <li><a href="#problem/design-netflix">Design Netflix streaming</a> — push CDN appliances inside ISPs.</li>
+  <li><a href="#problem/design-image-cdn">Design an image CDN</a> — on-the-fly resize and format negotiation at the edge.</li>
+</ul>

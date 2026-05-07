@@ -1,0 +1,81 @@
+<h1>Lambda vs Kappa architecture for analytics</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">analytics</span>
+  <span class="tag">streaming</span>
+  <span class="tag">batch</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p><b>Lambda architecture</b> runs two pipelines: a slow accurate <i>batch layer</i> (recomputes everything from raw data) and a fast approximate <i>speed layer</i> (streams recent events). Queries union the two. <b>Kappa architecture</b> deletes the batch layer — everything is a stream, and "reprocessing history" just means replaying the log from the beginning through the same streaming code. Lambda gives correctness at the cost of two codebases. Kappa gives operational simplicity at the cost of needing a streaming engine that can chew through years of history.</p>
+
+<h2>Why it matters</h2>
+<p>Every product surfaces analytics: dashboards, recommendation features, fraud scores, retention funnels, billing rollups. The architecture you pick decides whether engineers maintain one job or two for every metric, how quickly bug fixes can be backfilled, and whether you can answer "what was true at 3am yesterday?" without spinning up a Spark job. The wrong choice locks you into months of dual-pipeline drift.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Lambda (classic):</b> Twitter (early), LinkedIn (early), most Hadoop+Storm shops circa 2014.</li>
+  <li><b>Kappa:</b> Uber's M3, LinkedIn's Samza-based pipelines, most Flink-on-Kafka shops.</li>
+  <li><b>Hybrid:</b> Netflix Keystone — streaming for fresh data, periodic batch jobs for backfills and corrections.</li>
+  <li><b>Modern lakehouse:</b> Databricks/Iceberg/Delta — one storage layer, both batch and stream readers; arguably Kappa with a cheaper rewind.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">LAMBDA
+  raw events --> [ Kafka ] --+--> Speed (Flink)  --> realtime view  --\
+                              |                                         >--> Query merges
+                              +--> Batch (Spark, hourly) --> batch view -/
+
+KAPPA
+  raw events --> [ Kafka, retained for years ] --> Stream job (Flink) --> view
+                                                        ^
+                                                        |
+                                          rewind offset 0 to reprocess
+</div>
+<p>In Lambda, the batch layer is the source of truth; the speed layer fills the gap between "now" and "last batch ran". In Kappa, the log itself is the source of truth, and the stream job is the only consumer. Reprocessing means starting a new instance of the job from offset 0 and atomically swapping the output table when it catches up.</p>
+
+<h2>When Lambda still wins</h2>
+<ul>
+  <li><b>Heavy joins across years of data:</b> Streaming joins over 5 years of events are painful; nightly Spark is fine.</li>
+  <li><b>Regulated reporting:</b> Auditors want a reproducible batch job with a fixed input snapshot, not "we replayed Kafka."</li>
+  <li><b>Cheap storage tier:</b> Batch can run on Parquet in S3 with spot instances. Streaming infra costs more per GB processed.</li>
+  <li><b>Approximate is fine for "now":</b> Use HyperLogLog/Count-Min in the speed layer, exact in batch. Many dashboards live happily with this.</li>
+</ul>
+
+<h2>When Kappa wins</h2>
+<ul>
+  <li><b>Bug-fix velocity:</b> One codebase. Fix a metric, redeploy, rewind. No "did we update both?" drift.</li>
+  <li><b>Sub-minute freshness everywhere:</b> If product needs streaming anyway, why maintain a second pipeline?</li>
+  <li><b>Event-sourced systems:</b> The log already exists and is already retained — Kappa is almost free.</li>
+  <li><b>Schema evolution:</b> Replay with new schema; no need to migrate two stores.</li>
+</ul>
+
+<h2>Anti-patterns and failure modes</h2>
+<ul>
+  <li><b>Two codebases drifting:</b> The classic Lambda failure — the batch SUM and the streaming SUM don't agree, and nobody knows which is right. Symptom: dashboards that "look weird on Mondays."</li>
+  <li><b>Kappa with insufficient retention:</b> You need to reprocess 6 months of history but Kafka only kept 7 days. Now you have to bolt on a batch source — congratulations, you're back to Lambda.</li>
+  <li><b>Reprocessing while serving:</b> Naively rewinding the live job blanks out the dashboard for hours. Always reprocess into a shadow output and atomic-swap.</li>
+  <li><b>Late-arriving data ignored:</b> Stream windows close at watermark; events arriving 2 hours late are silently dropped. Fix: side outputs + scheduled reconciliation.</li>
+  <li><b>Hot keys melting the stream job:</b> One celebrity user generating 10% of events stalls the partition. Pre-aggregate or salt keys.</li>
+  <li><b>Exactly-once theater:</b> Engine claims exactly-once but your sink (e.g. plain HTTP) isn't idempotent. End-to-end you have at-least-once. Make sinks idempotent or use transactional sinks.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Choosing Lambda "to be safe" then never investing in the batch layer — it rots and the speed layer becomes the de facto truth anyway.</li>
+  <li>Choosing Kappa without budgeting for Kafka/Pulsar long-term storage and tiered storage costs.</li>
+  <li>Ignoring backfill cost: a stream job that takes 3 weeks to reprocess 1 year is not really Kappa, it's Lambda with extra steps.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're building a retention-funnel dashboard that says "of users who signed up last quarter, what % completed onboarding within 7 days?" Marketing wants minute-level freshness for today's cohort but is fine with hourly for older cohorts. Lambda or Kappa? How do you handle the 7-day window when reprocessing?
+  <br/>
+  <b>Hint:</b> Think about which numbers ever change after they're computed. The 90-day-old cohort number is fixed. Today's is volatile. Does that suggest one architecture, or a split?
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-funnel-retention">Design a funnel/retention pipeline</a> — direct application of these trade-offs.</li>
+  <li><a href="#problem/design-distributed-counter">Design a distributed counter</a> — speed-layer approximations vs batch-layer exact rollups.</li>
+</ul>

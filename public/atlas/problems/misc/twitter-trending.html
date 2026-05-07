@@ -1,0 +1,203 @@
+<h1>Design Twitter Trending Topics (count-min sketch, top-K streaming)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">misc</span>
+  <span class="tag">social-network</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Compute the top-50 trending topics (hashtags, n-grams, named entities) globally and per-region every minute, from a firehose of 500 K tweets/sec, using a small fixed memory footprint and no full per-key counters. Trends should reflect velocity (recent spikes), not just absolute volume; spam &amp; bot-generated trends must be suppressed.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Global top-K trends, refreshed every 60 s.</li>
+  <li>Per-region top-K (200 regions), per-locale, per-time-window (5 min, 1 hr, 24 hr).</li>
+  <li>Personalised trends (filter by who-you-follow's network).</li>
+  <li>Spike detection: a hashtag jumping from 100/min to 50,000/min should bubble up immediately.</li>
+  <li>Spam suppression: bot rings, repeated identical tweets, suspended-account amplification removed.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> end-to-end tweet-to-trend &lt; 90 s p99.</li>
+  <li><b>Scale:</b> 500 K tweets/sec sustained, 1.5 M/sec peak (world cup final).</li>
+  <li><b>Memory:</b> trend computation must run in &lt; 4 GB RAM per worker (no full key map).</li>
+  <li><b>Accuracy:</b> top-50 set match with exact ground truth ≥ 95% across 1 hr windows.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>500 K tweets/s × 5 candidate terms each = 2.5 M counter-bumps/sec.</li>
+  <li>Exact counters: 50 M unique terms/day × 16 B = 800 MB; with bigrams + trigrams ⇒ 10–50 GB. Sketches reduce to ≤ 200 MB per worker.</li>
+  <li>Kafka tweet topic: 500 K × 1 KB = 500 MB/s ingress, 256 partitions.</li>
+  <li>Output: 200 regions × 50 trends × 60 refreshes/hr = 600 K rows/hr to Cassandra (~150 GB/yr).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET /v1/trends/global?window=5m&amp;limit=50          → [{term, score, deltaPct}]
+GET /v1/trends/region/{geo}?window=1h&amp;limit=50    → [...]
+GET /v1/trends/personalized?userId=...             → [...]
+INTERNAL: trend-pipeline consumes Kafka tweets, emits trend-snapshots topic.</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Tweet Ingest]──►[Kafka: tweets (256 partitions)]
+                          │
+                          ▼
+                 [Spam Filter (Flink)]──drops──►[bot-events]
+                          │
+                          ▼
+                 [Tokenizer + NER (Flink)]
+                          │
+                ┌─────────┼─────────┐
+                ▼         ▼         ▼
+        [CMS Worker]  [CMS Worker]  ...      (per region keyed)
+                │         │         │
+                └────►[Heavy Hitter Top-K (Space-Saving)]
+                          │
+                          ▼
+                 [Trend Aggregator]──►[Cassandra: trend_snapshots]
+                          │
+                          ▼
+                 [Cache (Redis) ←── Read API]
+</div>
+<p>Flink consumes the tweet topic, tokenizes into terms (hashtags, hashtag-less n-grams, named entities), updates per-window count-min sketch + Space-Saving top-K, then aggregator merges shards into final ranked list.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Trend snapshots (Cassandra)</h3>
+<pre>CREATE TABLE trend_snapshots (
+  scope text,           -- "global" | "region:US-CA"
+  window text,          -- "5m" | "1h"
+  ts_bucket bigint,
+  rank int,
+  term text, score double, delta_pct double,
+  PRIMARY KEY ((scope, window), ts_bucket, rank)
+) WITH CLUSTERING ORDER BY (ts_bucket DESC, rank ASC);</pre>
+<h3>7.2 Sketch state (Flink RocksDB)</h3>
+<p>Per (scope, window) keyed state holds a count-min sketch (depth=4, width=2^17 → 524 KB) plus a Space-Saving top-K (k=500, ~30 KB). Total ~600 KB per scope × 200 scopes × 4 windows ≈ 480 MB — fits comfortably.</p>
+<h3>7.3 Cache (Redis)</h3>
+<p>Top-50 per scope cached as a JSON blob with 60 s TTL; read API never hits Cassandra on cache hit.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Probabilistic top-K</h3>
+<p>Count-min sketch supplies <i>frequency estimate</i> for any term in O(d) hashing; Space-Saving (Misra-Gries) maintains the actual top-K candidates with bounded error. Hybrid: every term increments CMS; if its CMS estimate exceeds the current K-th element of Space-Saving, it enters/replaces. This is the canonical sketch combo from DDIA Ch. 11's stream-processing notes on heavy-hitter detection.</p>
+<h3>8.2 Sliding windows</h3>
+<p>Tumbling 60 s sub-windows; a 5 min window is the union of 5 sub-windows. Each sub-window gets its own CMS; on advance, oldest is dropped (no cell-by-cell decay). For 1 hr window: 12 × 5 min snapshots merged on read.</p>
+<h3>8.3 Spike detection (z-score)</h3>
+<p>For each top-K candidate, compute baseline = EWMA over last 60 minutes of per-minute counts. <code>spikeScore = (currentMinute − baseline) / stddev</code>. Trends sorted by <code>0.6 × volumeRank + 0.4 × spikeRank</code>. This catches "X just got mentioned 50× normal" even when total count is modest.</p>
+<h3>8.4 Spam &amp; bot suppression</h3>
+<p>Pre-pipeline filter: drops tweets from suspended accounts, near-duplicate text (SimHash within 3 bits), accounts with &lt; 24 h age + &gt; 100 tweets/day. Per-term unique-author HyperLogLog: a hashtag with 100 K mentions but only 200 unique authors is demoted (bot ring).</p>
+<h3>8.5 Personalised trends</h3>
+<p>Per-user trends are too expensive to compute live (300 M users). We compute per-cluster (1,000 follower clusters from offline clustering) and assign each user to their cluster; live read is a single cluster's top-K.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Skewed partitions:</b> mega-event hashtag floods one partition. Fix: secondary salt + map-side combine before shuffle.</li>
+  <li><b>Late events:</b> Flink watermark with 30 s allowed lateness; later events dropped from current trend.</li>
+  <li><b>Cold start of new region:</b> bootstrap from last hour replay (Kafka log compaction off; retention 24 h).</li>
+  <li><b>Cassandra wide row:</b> ts_bucket clustering keeps partition bounded; older snapshots TTL'd at 30 days.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Count-min sketch over exact map</td><td>50× memory savings</td><td>Over-estimates rare keys; mitigated by Space-Saving</td></tr>
+<tr><td>Tumbling sub-windows over decay</td><td>Simple, correct on drop</td><td>Step-function behavior on window boundary</td></tr>
+<tr><td>Cluster-based personalization</td><td>O(1) read, scales</td><td>Less personal than true per-user</td></tr>
+<tr><td>Volume + spike hybrid score</td><td>Catches velocity</td><td>Tuning the 0.6/0.4 weight is ongoing</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — windowed aggregations, watermarks, late-event handling; sketch data structures (CMS, Space-Saving / Misra-Gries, HyperLogLog) explicitly cited as the right tool for unbounded streams with bounded memory.</li>
+  <li>Ch. 6 Partitioning — keyed Flink shuffle by region/scope; salting to dodge skew.</li>
+  <li>Ch. 4 Encoding — Avro tweet schema with backward compatibility for adding bot-flag fields.</li>
+  <li>Ch. 5 Replication — Cassandra LOCAL_QUORUM writes for trend snapshots; cross-region async replication.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"This problem is a classic excuse to talk sketches: CMS for frequency, Space-Saving for top-K, HLL for unique authors. Each saves an order of magnitude of RAM."</li>
+  <li>"Volume alone is wrong — 'iPhone' would always trend. The interesting metric is z-score against the term's own baseline."</li>
+  <li>"Spam is half the work. Without bot suppression you'll trend 'win-iPhone-RT-now' every hour."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Count-min sketch (CMS)</td>
+      <td>Per-region sketch with depth=4, width=2^17 = 524 KB holds frequency estimates for tens of millions of terms — exact counters would cost 10–50 GB per worker; CMS keeps memory under our 4 GB/worker NFR while preserving the heavy-hitter signal.</td>
+      <td>Exact hash map (rejected: 50 GB/worker), Bloom filter (rejected: presence-only, no frequency).</td>
+    </tr>
+    <tr>
+      <td>Space-Saving / Misra-Gries top-K</td>
+      <td>Maintains k=500 candidate top-K with bounded error proportional to the (k+1)-th item frequency — the canonical pairing with CMS to fix CMS's over-estimation of cold keys; ~30 KB total state per scope.</td>
+      <td>Heavy Keeper (rejected: more complex, marginal accuracy gain), full sort (rejected: not streaming).</td>
+    </tr>
+    <tr>
+      <td>HyperLogLog (unique authors)</td>
+      <td>Per-term unique-author counter detects bot rings: a hashtag with 100 K mentions but only 200 unique authors is demoted; HLL gives 0.81% error in 12 KB instead of a SET of millions of userIds — vital at our 500 K tweet/sec rate.</td>
+      <td>Redis SET (rejected: GB-level memory per term), exact dedupe (rejected: prohibitive at 50 M unique terms/day).</td>
+    </tr>
+    <tr>
+      <td>Apache Flink</td>
+      <td>Native event-time semantics with watermarks (30 s allowed lateness) handle the firehose's out-of-order tweets correctly; keyed state in RocksDB persists the 600 KB-per-scope sketches with checkpoint-based exactly-once recovery on worker death.</td>
+      <td>Spark Structured Streaming (rejected: micro-batch latency &gt; 90 s p99 budget), Kafka Streams (rejected: weaker watermarks).</td>
+    </tr>
+    <tr>
+      <td>Apache Kafka (256 partitions)</td>
+      <td>500 K tweets/s × 1 KB = 500 MB/s ingress — 256 partitions give per-partition load ~2 MB/s, well within broker comfort; replayable retention (24 h) enables bootstrap of new regions from log without re-ingesting from origin.</td>
+      <td>Kinesis (rejected: shard cost at 500 MB/s), RabbitMQ (rejected: not partitioned for this volume).</td>
+    </tr>
+    <tr>
+      <td>RocksDB (Flink state backend)</td>
+      <td>Per-(scope, window) keyed state across 200 regions × 4 windows = 800 keyed entries; RocksDB's LSM keeps memory-mapped active state hot and pushes cold to local SSD — required to checkpoint 480 MB total state to S3 within Flink's 30 s checkpoint interval.</td>
+      <td>Heap-based state (rejected: GC pauses on 480 MB), Redis (rejected: extra hop, no checkpoint).</td>
+    </tr>
+    <tr>
+      <td>Tumbling sub-windows (60 s)</td>
+      <td>5 min window = union of 5 sub-windows, 1 hr = 12 × 5 min — drops oldest sub-window cleanly on advance with no cell-by-cell decay math; matches the 60 s refresh SLA exactly and keeps state size bounded per scope.</td>
+      <td>Exponential decay (rejected: implementation complexity, harder to reason about), session windows (rejected: no fit).</td>
+    </tr>
+    <tr>
+      <td>EWMA + z-score (spike detection)</td>
+      <td>Baseline = EWMA over last 60 minutes of per-minute counts; <code>spikeScore = (current − baseline) / stddev</code> catches a hashtag jumping 100/min → 50 K/min within 60 s — pure volume ranks would always elect "iPhone".</td>
+      <td>Absolute volume (rejected: stale-celebrity bias), naïve ratio (rejected: numerical instability).</td>
+    </tr>
+    <tr>
+      <td>SimHash (near-duplicate filter)</td>
+      <td>SimHash within 3-bit Hamming distance flags copy-paste spam tweets pre-pipeline; 64-bit fingerprint computed in microseconds, far cheaper than full text comparison at 500 K tweets/s — drops the obvious bot amplification before sketches are touched.</td>
+      <td>MinHash + LSH (rejected: heavier per-tweet cost), exact dedup (rejected: 500 K/s lookup).</td>
+    </tr>
+    <tr>
+      <td>NER pipeline (tokenizer)</td>
+      <td>Hashtags alone miss "Lionel Messi"; lightweight on-device named-entity recogniser extracts up to 5 candidate terms per tweet, feeding 2.5 M counter-bumps/sec into the sketch — calibrated so NER cost stays under 1 ms/tweet.</td>
+      <td>Hashtags only (rejected: misses entities), heavyweight ML NER (rejected: blows latency budget).</td>
+    </tr>
+    <tr>
+      <td>Cassandra (trend snapshots)</td>
+      <td>200 regions × 4 windows × 60 refreshes/hr × 50 trends ≈ 600 K rows/hr — partition key (scope, window) with ts_bucket clustering keeps wide partitions bounded; 30-day TTL handles retention without manual cleanup.</td>
+      <td>Postgres (rejected: write rate), Elasticsearch (rejected: cost-per-write at this volume).</td>
+    </tr>
+    <tr>
+      <td>Redis (read cache, 60 s TTL)</td>
+      <td>Top-50 per scope cached as JSON with 60 s TTL matching the refresh interval — read API hits Redis 99% of the time, keeping Cassandra free for ingestion writes; cache miss falls back to last snapshot in Cassandra at &lt;20 ms p99.</td>
+      <td>App-level cache (rejected: per-instance staleness), CDN (rejected: 1 min TTL too coarse).</td>
+    </tr>
+    <tr>
+      <td>Salt key + map-side combine</td>
+      <td>World Cup hashtags would peg one Flink partition; salting the term key with a 0–15 prefix spreads load across 16 sub-keys, then combines them in a second stage — keeps no partition above 95% CPU during the 1.5 M tweet/s burst.</td>
+      <td>No mitigation (rejected: backpressure on hot keys), random partition (rejected: loses keyed state benefit).</td>
+    </tr>
+    <tr>
+      <td>Avro + Schema Registry</td>
+      <td>Tweet schema evolves (new bot-flag fields, attestation columns) — Avro's backward-compatible evolution keeps consumer Flink jobs running through schema bumps without redeploy, critical at 500 K msg/s where consumer downtime quickly becomes data loss.</td>
+      <td>JSON (rejected: 4× size, no schema enforcement), Protobuf (rejected: weaker schema-evolution tooling).</td>
+    </tr>
+  </tbody>
+</table>

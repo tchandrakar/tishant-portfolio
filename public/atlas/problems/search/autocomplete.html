@@ -1,0 +1,128 @@
+<h1>Design Autocomplete / Typeahead (sub-100 ms, top-K trie)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">search</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a typeahead service that, on every keystroke, returns the top-K (typically K=10) most likely query completions in under 100 ms end-to-end. Suggestions come from historical query logs ranked by frequency, recency, and personalization signals. Think Google search box, YouTube search, or e-commerce suggest.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Return top-10 completions for a prefix in real time as the user types.</li>
+  <li>Support multilingual prefixes, accents, case-insensitive matching.</li>
+  <li>Continuously learn from new queries (hourly or faster).</li>
+  <li>Personalization: boost completions the user has typed before.</li>
+  <li>Filter: profanity, spam, trademark/legal blocklist.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 &lt; 30 ms, p99 &lt; 100 ms server-side; perceived &lt; 150 ms over the wire.</li>
+  <li><b>Scale:</b> 5 B searches/day → ~10× keystrokes ≈ 50 B suggest calls/day ≈ 580 K QPS avg, 2 M QPS peak.</li>
+  <li><b>Freshness:</b> new trending query indexable in &lt; 1 hour.</li>
+  <li><b>Availability:</b> 99.99%.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 2 M peak suggest QPS. Each box debounces ~50 ms client-side, so amplification is bounded.</li>
+  <li>Vocabulary: ~500 M unique queries with non-trivial frequency; trie nodes ≈ 5 B chars × 8 B avg = ~40 GB raw, ~10 GB after compression — fits per-node memory.</li>
+  <li>Storage: query log 5 B/day × 100 B = 500 GB/day → S3/HDFS for batch.</li>
+  <li>Cache: top-K per prefix for the top 10 M prefixes ≈ 10 M × 10 × 32 B = 3.2 GB → trivially fits in Redis.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET /suggest?q=harr&amp;hl=en&amp;userId=...&amp;k=10
+   → { suggestions: [{text, score, source}], queryId }
+POST /feedback {queryId, accepted: "harry potter"}   // implicit signal</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]--debounced 50ms--> [Edge LB] -> [Suggest Service] -> [Redis hot-prefix cache]
+                                                |               (miss)
+                                                v
+                                       [In-memory Trie shards]
+                                                ^
+                                                | atomic swap (every 1h)
+[Query Log] -> [Kafka] -> [Spark/Flink Job] -> [Aggregator: count+rank] -> [Trie Builder] -> [GCS/S3]
+                                                                                  |
+                                                                          downloaded by suggest pods
+</div>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Trie node (compressed)</h3>
+<pre>node {
+  children: map&lt;char, nodeId&gt;     // or radix-compressed edge labels
+  topK: [(query_id, score)]       // precomputed top-10 for this prefix
+}
+strings table: query_id -> normalized_text, original_text, lang</pre>
+<h3>7.2 Why precompute topK at every node?</h3>
+<p>Walking the subtree at query time is O(prefix_subtree). Precomputing top-K per node makes lookup O(prefix_length) — typically &lt; 20 chars — independent of how popular the prefix is. The cost is build-time RAM and a slightly larger artifact (~3× over a plain trie).</p>
+<h3>7.3 Sharding</h3>
+<p>Partition by first 1–2 characters of the prefix. Each suggest pod loads only its shards. Hot shards (e.g., "a*", "the*") get more replicas.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Offline build pipeline</h3>
+<p>Hourly Spark job: read last 24 h of query logs from Kafka → normalize (lowercase, NFKC, strip diacritics) → aggregate (count, last_seen) → score = log(count) · decay(now − last_seen) · quality_filter → top-K rollup at every prefix using a bottom-up merge → serialize to a compact binary trie (FST or DAWG). Artifact pushed to GCS, suggest pods pull and atomic-swap (DDIA Ch. 10 — batch processing produces a derived dataset consumed by online services).</p>
+<h3>8.2 Online serving</h3>
+<p>Suggest pod: load mmap'd trie at startup → on request, normalize prefix → look up node → return its top-K → personalization layer reorders by user's recent queries (small per-user Bloom filter / Redis hash) → blocklist filter.</p>
+<h3>8.3 Hot-prefix cache</h3>
+<p>Redis L1 cache keyed on <code>(prefix, lang, userBucket)</code> with 60 s TTL absorbs the long tail of duplicate prefixes — typically 80 %+ hit rate.</p>
+<h3>8.4 Real-time trending boost</h3>
+<p>Side stream: a Flink job computes a rolling 5-minute count-min sketch of queries; the top-1 K trending queries are pushed to suggest pods as a small in-memory overlay merged at query time.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Per-keystroke amplification:</b> debounce client-side to 50 ms and cancel in-flight requests on new keystrokes.</li>
+  <li><b>Memory:</b> use FST (Lucene-style) or DAWG to dedup suffixes — typically 5–10× smaller than naive trie.</li>
+  <li><b>Cold start:</b> stagger pod restarts; warm-load mmap pages by walking common prefixes once.</li>
+  <li><b>Tail latency:</b> avoid GC by allocating the trie off-heap or in a flat byte array.</li>
+  <li><b>Personalization cost:</b> cap user history to 100 recent queries; merge with global top-K via a heap.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Precomputed top-K per node</td><td>O(prefix) lookup, trivially fast</td><td>3× memory; rebuild required for ranking change</td></tr>
+<tr><td>Hourly batch rebuild</td><td>Simple, deterministic, easy to debug</td><td>Up to 1 h freshness lag (mitigated by trending overlay)</td></tr>
+<tr><td>Shard by leading characters</td><td>Locality, small per-pod artifacts</td><td>Skew on popular leading letters</td></tr>
+<tr><td>FST/DAWG vs hash map</td><td>10× smaller, cache-friendly</td><td>Slower to build, harder to update incrementally</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 3 Storage and Retrieval — full-text and trie indexes; FSTs as compact term dictionaries.</li>
+  <li>Ch. 6 Partitioning — partitioning by key prefix and managing skew.</li>
+  <li>Ch. 10 Batch Processing — offline pipeline producing the immutable trie artifact consumed by online serving.</li>
+  <li>Ch. 11 Stream Processing — Flink-based trending overlay on the live query stream.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The unlock is precomputing top-K at every node — it converts an open-ended subtree problem into an O(prefix) lookup."</li>
+  <li>"I keep the online path read-only and immutable; everything dynamic lives in two small overlays (trending + personalization)."</li>
+  <li>"The most under-appreciated win is client-side debouncing; without it the back end pays 10× for the same UX."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>FST / DAWG (compact trie)</td><td>500 M unique queries × ~16 chars would be ~40 GB as a naive trie; FST suffix-dedup compresses it to ~10 GB so the entire artifact fits in a single pod's RAM, giving O(prefix) lookups in &lt;1 µs against mmap'd bytes.</td><td>HashMap&lt;prefix, topK&gt; (3–5× memory, no prefix iteration); ternary search tree (worse cache locality at this size).</td></tr>
+    <tr><td>Radix-compressed trie nodes</td><td>Average suggested query is ~20 chars but most internal trie nodes have one child; radix compression collapses single-child chains, cutting node count ~5× and bringing lookup hops from ~20 to ~4 — critical for the &lt;30 ms p50 budget.</td><td>Plain character trie (5× more pointers, cache miss on every step).</td></tr>
+    <tr><td>Precomputed top-K per node</td><td>Walking the subtree under "har" at query time would touch millions of nodes; precomputing top-10 at every node converts it to a constant-time read at the cost of ~3× memory — the only way to hit p99 &lt;100 ms at 2 M QPS.</td><td>On-the-fly subtree scan (10–100× slower for popular prefixes); approximate top-K via sketches (recall regression).</td></tr>
+    <tr><td>Apache Kafka (query log transport)</td><td>5 B searches/day = ~58 K msg/s sustained, bursty during news events; Kafka's durable log lets the trie builder replay 24 h windows for retraining and decouples the suggest pods from the offline pipeline.</td><td>Kinesis (vendor lock-in, lower replay window); direct DB writes (no replay, no backpressure).</td></tr>
+    <tr><td>Apache Spark (hourly trie builder)</td><td>Aggregating 5 B queries/day into prefix→top-K rollups requires sorting + reducing 500 GB; Spark's in-memory shuffle finishes the job in ~15 min on a 50-node cluster, well under the 1 h freshness SLA.</td><td>MapReduce (re-shuffles, 3× wall-time); Flink batch (less mature for this batch shape).</td></tr>
+    <tr><td>Apache Flink (trending overlay)</td><td>Trending queries must surface in &lt;5 min — far below the 1 h batch cycle; Flink's event-time windows + count-min sketches over a 5-min rolling window catch news spikes and push a small overlay (top 1 K) to suggest pods.</td><td>Spark Streaming (mini-batch latency); Storm (no exact-once, weaker state).</td></tr>
+    <tr><td>Redis (hot-prefix cache)</td><td>10 M hot prefixes × top-10 × 32 B = 3.2 GB, trivially fits one Redis node; 60 s TTL absorbs the long tail of duplicate prefixes at &gt;80 % hit rate, cutting load on the trie pods by 5×.</td><td>In-process Caffeine (no cross-pod sharing); Memcached (no TTL granularity needed but no replication).</td></tr>
+    <tr><td>GCS / S3 (artifact distribution)</td><td>Hourly trie artifact is ~10 GB; object storage gives 99.999999999% durability, multi-region replication, and HTTP range reads so suggest pods can mmap-stream the file at startup without a custom pipeline.</td><td>HDFS (extra cluster); Bittorrent-style P2P (operational complexity for marginal speed-up).</td></tr>
+    <tr><td>Count-min sketch (trending counts)</td><td>Tracking exact counts for billions of distinct queries in a 5-min window would cost ~50 GB; CMS at ε=0.001 keeps it to ~50 MB per Flink operator with a controlled overcount bias that the top-K extractor tolerates.</td><td>HashMap (50 GB+ state); HyperLogLog (gives cardinality, not counts).</td></tr>
+    <tr><td>Bloom filter (per-user history)</td><td>Personalization needs "has user typed this prefix before" for 100 M users at &lt;1 ms; a 1 KB Bloom per user (1 % FP) costs 100 GB total in Redis and avoids storing exact history per pod.</td><td>Exact set per user (10× RAM); Redis ZSET per user (slower reads at 2 M QPS).</td></tr>
+    <tr><td>off-heap / flat byte-array storage</td><td>A 10 GB on-heap trie would generate &gt;500 ms G1 pauses, blowing the latency budget; a flat byte-array layout gives zero GC pressure and lets the JIT vectorize prefix walks.</td><td>On-heap Java objects (GC pauses); off-heap via Unsafe (less portable, harder to debug).</td></tr>
+    <tr><td>HTTP/2 + client-side debouncing (50 ms)</td><td>Without debouncing, "harry potter" sends 12 keystroke requests; debouncing to 50 ms cuts that to ~3 and HTTP/2 multiplexing reuses one connection so we don't pay TLS handshake per keystroke — 10× backend savings.</td><td>HTTP/1.1 (head-of-line blocking); WebSocket (heavier connection state per pod).</td></tr>
+  </tbody>
+</table>

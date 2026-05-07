@@ -1,0 +1,93 @@
+<h1>The hot-key / celebrity-fanout problem</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">hot-key</span>
+  <span class="tag">fanout</span>
+  <span class="tag">scaling</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>In any sharded or partitioned system, traffic is rarely uniform. A small fraction of keys (a viral tweet, a celebrity's profile, a Black Friday SKU, a single trending hashtag) attract orders of magnitude more reads or writes than the average. That single shard becomes a bottleneck while the others are bored. The "celebrity-fanout problem" is the write-side variant: when a user with 100M followers tweets, naively writing into 100M timelines kills the system. Hot-key handling is the art of detecting these outliers and routing them through different code paths.</r>
+
+<h2>Why it matters</h2>
+<p>Hot keys are the single most common reason "we're sharded, why is it slow?" shows up in postmortems. Capacity planning based on averages is a lie — the p99.9 key drives your infrastructure spend and your outage frequency. Every social, e-commerce, gaming, or analytics system above modest scale eventually rewrites a chunk of itself to handle skew. Knowing the patterns up front saves you from a panicked re-architecture during a viral moment.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Twitter timelines:</b> Justin Bieber-era — fanout-on-write was untenable for top accounts. They use a hybrid: fanout-on-write for normal users, fanout-on-read merge for celebrity follows.</li>
+  <li><b>Instagram:</b> Similar hybrid; celebrity posts are pulled in at read time and merged with the precomputed feed.</li>
+  <li><b>YouTube:</b> Video metadata for "trending" videos is cached at every edge, not in a single shard.</li>
+  <li><b>Stripe / payment processors:</b> A hot merchant (e.g., a major retailer on launch day) has dedicated rate-limit buckets and pre-warmed connection pools.</li>
+  <li><b>Redis / DynamoDB:</b> Both have well-known "hot partition" failure modes; DAX and DynamoDB Accelerator exist largely to absorb hot-key reads.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">UNIFORM (theory)                  ZIPFIAN (reality)
+  shard   QPS                       shard    QPS
+  ----- -----                       -----  -----
+   s1   1000                         s1   90000  <-- celebrity lives here
+   s2   1000                         s2     800
+   s3   1000                         s3     900
+   s4   1000                         s4     750
+   s5   1000                         s5     820
+                                            ^
+                                            |
+                                  100x skew, single shard at limit
+</div>
+<p>Real-world keys follow Zipf or power-law distributions: the top 1% of keys often serve 50%+ of traffic. Hashing into N shards doesn't fix this — you just get one very hot shard.</p>
+
+<h2>Mitigations: read-side hot keys</h2>
+<ul>
+  <li><b>Multi-tier caching:</b> Hot keys live in process-local LRU + edge cache + regional cache. Origin sees only cache misses, which by definition aren't hot.</li>
+  <li><b>Request coalescing:</b> 10,000 concurrent requests for the same key collapse into one origin fetch (singleflight pattern). Standard in CDNs and well-built caches.</li>
+  <li><b>Read replicas with consistent-hash routing:</b> Promote hot keys to N replicas; route reads round-robin across them.</li>
+  <li><b>Key splitting (read-side):</b> Store the value under <code>key#0..N-1</code>, write to all, read from a random one. Trades write amplification for read distribution.</li>
+  <li><b>Probabilistic refresh:</b> Refresh cache entries before TTL expires (with a small probability) so 1M users don't simultaneously stampede on TTL boundary.</li>
+</ul>
+
+<h2>Mitigations: write-side hot keys (counters, fanout)</h2>
+<ul>
+  <li><b>Sharded counter:</b> Instead of one row "likes_for_post=N", maintain 100 sub-counters; aggregate on read. Used in YouTube view counts, Reddit votes, etc.</li>
+  <li><b>Fanout-on-read for celebrities:</b> Don't write to 100M follower inboxes. At read time, merge their precomputed feed with celebrity tail-fetch. The "Twitter trick."</li>
+  <li><b>Async / batched fanout:</b> Big-fanout writes go on a queue; a fleet of workers spreads delivery over seconds or minutes. Trade freshness for survivability.</li>
+  <li><b>Pre-aggregation in stream:</b> If 1000 events/sec all increment the same counter, group them in 1-second windows and write 1 update per second per shard.</li>
+  <li><b>Write through a leader-per-key with batching:</b> Pin the hot key to one node that owns coalescing; dramatically fewer cache invalidations downstream.</li>
+</ul>
+
+<h2>Detection</h2>
+<ul>
+  <li><b>Heavy-hitter sketches:</b> Count-Min Sketch or Space-Saving on the request stream identifies hot keys in real time with bounded memory.</li>
+  <li><b>Per-key metrics on the dataplane:</b> Sample request keys at 1/1000 and emit; aggregate centrally. Cheap and good enough for skew detection.</li>
+  <li><b>Latency anomalies:</b> A single-shard p99 spike usually means hot key before it means hardware. Alert on per-shard, not global, p99.</li>
+</ul>
+
+<h2>Anti-patterns and failure modes</h2>
+<ul>
+  <li><b>"Just add a cache":</b> Cache stampede on TTL expiry can be worse than no cache. Need request coalescing + jittered TTL + async refresh.</li>
+  <li><b>Hash-then-pray:</b> Assuming consistent hashing solves skew. It distributes <i>keys</i> evenly, not <i>traffic</i>.</li>
+  <li><b>Synchronous fanout to all followers:</b> A celebrity tweet blocks the API call until 100M writes complete. The user's phone times out, retries, doubles the load.</li>
+  <li><b>One global rate limiter for hot key:</b> Rate-limiting a viral key at the edge protects the backend but turns into a thundering retry storm. Use queues, not 429s, for elephant flows.</li>
+  <li><b>No pre-warming for known events:</b> A scheduled product launch at 9am — and ops finds out at 9:00:30 when the shard melts. Pre-warm caches and pre-shard the key the night before.</li>
+  <li><b>Sharded counter without GC:</b> Counters keep accumulating sub-shards across deploys; reads get slower forever.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Optimizing for the median user when the top 0.01% are the load-bearing tail.</li>
+  <li>Picking partition keys based on what's "natural" (user_id) without checking distribution (10 power users dominate).</li>
+  <li>Designing fanout-on-write because it's "simpler" then having no fallback when an account hits 1M followers.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're designing the "like" counter for a video site. Some videos get 5 likes/day; one trending video gets 50,000 likes/second for 10 minutes. Sketch the data path: counter storage, write path, read path, and how you handle the moment of virality without melting Redis.
+  <br/>
+  <b>Hint:</b> Do all writes need to hit the same row? Does the displayed count need to be exact, or "close enough"? When does the answer change for a payment vs a like?
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-twitter-timeline">Design Twitter's timeline</a> — the canonical celebrity-fanout problem.</li>
+  <li><a href="#problem/design-distributed-counter">Design a distributed counter</a> — sharded counters and read aggregation.</li>
+  <li><a href="#problem/design-rate-limiter">Design a rate limiter</a> — handling skew in the limiter itself.</li>
+</ul>

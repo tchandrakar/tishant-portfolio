@@ -1,0 +1,126 @@
+<h1>Design CDN architecture (Cloudflare/Akamai-style, hierarchical caching)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">cdn</span>
+  <span class="tag">storage-cache</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a global Content Delivery Network in the spirit of Cloudflare or Akamai. The system terminates TLS at the edge, caches static and semi-dynamic assets close to the user, and shields origin servers from request floods. The hard parts are global request routing, multi-tier cache hierarchy, cache fill efficiency at petabyte scale, and surviving regional failures without thundering-herd traffic on the origin.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Serve HTTP/1.1, HTTP/2, HTTP/3 (QUIC) from any of N edge POPs.</li>
+  <li>Honor <code>Cache-Control</code>, <code>ETag</code>, <code>Vary</code>, range requests, and stale-while-revalidate.</li>
+  <li>Tiered cache: edge (POP) → regional shield → origin.</li>
+  <li>Per-customer config: cache keys, TTL overrides, custom headers, WAF rules.</li>
+  <li>TLS termination, SNI, automatic certificate provisioning.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 TTFB &lt; 30 ms, p99 &lt; 150 ms within region.</li>
+  <li><b>Scale:</b> 50 M HTTP req/sec at the edge (Cloudflare-class), 300+ POPs, 100 Tbps egress.</li>
+  <li><b>Availability:</b> 99.99% per POP, 99.999% global (anycast removes individual POP failures).</li>
+  <li><b>Cache hit ratio:</b> &gt; 95% bytes-hit on tier-1 customers.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 50 M req/sec → ~4.3 trillion req/day. With 95% hit ratio, only 2.5 M req/sec touch shield/origin.</li>
+  <li>Storage per POP: 200 servers × 30 TB NVMe = 6 PB hot cache; global working set ~50 PB.</li>
+  <li>Bandwidth: peak 100 Tbps egress; per-POP 200–800 Gbps.</li>
+  <li>Object size mix: 70% &lt; 100 KB (HTML/JS/CSS), 25% 100 KB–10 MB (images), 5% &gt; 10 MB (video chunks).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /any/path                  Host: foo.com   → cached or origin-fetched response
+PURGE /api/v4/zones/{z}/purge_cache  {urls|tags} → 202 Accepted
+PUT   /api/v4/zones/{z}/cache/rules  {pattern, ttl, key} → 200 OK
+GET   /api/v4/zones/{z}/analytics   ?since=...   → req, bytes, hit_ratio</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]
+   │  (anycast IP, BGP picks nearest POP)
+   ▼
+[Edge POP] ── L4 LB (Maglev/Katran) ── L7 proxy (nginx/envoy/pingora)
+   │                                       │
+   │  hit                                  │ miss
+   ▼                                       ▼
+[Local NVMe cache] ◄── consistent hash ──► [Regional Shield POP]
+                                              │ miss
+                                              ▼
+                                       [Customer Origin]
+</div>
+<p>A request hits the closest POP via BGP anycast. Inside the POP, an L4 load balancer (Maglev-style consistent hashing) pins the 5-tuple to one of ~200 L7 proxies. The proxy looks up the cache key in local NVMe; on miss it asks the regional shield POP, which acts as a single fan-in to origin. This collapses N edge misses into 1 origin fetch.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Cache key &amp; index</h3>
+<pre>cache_key = sha256(scheme | host | path | normalized_query | vary_headers)
+index entry: {key, size, ttl_expiry, etag, last_modified, sfid, offset, hit_count}</pre>
+<p>Index lives in RAM (~50 GB per box for 500 M objects); object bodies live on NVMe in slab files (SFIDs) to avoid filesystem inode pressure. Eviction is segmented LRU with admission filtering (TinyLFU) to keep one-hit wonders out of hot tier.</p>
+<h3>7.2 Why tiered cache</h3>
+<p>If 300 edge POPs each miss independently, origin sees 300× amplification. A regional shield (one per continent, ~10 globally) deduplicates fills. Coalescing in-flight misses on the same key (single-flight) further reduces origin load by 100–1000× during a flash crowd.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 L7 proxy</h3>
+<p>Built on Pingora/Envoy. Each box runs ~50k concurrent connections, terminates TLS via session-resumption tickets, and serves from NVMe at 40+ Gbps. Hot objects (&lt; 64 KB, &gt; 100 hits) are promoted to RAM tier (kB-class objects). Range requests are served by sparse file indexing.</p>
+<h3>8.2 Cache fill / shield</h3>
+<p>Shield POP keeps a larger working set (~30 PB regional). Origin connections are pooled and HTTP/2-multiplexed. <code>stale-while-revalidate</code> returns the stale copy immediately and refreshes asynchronously, so origin RTT never appears on the hot path.</p>
+<h3>8.3 Control plane</h3>
+<p>A globally-replicated KV (Cloudflare Quicksilver, ~&lt;1 s convergence to 300 POPs) pushes config changes. Per DDIA Ch. 5, this is a leader-based replication system with read replicas at every edge — strong consistency at the leader, eventual at the edges, and bounded staleness.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot key (e.g. live event):</b> add request-coalescing + shield → 1 origin fetch regardless of edge QPS.</li>
+  <li><b>NVMe write amplification:</b> append-only slab files, compaction during off-peak.</li>
+  <li><b>TLS handshake cost:</b> session tickets + 0-RTT (QUIC) cuts CPU 60%.</li>
+  <li><b>POP failure:</b> BGP withdraws the prefix; anycast routes to next-nearest POP within seconds.</li>
+  <li><b>Cold-cache thundering herd</b> after POP drain: pre-warm via shield + jittered TTL.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Anycast over GeoDNS</td><td>Sub-second failover, no DNS TTL stickiness</td><td>Path can flap mid-session; needs sticky L4</td></tr>
+<tr><td>Tiered cache (edge + shield)</td><td>Origin offload 100–1000×</td><td>Extra hop; +10–30 ms on miss</td></tr>
+<tr><td>Single-flight coalescing</td><td>Survives flash crowds</td><td>Tail-latency spike for coalesced followers</td></tr>
+<tr><td>NVMe slab files vs FS</td><td>Predictable IOPS, no inode limit</td><td>Custom GC, harder ops</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — leader-based config push (Quicksilver) with bounded-staleness reads at edges.</li>
+  <li>Ch. 8 Distributed Systems — partial failure, unreliable networks, anycast as a "fault-tolerant client" pattern.</li>
+  <li>Ch. 6 Partitioning — consistent hashing inside a POP across L7 proxies.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Origin offload is the product. Everything else — anycast, NVMe, shield — exists to push hit ratio from 90% to 99%."</li>
+  <li>"I'd treat the control plane as a separate, leader-based system. Conflating it with the data plane is how you cause global outages."</li>
+  <li>"The hardest failure mode is a poisoned cache entry replicated globally; my mitigation is signed origin responses + fast tag-purge."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>BGP anycast (single VIP, 300 POPs)</td><td>One IP advertised from every POP gives sub-second failover for all 50 M req/sec without DNS in the loop. With 99.999% global availability, we cannot wait for resolver TTLs to expire when a POP dies — anycast withdraws the prefix and BGP reconverges in 30–120 s globally and in milliseconds for adjacent peers.</td><td>GeoDNS only (TTL stickiness breaks failover); unicast per-POP IPs (DNS table explosion, no convergence).</td></tr>
+<tr><td>Maglev / Katran consistent-hash L4 LB</td><td>Inside each POP we pin the 5-tuple to one of ~200 L7 proxies, surviving box loss without resetting all 50k connections per box. Hash stability matters at 50 M req/sec — random rebalancing would flush the local NVMe cache and collapse the 95% bytes-hit ratio.</td><td>IPVS round-robin (no hash stability); HAProxy L7 (CPU-bound at 200 Gbps).</td></tr>
+<tr><td>Pingora / Envoy L7 proxy (Rust/C++)</td><td>50k concurrent TLS conns per box at 40+ Gbps demands zero-copy I/O and predictable memory. Pingora's async Rust runtime avoids the per-conn nginx worker overhead, halving CPU at the per-POP 200–800 Gbps target.</td><td>nginx (worker-per-conn cost); Apache (thread-per-conn doesn't scale to 50k).</td></tr>
+<tr><td>NVMe slab files with custom GC</td><td>200 servers × 30 TB NVMe = 6 PB hot cache per POP. Filesystem inode pressure at billions of objects kills ext4/XFS; append-only slab files with off-peak compaction give predictable IOPS for the 70%-of-traffic small-object class.</td><td>ext4/XFS (inode exhaustion); RocksDB (write-amp on hot keys).</td></tr>
+<tr><td>TinyLFU + segmented LRU admission</td><td>Stops one-hit wonders from polluting the 6 PB hot tier. With a 50 PB global working set and only ~12% of that fits in any single POP, admission filtering is the difference between 95% and 80% hit ratio — a 4× origin offload swing.</td><td>Plain LRU (admits scan traffic); LFU (slow to react to viral content).</td></tr>
+<tr><td>Quicksilver-style replicated KV (control plane)</td><td>Pushes config changes (cache rules, WAF, TTL) to 300 POPs in &lt;1 s. Leader-based replication with bounded-staleness reads at edges keeps the data plane fast while customer config pushes stay strongly consistent at the leader (DDIA Ch. 5).</td><td>etcd (write throughput limit); Consul (gossip too noisy for 300 POPs).</td></tr>
+<tr><td>Regional shield POP (one per continent, ~10)</td><td>Without a shield, 300 edge misses on the same key produce 300× origin amplification. Shield collapses fan-in to 1 origin fetch, hitting our &lt;2.5 M req/sec origin-touch budget at 50 M edge QPS.</td><td>Direct edge→origin (300× amplification); peer-to-peer cache fill (gossip overhead).</td></tr>
+<tr><td>Single-flight request coalescing</td><td>During a flash crowd, 100k concurrent requests for the same hot key collapse to one origin fetch — 100–1000× reduction. Critical for live-event traffic where a single URL drives most QPS.</td><td>No coalescing (origin meltdown on Super Bowl); per-request mutex (lock contention).</td></tr>
+<tr><td>HTTP/3 (QUIC) + 0-RTT session tickets</td><td>QUIC's 0-RTT handshake eliminates the 1–2 RTT TLS cost on the warm-resume path, cutting TLS CPU 60% across the fleet. At p50 TTFB &lt;30 ms, every saved RTT is 5–15% of our budget.</td><td>HTTP/2 only (still pays TLS handshake); TLS 1.2 (no 0-RTT).</td></tr>
+<tr><td>RAM tier promotion for hot small objects (&lt;64 KB, &gt;100 hits)</td><td>NVMe is fast but not as fast as DRAM; the 70% of traffic that's HTML/JS/CSS &lt;100 KB benefits from a 50 GB/box DRAM hit. p50 TTFB target of &lt;30 ms requires sub-microsecond cache lookups for the working set's hottest 1%.</td><td>NVMe-only (latency cliff on hot keys); RAM-only (capacity bottleneck).</td></tr>
+<tr><td>BFD on transit links</td><td>BGP convergence alone takes 30–120 s; BFD detects link failure in &lt;1 s, allowing the POP to withdraw before user traffic notices. Required to hit 99.999% global availability with anycast as the failover primitive.</td><td>BGP keepalives only (slow detection); ICMP probes (not L2-aware).</td></tr>
+<tr><td>Roaring bitmap tag indexes</td><td>Per-tag inverted indexes (e.g., "homepage" → 1 M URLs) compress 10× over plain hash sets, fitting the 50 GB-per-box index budget for 500 M cached objects. Bitmap intersection enables fast per-zone purge math.</td><td>Plain HashSet (10× memory); B-tree (slower set ops).</td></tr>
+</tbody>
+</table>
+

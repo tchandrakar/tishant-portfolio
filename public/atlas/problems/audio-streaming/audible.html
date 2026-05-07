@@ -1,0 +1,162 @@
+<h1>Design Audible (audiobook platform with offline)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">audio-streaming</span>
+  <span class="tag">file-storage</span>
+  <span class="tag">payments</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design Audible, an audiobook platform where users purchase or subscribe (1 credit/month) to long-form audiobooks (avg 10 hours, 300 MB). Books are bought once and owned forever; offline listening is the primary mode (commutes, flights, runs). The system must handle a large catalog (~1M titles), per-user library entitlements, chaptered playback with bookmark/note sync across devices, Whispersync (resume position synced even mid-chapter across phone/Kindle/Echo), and integrations with the Amazon retail backbone for purchases and Audible Originals.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Browse catalog by genre, author, narrator, length; search.</li>
+  <li>Purchase audiobook (one-tap with Amazon account) or redeem monthly credit.</li>
+  <li>Stream and/or download audiobook (chaptered MP4-AAC files).</li>
+  <li>Whispersync: resume position synced across all user devices in seconds.</li>
+  <li>Bookmarks, notes, clip-sharing of 30s snippets.</li>
+  <li>Variable playback speed (0.5x to 3.5x) without pitch shift.</li>
+  <li>Sleep timer, chapter navigation, table of contents.</li>
+  <li>Listening stats, badges, recommendations.</li>
+  <li>DRM-protected downloads bound to Audible/Amazon account.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> first byte under 300ms (less critical than Spotify &mdash; users listen for hours).</li>
+  <li><b>Scale:</b> 90M MAU, 20M paying members, 5M concurrent at peak.</li>
+  <li><b>Availability:</b> 99.95% playback; 99.99% library/entitlement (purchases).</li>
+  <li><b>Durability:</b> 11 nines for master audio; books stay in catalog 50+ years.</li>
+  <li><b>Offline-first:</b> 80% of listening hours are from downloaded files.</li>
+  <li><b>Whispersync:</b> position propagates across devices within 5s p95.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li><b>Catalog:</b> 1M titles &times; avg 300 MB &times; 2 bitrates (32k, 64k AAC) = ~600 TB + lossless masters ~6 PB.</li>
+  <li><b>Daily downloads:</b> 20M DAU &times; 0.3 books/day = 6M downloads/day &times; 300 MB = 1.8 PB/day egress.</li>
+  <li><b>Streaming bandwidth:</b> 5M concurrent &times; 64 kbps = 320 Gbps peak.</li>
+  <li><b>Library/entitlement reads:</b> 20M DAU &times; 5 reads/day = 100M reads/day = ~1200 QPS avg, 5K peak.</li>
+  <li><b>Whispersync writes:</b> 20M DAU &times; 50 position updates/day = 1B/day = ~12K writes/sec avg.</li>
+  <li><b>Purchases:</b> 1M txns/day = ~12 TPS avg, 200 TPS peak (e.g., Black Friday).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>GET   /v1/catalog/book/{asin}                         -&gt; {meta, chapters, narrator}
+POST  /v1/purchase           {asin, useCredit:bool}   -&gt; {entitlementId, receiptId}
+GET   /v1/library                                     -&gt; {books[], lastReadPos}
+GET   /v1/download/{asin}/manifest                    -&gt; {chapterUrls[], drmHeader}
+POST  /v1/whispersync/update {asin, posMs, ts, devId} -&gt; {accepted, serverPos}
+GET   /v1/whispersync/{asin}                          -&gt; {posMs, lastDevice, ts}
+POST  /v1/bookmark           {asin, posMs, note}      -&gt; {bookmarkId}
+POST  /v1/clip               {asin, startMs, endMs}   -&gt; {shareUrl}
+GET   /v1/recos                                       -&gt; {books[]}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App: phone, Kindle, Echo, Web]
+   |
+   +-- HTTPS --&gt; [Edge CDN] -- chapter MP4s -- [Origin: S3 + Glacier]
+   |
+   +-- HTTPS --&gt; [API GW]
+                    |
+                    +--&gt; [Catalog Svc] ---- [DynamoDB: books]
+                    +--&gt; [Library Svc] ---- [Aurora MySQL: entitlements]
+                    +--&gt; [Purchase Svc] --- [Amazon Pay] -- [Kafka: orders]
+                    +--&gt; [DRM Svc]    ----- [KMS] -- license tokens
+                    +--&gt; [Whispersync Svc]- [DynamoDB Global Tables]
+                    +--&gt; [Reco Svc]   ----- [SageMaker endpoints]
+
+[Kafka: listen-events] -&gt; [Kinesis Analytics] -&gt; [S3] -&gt; [Athena]
+</div>
+<p>Walk-through: purchase flow goes through Amazon Pay; on success, an entitlement row is written and a Kafka event triggers download permission. Download manifest is signed per-chapter and DRM-wrapped. Whispersync uses DynamoDB Global Tables for last-write-wins multi-region replication of position. Listen events stream into a data lake for reco training and royalty payouts.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Catalog (DynamoDB)</h3>
+<pre>PK: asin   SK: META | CHAPTER#nnn
+Attributes: title, authors[], narrator, durationMs,
+            chapterTitle, chapterStartMs, audioBlobId, bitrate</pre>
+<h3>7.2 Library/entitlement (Aurora MySQL)</h3>
+<pre>CREATE TABLE entitlement (
+  user_id BIGINT, asin VARCHAR(16),
+  acquired_at DATETIME, source ENUM('credit','purchase','gift'),
+  PRIMARY KEY (user_id, asin),
+  KEY idx_user_recent (user_id, acquired_at DESC)
+);</pre>
+<h3>7.3 Whispersync (DynamoDB Global Tables)</h3>
+<pre>PK: user_id   SK: asin
+Attributes: pos_ms, ts, device_id, version
+Conditional update: only accept if incoming.ts &gt; stored.ts</pre>
+<h3>7.4 Why these stores?</h3>
+<p>DynamoDB Global Tables give multi-region active-active with last-writer-wins &mdash; perfect for Whispersync where we want fast cross-device sync and tolerate the rare clock-skew loss. Aurora MySQL for entitlements because purchases must be transactionally consistent with payment. S3 for audio with intelligent tiering &mdash; rarely-listened-to long-tail moves to Glacier.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Whispersync engine</h3>
+<p>Each client emits position updates every 10s + on pause/seek. The Whispersync service applies a conditional write keyed on monotonic logical timestamp <code>(ts, device_id)</code>. Conflict resolution = highest <code>ts</code> wins (Lamport-ish). Other devices subscribe via long-poll or MQTT for sub-5s push. Bookmarks/notes use the same model but stored as a list with CRDT-style merging.</p>
+<h3>8.2 Download &amp; DRM</h3>
+<p>On download request, DRM service mints an offline license bound to <code>device_id</code> + <code>customer_id</code>, valid for the entitlement lifetime. Audio chapters are encrypted with AES-128 CTR; content key is wrapped under a device key. Loss of license = book unplayable. Re-authorization is required if user removes device from Amazon account.</p>
+<h3>8.3 Variable speed without pitch shift</h3>
+<p>Done client-side using a phase-vocoder (WSOLA on iOS/Android). The server simply ships standard AAC; no per-speed transcoding needed. This is a critical UX feature &mdash; 40% of users listen at 1.5x.</p>
+<h3>8.4 Recommendation</h3>
+<p>Two-tower over user listen history (last 100 books) and book features (genre, narrator, length). SageMaker batch transform refreshes daily; online ranker uses 24h-recent listens for "Because you finished X". Long-form means signals are sparser than music &mdash; we lean on completion rate and 4-week retention as labels.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Cold storage tiering:</b> 80% of catalog is in long-tail; auto-promote to S3 Standard when an entitlement is granted.</li>
+  <li><b>Whispersync write hotspot:</b> partition key is user_id, so naturally spread; provisioned WCU autoscaled.</li>
+  <li><b>Black Friday surge:</b> purchase service scales horizontally behind SQS to absorb spikes; entitlement write is async-confirmed.</li>
+  <li><b>Download manifest signing:</b> cache signed URLs per (user, asin, device) for 24h.</li>
+  <li><b>Chapter granularity:</b> fragment into ~5MB chapter slices to enable resumable downloads on flaky mobile networks.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>DynamoDB Global Tables for Whispersync</td><td>Active-active, simple LWW</td><td>Rare lost-update on clock skew</td></tr>
+<tr><td>Offline-first downloads vs streaming-only</td><td>Works on planes/subways, lower egress</td><td>DRM complexity, piracy surface</td></tr>
+<tr><td>Aurora MySQL for entitlements</td><td>Strong txn with payment</td><td>Vertical scale ceiling, sharding pain at &gt;100M users</td></tr>
+<tr><td>Client-side speed change</td><td>No server transcoding cost</td><td>Quality varies by device</td></tr>
+<tr><td>Glacier for cold catalog</td><td>10x cheaper storage</td><td>Restore latency hours; requires pre-warm on entitlement</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-region async for Whispersync; sync replication for entitlement.</li>
+  <li>Ch. 6 Partitioning — DynamoDB hash partitioning by user_id avoids hotspots.</li>
+  <li>Ch. 7 Transactions — entitlement insert + payment capture in single Aurora txn.</li>
+  <li>Ch. 9 Consensus — purchase idempotency relies on a Raft-backed payment ledger upstream.</li>
+  <li>Ch. 11 Stream Processing — Kafka order events drive entitlement, recos, royalty pipelines.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Audible is fundamentally a digital ownership product, not a streaming product &mdash; entitlements outlive subscriptions, so I treat the entitlement DB like a financial system of record."</li>
+  <li>"Whispersync is the moat; I'd over-invest in low-latency cross-device sync because 'losing my place' is the #1 churn driver."</li>
+  <li>"DRM is necessary but adversarial &mdash; I'd build a piracy-detection signal pipeline (impossible-listen-rate, geo-jumps) and revoke licenses asynchronously."</li>
+  <li>"For new-narrator discovery I'd run a multi-armed bandit on the homepage rail rather than a static reco model &mdash; long-form has high commitment cost so exploration must be deliberate."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>DynamoDB</b></td><td>Catalog of 1M titles with chapter-granular access pattern (PK=asin, SK=CHAPTER#nnn) maps perfectly to single-digit-ms point reads at any scale; on-demand pricing avoids capacity planning for the 5K-peak QPS spike from new-release campaigns.</td><td>Cassandra — heavier ops; Aurora — vertical-scale ceiling for catalog growth</td></tr>
+    <tr><td><b>DynamoDB Global Tables</b></td><td>Whispersync requires multi-region active-active with last-write-wins — exactly what Global Tables provide; conditional writes keyed on monotonic <code>(ts, device_id)</code> deliver the 5s p95 cross-device sync SLA at 12K writes/sec.</td><td>Cassandra multi-DC — equivalent capability but more ops; CRDTs in custom store — reinventing the wheel</td></tr>
+    <tr><td><b>Aurora MySQL</b></td><td>Entitlements are a financial system of record — books are owned forever, so the row outlives the user; MySQL's transactional guarantees plus Aurora's storage-decoupled multi-AZ replicas give 99.99% availability for the purchase path.</td><td>PostgreSQL — equivalent technically but Amazon's tooling favors Aurora-MySQL; DynamoDB — weaker txn semantics for "credit + entitlement" atomic write</td></tr>
+    <tr><td><b>S3 + Glacier</b></td><td>6 PB of lossless masters plus 600 TB streaming variants over 50-year shelf life demands 11-nines durability cheaply; intelligent tiering moves the 80% long-tail catalog to Glacier (10x cheaper) and pre-warms on entitlement grant before the user can press play.</td><td>Self-managed cold storage — capex; Backblaze — weaker AWS integration</td></tr>
+    <tr><td><b>CloudFront CDN</b></td><td>1.8 PB/day download egress with users globally distributed needs edge caching; CloudFront's origin shield and signed URLs (24h cache per user-asin-device) absorb the long-tail download pattern where users re-download on phone reset.</td><td>Akamai — equivalent but extra vendor; direct S3 — expensive and slow at distance</td></tr>
+    <tr><td><b>Kafka</b></td><td>Order events drive entitlement creation, reco features, and royalty payouts — a single durable log lets each consumer evolve independently, and replay supports recovering from a downstream bug without re-running purchases.</td><td>SQS — no fanout to multiple consumers without SNS hop; Kinesis — fine but Kafka chosen for richer ecosystem</td></tr>
+    <tr><td><b>SQS</b></td><td>Black Friday surge to 200 TPS purchases needs a buffer between Amazon Pay and the entitlement writer; SQS gives at-least-once with idempotency on <code>receiptId</code> so we can absorb 10x spikes without overprovisioning the DB.</td><td>Kafka — overkill for a simple work queue; in-memory queue — loses messages on restart</td></tr>
+    <tr><td><b>Kinesis Data Analytics</b></td><td>Listen-event aggregation feeds royalty payouts and 4-week retention labels for reco; KDA's managed Flink runtime handles the streaming SQL with autoscaling, eliminating cluster ops for a workload that bursts with new-release listening.</td><td>Self-hosted Flink — ops cost; Spark Streaming — higher latency than KDA's Flink</td></tr>
+    <tr><td><b>Athena</b></td><td>Royalty teams run ad-hoc SQL over years of listen-event data lake; Athena's serverless model means analysts query S3 Parquet directly at $5/TB scanned — far cheaper than maintaining a warehouse for monthly-cadence queries.</td><td>Redshift — fixed-cost cluster wasteful for our query frequency; BigQuery — wrong cloud</td></tr>
+    <tr><td><b>SageMaker</b></td><td>Two-tower model over user history (last 100 books) and book features needs daily batch transform plus online endpoints; SageMaker handles training, endpoint hosting, and A/B traffic shifting without us building MLOps from scratch.</td><td>Self-hosted TF Serving — ops burden; Vertex AI — wrong cloud</td></tr>
+    <tr><td><b>AWS KMS</b></td><td>DRM content keys must be wrapped under a hardware-backed root; KMS gives FIPS 140-2 HSMs, per-account key isolation, and CloudTrail audit logs that the legal team needs to defend label/publisher contracts.</td><td>Self-managed HSM — capex + audit overhead; HashiCorp Vault — extra ops</td></tr>
+    <tr><td><b>Widevine / FairPlay (DRM)</b></td><td>Publishers contractually require hardware-backed DRM for offline downloads; Widevine covers Android/Echo, FairPlay covers iOS, and PlayReady covers Windows/Kindle — between them every Audible client is covered.</td><td>Custom DRM — won't pass publisher audit; no DRM — illegal under contracts</td></tr>
+    <tr><td><b>AES-128 CTR</b></td><td>Per-chapter content encryption for offline files; CTR mode allows random seek into the file (jumping to chapter 12 of 30) without decrypting earlier blocks, which a CBC-mode design would force.</td><td>AES-CBC — no random seek; AES-GCM — overkill (auth tags) for read-only content</td></tr>
+    <tr><td><b>WSOLA (phase vocoder)</b></td><td>Variable speed 0.5x to 3.5x without pitch shift is a 40%-of-users feature; running WSOLA client-side avoids per-speed transcoding which would otherwise multiply storage by 7x and add origin compute.</td><td>Server transcoding — storage explosion; PSOLA — worse quality at extreme rates</td></tr>
+    <tr><td><b>MQTT / Long-poll</b></td><td>Sub-5s Whispersync push to other devices needs a low-overhead persistent channel; MQTT over TLS with last-will-and-testament keeps mobile battery happy, and long-poll is the fallback for restrictive networks.</td><td>Pure WebSocket — fine but heavier on mobile; SSE — one-way only</td></tr>
+  </tbody>
+</table>

@@ -1,0 +1,137 @@
+<h1>Design Google Ads (auction + serving + reporting)</h1>
+<div class="meta-row">
+  <span class="tag diff-Very Hard">Very Hard</span>
+  <span class="tag">ad-tech</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a search and display advertising platform like Google Ads. Advertisers create campaigns with keyword targeting, budgets, and bids. When a user issues a query, the system runs an auction across millions of candidate ads in &lt;100 ms, serves the winners, tracks impressions and clicks, charges advertisers under a generalized second-price (GSP) model, and reports near-real-time performance to advertisers.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Advertiser console: campaign / ad-group / keyword CRUD, bid management, budgets.</li>
+  <li>Real-time auction at query-time: candidate selection, scoring, ranking, pricing.</li>
+  <li>Ad serving with click and impression tracking, fraud filtering.</li>
+  <li>Budget pacing across the day; stop serving when daily cap is exhausted.</li>
+  <li>Reporting: dashboards with hourly aggregates, daily attribution, conversion tracking.</li>
+  <li>Quality Score model that combines bid, predicted CTR (pCTR), and landing-page experience.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> auction p99 &lt; 80 ms; total ad-serving budget &lt; 120 ms inside the SERP.</li>
+  <li><b>Scale:</b> 100 B searches/day → ~1.2 M QPS peak; 10 M active advertisers; 50 B keywords.</li>
+  <li><b>Availability:</b> 99.99% — every dropped auction is lost revenue.</li>
+  <li><b>Consistency:</b> eventual for reporting, strong for budget enforcement.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 1.2 M peak auctions/s × ~30 candidate ads scored each = 36 M scoring ops/s.</li>
+  <li>Storage: campaigns ~10 TB; click/impression log ~50 TB/day raw, ~5 TB after compaction.</li>
+  <li>Bandwidth: 100 B impressions/day × 2 KB beacon = 200 TB/day.</li>
+  <li>Memory: keyword inverted index ~2 TB sharded across ~200 serving replicas.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/campaigns                     {name, dailyBudget, bidStrategy}    → campaignId
+POST /v1/campaigns/{id}/adgroups       {keywords[], maxCpcBid, creative}   → adGroupId
+GET  /v1/auction?q=...&user=...&geo=.. (internal)                          → [adId, price, slot]
+POST /v1/track/impression              {adId, auctionId, ts}               → 204
+POST /v1/track/click                   {adId, auctionId, ts, sig}          → 302 redirect
+GET  /v1/reports/campaign/{id}?range   → {impr, clicks, spend, conv}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[User Query] → [SERP FE] → [Ad Mixer] ─────────────┐
+                              │                     │
+                              ▼                     ▼
+                     [Candidate Selector]    [pCTR Model Server]
+                       (inverted index)        (TF Serving / GPU)
+                              │                     │
+                              ▼                     │
+                       [Auction / GSP] ◄────────────┘
+                              │
+                              ▼
+                      [Ad Server + Beacons]
+                              │
+                              ▼
+                     [Kafka click/impr log] → [Flink ETL] → [BigQuery + Druid]
+                              │
+                              ▼
+                  [Budget Pacer (Redis token bucket)]
+</div>
+<p>The Ad Mixer fans out to candidate selection (keyword + audience match), gets pCTR predictions, runs the GSP auction, and writes the auction record to Kafka. Beacons fire on render and click; Flink performs deduplication, bot filtering, and budget decrement.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Campaign metadata (Spanner)</h3>
+<pre>CREATE TABLE campaigns (
+  campaign_id INT64, advertiser_id INT64,
+  daily_budget_micros INT64, status STRING,
+  PRIMARY KEY (advertiser_id, campaign_id)
+) INTERLEAVE IN PARENT advertisers;</pre>
+<h3>7.2 Inverted index (Bigtable + in-memory)</h3>
+<p>Keyword → posting list of (adGroupId, bid, matchType). Replicated to each serving shard; reload via versioned snapshots every 5 minutes.</p>
+<h3>7.3 Reporting (BigQuery + Druid)</h3>
+<p>Druid for sub-second slice/dice on advertiser dashboards; BigQuery for ad-hoc and billing reconciliation.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Auction (GSP)</h3>
+<p>Score = bid × pCTR × QualityScore. Top-K by score; price for slot <i>k</i> = (score_{k+1} / pCTR_k) + ε. Reserve price floors enforced. Auction record (auctionId, candidates, prices) is logged for audit and billing.</p>
+<h3>8.2 pCTR model</h3>
+<p>Logistic regression with feature crosses for candidate generation, GBDT/DNN for ranking. Features: query × ad embeddings, historical CTR with smoothing, device, geo, dayparting. Online updates via streaming TF training.</p>
+<h3>8.3 Budget pacer</h3>
+<p>Redis token-bucket per campaign. Pacer admits an auction only if a token is available; refills at <code>budget / day_seconds</code> with smoothing to avoid early-day exhaustion.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Index hot keywords ("iphone"):</b> partition by keyword hash with a small replicated hot-key set served from RAM.</li>
+  <li><b>pCTR latency:</b> batch scoring per request, INT8 quantization, locality with the candidate selector.</li>
+  <li><b>Click fraud:</b> stateful Flink job correlating IP, UA, click cadence; suspicious clicks marked non-billable.</li>
+  <li><b>Budget overshoot:</b> Lua atomic decrement in Redis; reconcile end-of-day in Spanner.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>GSP vs VCG</td><td>Simple, near-truthful</td><td>Not fully incentive-compatible</td></tr>
+<tr><td>Async budget update</td><td>Cheap, low-latency auction</td><td>Risk of small overspend</td></tr>
+<tr><td>Druid for reporting</td><td>Sub-second OLAP</td><td>Late-arriving events tricky</td></tr>
+<tr><td>Spanner for campaigns</td><td>Global ACID, schema evolution</td><td>Cost vs sharded MySQL</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — keyword-hash sharding for the inverted index.</li>
+  <li>Ch. 9 Consistency — Spanner external consistency for advertiser billing.</li>
+  <li>Ch. 11 Stream Processing — exactly-once impression/click pipelines via Kafka + Flink with idempotent sinks.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd separate the hot-path auction from the cold-path reporting — the latter can absorb minutes of lag, the former cannot afford 10 ms."</li>
+  <li>"Budget enforcement is the trickiest tension: strong consistency would slow the auction, so I use a token bucket per shard plus periodic global reconciliation."</li>
+  <li>"Quality Score keeps incentives aligned — purely highest-bidder pricing degrades user experience and long-term revenue."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>Google Spanner (campaign metadata)</td><td>10 M advertisers and 50 B keywords need globally-consistent edits with strict ACID for billing reconciliation; Spanner's external consistency lets us bill against the same row read by the auction without reconciliation drift across regions.</td><td>Sharded MySQL (rejected: manual resharding pain at 10 TB); CockroachDB (less mature billing-grade ACID at this scale).</td></tr>
+<tr><td>Bigtable (inverted keyword index)</td><td>The 2 TB keyword posting list is read-heavy and sharded by keyword hash; Bigtable's row-key range scans serve posting lists at &lt;5 ms p99 while the in-memory replicas absorb the 1.2 M auction QPS hot path.</td><td>Cassandra (rejected: GC stalls hurt p99); Elasticsearch (heavyweight, slower for simple posting-list lookups).</td></tr>
+<tr><td>Redis token bucket (budget pacer)</td><td>Budget admit/decrement happens inside an 80 ms auction at 1.2 M QPS; Redis Lua atomic decrement gives sub-millisecond enforcement with idempotent semantics, while Spanner reconciles end-of-day to bound overspend to ~1%.</td><td>In-process counters (rejected: cross-shard inconsistency); Spanner direct (too slow for hot path at 50 ms+ commit latency).</td></tr>
+<tr><td>TensorFlow Serving on GPU (pCTR ranker)</td><td>Per auction we score ~30 candidates inside a 30 ms ranking budget; TF Serving with INT8 quantization handles 36 M scoring ops/s on a GPU fleet co-located with the candidate selector to avoid an RPC hop.</td><td>CPU-only XGBoost (rejected: 3x slower at this batch size); ONNX Runtime (similar perf, weaker TF ecosystem fit).</td></tr>
+<tr><td>GBDT for CTR (ranking model)</td><td>Logistic regression with crosses for cheap candidate generation, GBDT for final ranking — GBDT captures non-linear feature interactions (query × ad × geo × daypart) better than LR while training nightly on 100 B impressions stays tractable.</td><td>Pure DNN (rejected: training cost, latency); Pure LR (under-fits non-linear ad-quality signals).</td></tr>
+<tr><td>Apache Kafka (impression / click log)</td><td>200 TB/day of beacon traffic plus auction records need a durable replayable log; Kafka's partitioned append-only model lets Flink replay last-N-days for billing recompute and feeds both BigQuery (cold) and Druid (hot) sinks.</td><td>Pulsar (smaller ecosystem); AWS Kinesis (lower throughput per shard, harder for 5 GB/s peak).</td></tr>
+<tr><td>Apache Flink (ETL + click fraud)</td><td>Stateful click fraud detection correlates IP / UA / cadence over 5-minute keyed windows; Flink's exactly-once + RocksDB state backend supports this at click volumes (~100 B/day) with bounded watermarks for late beacons.</td><td>Spark Structured Streaming (micro-batch lag); Kafka Streams (state size limits at TB scale).</td></tr>
+<tr><td>Apache Druid (advertiser dashboards)</td><td>Advertisers slice/dice campaign × hour × geo on dashboards expecting &lt;1 s response; Druid's bitmap-indexed columnar segments deliver sub-second OLAP on the last 30 days where BigQuery would charge per scan and add latency.</td><td>BigQuery (high per-query cost for dashboards); ClickHouse (viable, but Druid's ingestion + lambda support more mature here).</td></tr>
+<tr><td>BigQuery (billing &amp; ad-hoc)</td><td>Daily billing reconciliation scans 5 TB compacted logs; BigQuery's serverless model lets finance run ad-hoc audit queries without managing a cluster, and federated queries against Spanner cross-check spend vs ledger.</td><td>Hive on HDFS (operational overhead); Snowflake (similar capability, more expensive at GCP-native ingest).</td></tr>
+<tr><td>GSP auction (vs VCG)</td><td>GSP scoring (bid × pCTR × QualityScore) and pricing (next-score / pCTR + ε) is well-understood by 10 M advertisers; near-truthful in practice and avoids the pCTR-calibration sensitivity that breaks VCG revenue.</td><td>VCG (rejected: complex, advertiser-confusing, revenue volatile); First-price (forces bid-shading complexity).</td></tr>
+<tr><td>Quality Score squashing (α≈0.85)</td><td>Pure bid×pCTR rewards rich advertisers with bad creative; raising bid to power α&lt;1 dampens the bid signal so high-quality ads win when scores are close, protecting long-term marketplace health and SERP quality.</td><td>No squashing (rejected: degrades user experience); reserve-only floors (blunt instrument).</td></tr>
+<tr><td>Versioned snapshot reload (5 min)</td><td>Hot-reloading the 2 TB keyword index without serving stalls requires atomic versioned swaps; 5-minute snapshots balance index freshness for new campaigns against the cost of rebuilding posting lists across 200 replicas.</td><td>Live diff streams (rejected: complex correctness for posting list edits); hourly reload (too stale for new campaign launches).</td></tr>
+</tbody>
+</table>

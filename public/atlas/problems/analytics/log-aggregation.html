@@ -1,0 +1,179 @@
+<h1>Design Log Aggregation Pipeline (Splunk-style, Elasticsearch + Kafka)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">analytics</span>
+  <span class="tag">search</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a centralized log platform like Splunk / Elastic Stack / Loki for an enterprise running 50K hosts and producing 100&ndash;500 TB of logs/day. Engineers need full-text search, structured filters, dashboards, alerting, and long-term archival. The system must keep ingestion alive even when downstream search is degraded &mdash; logs are the lifeline during outages.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Collect logs via Fluent Bit / Vector / Filebeat agents.</li>
+  <li>Parse (regex/grok), enrich (k8s metadata, geoip), and structure into JSON.</li>
+  <li>Full-text + structured search with sub-second latency on 24h window.</li>
+  <li>Saved searches, alerts, dashboards (Kibana-style).</li>
+  <li>30-day hot retention, 1-year cold archive in S3, replayable to hot tier.</li>
+  <li>Role-based access by index pattern.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Ingest:</b> 5 PB/month &asymp; 200 TB/day, 5M log lines/sec peak.</li>
+  <li><b>Search latency:</b> p95 &lt; 2 s for 1h, &lt; 10 s for 24h.</li>
+  <li><b>Indexing lag:</b> log queryable within 30 s.</li>
+  <li><b>Durability:</b> zero loss for committed lines; agents retry up to 24 h.</li>
+  <li><b>Multi-tenancy:</b> 200 teams isolated by index + RBAC.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>200 TB/day raw; ~50 TB/day after gzip on disk; ~80 TB/day Lucene-indexed.</li>
+  <li>Lines: 5M/s baseline, 20M/s peak &rarr; Kafka with 2048 partitions @ 10 MB/s each.</li>
+  <li>Hot ES: 30d * 80 TB = 2.4 PB; ~120 nodes &times; 24 TB SSD with 1 replica.</li>
+  <li>Cold S3: 12 mo * 50 TB compressed = 18 PB / yr.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /_bulk                       (Elastic _bulk JSON)
+GET  /search?q=service:checkout AND status:5xx&amp;from=now-1h
+POST /alerts  { query, threshold, schedule }
+POST /restore { date_range, dest_index }   // rehydrate cold tier
+</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[App] -&gt; [Fluent Bit agent] --&gt; [Edge Aggregator] --&gt; [Kafka logs.raw, 2048 parts]
+                                                            |
+            +-----------------------------------------------+--------------------------+
+            v                                                                          v
+   [Parser/Enricher (Flink)]                                                   [Cold Archiver]
+            |                                                                          |
+            v                                                                          v
+   [Kafka logs.structured]                                                  [S3 Parquet by hour]
+            |
+            +--------&gt; [ES Indexer Workers]  --&gt;  [Elasticsearch hot tier]
+            |                                              ^
+            +--------&gt; [Alert Evaluator]                   |
+                                                  [Kibana / Search API]
+</div>
+<p>Agents tail files, batch every 5s, and ship to a regional aggregator that authenticates and writes to Kafka. <b>Kafka is the durable buffer</b> &mdash; if Elasticsearch falls behind or crashes, the pipeline doesn't lose data; it just reads from a lagged offset later. This decoupling is the single most important architectural choice (DDIA Ch. 11 "log as buffer").</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Index strategy</h3>
+<pre>Index pattern: logs-{tenant}-{yyyy.MM.dd}
+Shards/index : ceil(daily_size_GB / 30)        # ~30 GB target
+Replicas     : 1 (RF=2)
+Mapping      : @timestamp, service, host, level, msg(text), trace_id(keyword), labels(flat)</pre>
+<h3>7.2 Cold tier</h3>
+<p>The cold archiver consumes <code>logs.structured</code> and writes hour-partitioned Parquet to S3 with Hive-style paths <code>s3://logs/tenant=X/dt=2026-05-06/hr=14/</code>. Athena/Trino can query directly; the restore API rehydrates a date range back into a temporary ES index for interactive search.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Parser/Enricher</h3>
+<p>Stateless Flink job applying per-tenant grok patterns hot-loaded from a config service. Failed parses go to a <code>logs.parse_dlq</code> topic with the raw line preserved &mdash; no log line is silently lost. K8s metadata is enriched via a streaming join against a CDC stream from the API server (DDIA Ch. 11 stream-table join).</p>
+<h3>8.2 Hot/warm/cold tiering</h3>
+<p>ILM policy: 0&ndash;3 d on NVMe nodes, 3&ndash;30 d on HDD warm nodes, &gt;30 d frozen on S3-backed searchable snapshots. Index rolls over at 50 GB or 1 day, whichever first.</p>
+<h3>8.3 Search performance</h3>
+<p>Per-shard query parallelism + cross-cluster search for tenants spanning multiple clusters. Time-range pruning on index name keeps fan-out narrow. Frequent saved searches are pre-aggregated into rollup indexes by a nightly batch job.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Bursty noisy neighbors:</b> per-tenant token bucket at the edge; on overage, we keep ingesting to Kafka but shed indexer throughput &mdash; logs survive even if search lags.</li>
+  <li><b>Hot shard:</b> a single service emitting 1M lines/s overwhelms one ES shard; mitigate with rollover-on-size and index-level routing by hash(host).</li>
+  <li><b>Mapping explosion:</b> uncontrolled JSON keys blow up the field map; we use the <code>flattened</code> field type for free-form labels.</li>
+  <li><b>Replay during outage recovery:</b> Kafka retention 72h gives time to rebuild ES; replay throttled to avoid double-burst.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>ES hot tier vs. Loki/grep-on-S3</td><td>True full-text, sub-second</td><td>10&times; the storage cost</td></tr>
+<tr><td>Kafka as buffer (vs. direct write)</td><td>Survives ES outages, replayable</td><td>Extra hop &amp; ops burden</td></tr>
+<tr><td>Daily index rollover</td><td>Easy retention, time-pruning</td><td>Many small shards</td></tr>
+<tr><td>Cold tier in Parquet</td><td>10&times; cheaper, OLAP-queryable</td><td>Slow interactive UX without rehydrate</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li><b>Ch. 11 Stream Processing</b> &mdash; Kafka as the durable log decoupling producers from indexers; backpressure handled by lag, not by drop. Stream-table joins for k8s enrichment. Dead-letter queues for un-parseable records.</li>
+  <li><b>Ch. 10 Batch Processing</b> &mdash; nightly rollup indexes (count/sum per service/level/minute) are MapReduce-style aggregations. Cold-tier Parquet builds + Trino queries are batch-on-immutable inputs, exactly the pattern in Ch. 10.</li>
+  <li><b>Ch. 3 Storage &amp; Retrieval</b> &mdash; Lucene segment files = LSM-style immutable sorted runs with merging; inverted index is the canonical search structure.</li>
+  <li><b>Ch. 5 Replication</b> &mdash; ES primary/replica is single-leader per shard; we accept brief unavailability on primary failover for stronger consistency.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Logs are the most valuable when the system is broken, so the pipeline must keep accepting them even with ES down &mdash; that's why Kafka is non-negotiable."</li>
+  <li>"I'd push back on indexing everything: a 30-day searchable + 12-month grep-able tier saves an order of magnitude in cost."</li>
+  <li>"Mapping explosion has destroyed more ES clusters than disk failure; I'd ship with strict per-tenant field budgets."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Kafka as durable buffer between agents and indexer</td>
+      <td>Logs are most valuable when the system is broken, so the pipeline must keep accepting them even with ES down. Kafka absorbs 200 TB/day at &gt;2 GB/sec sustained and lets the indexer fall arbitrarily behind without losing logs &mdash; this decoupling is non-negotiable.</td>
+      <td>Direct agent&rarr;ES (back-pressure crashes apps); Fluentd buffer files (no replay across nodes)</td>
+    </tr>
+    <tr>
+      <td>Elasticsearch for hot 30-day searchable tier</td>
+      <td>SREs grep recent logs interactively; only an inverted index gives sub-second free-text on 6 PB of recent data (200 TB/day &times; 30 days). ES with hot/warm/cold node classes is the only mature OSS option that handles this scale with ad-hoc query patterns.</td>
+      <td>Loki (label-only search, slow on full-text); Splunk (10&times; cost); Solr (smaller ops community)</td>
+    </tr>
+    <tr>
+      <td>S3 + Parquet for 12-month grep-able cold tier</td>
+      <td>Indexing every log at full retention would cost ~$50M/yr; a 30-day searchable + 12-month grep-able tier saves an order of magnitude. Parquet on S3 with date partitioning makes Athena/Presto grep over old logs cheap and on-demand.</td>
+      <td>Index everything in ES (10&times; cost); Glacier-only (retrieval latency too high for ops)</td>
+    </tr>
+    <tr>
+      <td>ILM (Index Lifecycle Management) policies</td>
+      <td>200 TB/day of new indices means manual rotation is impossible. ILM rolls over indices at 50 GB or 1 day, transitions hot&rarr;warm at 7 days (cheaper hardware), and force-merges to fewer segments &mdash; all automatically, preventing the "1000 tiny shards" failure mode that kills ES clusters.</td>
+      <td>Manual rotation scripts (operational toil, error-prone); Curator (deprecated)</td>
+    </tr>
+    <tr>
+      <td>Strict per-tenant field budget (mapping limits)</td>
+      <td>Mapping explosion has destroyed more ES clusters than disk failure: one app emitting <code>error.line_42_var_x</code>-style dynamic field names balloons mappings to 50K+ fields and OOMs masters. A 1000-field-per-tenant cap with rejection at the indexer is mandatory at 200 TB/day.</td>
+      <td>Dynamic mapping (cluster death); pre-defined schema (blocks dev velocity)</td>
+    </tr>
+    <tr>
+      <td>Fluent Bit / Vector agent on every host</td>
+      <td>Tens of thousands of hosts emitting logs; we need a 1-2 MB-RSS agent that handles backpressure, multiline, and Kafka output. Fluent Bit's C core does this at &lt;1% CPU per host; a heavy JVM agent would tax production hosts at 200 TB/day fleet emission.</td>
+      <td>Filebeat (heavier, JVM); Logstash on host (200 MB RSS, kills app density)</td>
+    </tr>
+    <tr>
+      <td>Structured JSON logging + canonical fields</td>
+      <td>Free-form text logs force regex parsing at index time, doubling indexer CPU. Mandating JSON with 8 canonical fields (ts, level, svc, trace_id, ...) cuts indexer cost ~40% and unlocks join-by-trace_id with the tracing system at zero additional infra.</td>
+      <td>Free text + Grok (CPU-heavy); CEF/syslog (legacy, weaker tooling)</td>
+    </tr>
+    <tr>
+      <td>Time-based ES indices (per-day, per-tenant)</td>
+      <td>Most queries are "last 1h on service X"; per-day indices let the query coordinator skip 95% of shards via routing. Per-tenant prefix lets ILM expire one customer's data without touching others, which matters at 200 TB/day shared infra.</td>
+      <td>Single huge index (no shard pruning); per-hour indices (10K+ shard explosion)</td>
+    </tr>
+    <tr>
+      <td>OpenTelemetry log SDK + trace_id correlation</td>
+      <td>Engineers debug by jumping from a slow trace span to the logs of that exact request. OTel's log SDK injects trace_id automatically; a free-form logger requires manual MDC plumbing in 7 languages and inevitably misses paths.</td>
+      <td>Per-language MDC (inconsistent coverage); no correlation (debugging is grep-and-pray)</td>
+    </tr>
+    <tr>
+      <td>RoaringBitmap inside ES for terms aggregations</td>
+      <td>"Top 10 services by error count last 1h" over billions of docs needs efficient set ops on doc-id lists. ES uses Roaring under the hood for filter caches; this is why <code>filter</code> queries are 10&times;+ faster than <code>query</code> on the same predicate at our scale.</td>
+      <td>Sorted long arrays (slow AND); plain bitmaps (memory blowup on sparse fields)</td>
+    </tr>
+    <tr>
+      <td>Kafka Connect / Logstash to S3 sink with hourly compaction</td>
+      <td>Streaming Kafka&rarr;S3 produces millions of tiny Parquet files; Athena tasks-per-file would explode query cost. Hourly compaction batch rewrites to ~512 MB Parquet, which is the file size cold-tier query engines actually run well on.</td>
+      <td>No compaction (Athena query timeouts); Avro (no column pruning for cold grep)</td>
+    </tr>
+    <tr>
+      <td>Per-tenant rate limiting at the indexer</td>
+      <td>One application in a debug-spam loop can emit 10&times; its baseline and starve every other tenant's indexing. A token-bucket per tenant on the indexer guarantees fair share at 200 TB/day fleet-wide and prevents one bad deploy from blinding the rest of the org.</td>
+      <td>Global queue (noisy neighbor wins); host-level limit (no aggregate tenant view)</td>
+    </tr>
+  </tbody>
+</table>

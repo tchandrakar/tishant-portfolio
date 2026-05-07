@@ -1,0 +1,138 @@
+<h1>Design Driver Matching Engine (geospatial + supply/demand)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">ride-sharing</span>
+  <span class="tag">maps-location</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the dispatch engine that decides which driver gets which rider. It must consume a stream of driver location pings, maintain a real-time spatial index, and on every ride request return the optimal driver in well under one second. "Optimal" is multi-objective: minimize rider ETA, maximize driver utilization, balance global earnings, and respect surge-pricing incentives.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Ingest driver location pings (4s cadence) and maintain status (online, on-trip, off-duty).</li>
+  <li>On a ride request, return a ranked list of candidate drivers within configurable radius.</li>
+  <li>Send dispatch offer to top driver with a 10–15s acceptance window; fall through to next on decline/timeout.</li>
+  <li>Support pooled rides: assign a second rider to an in-progress trip if detour cost is acceptable.</li>
+  <li>Honor preferences: car class, accessibility, pets, language, rider rating threshold.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 dispatch decision &lt; 200 ms; p99 &lt; 1s.</li>
+  <li><b>Scale:</b> 5 M concurrent online drivers, 1.25 M location writes/sec, 3 K dispatches/sec peak.</li>
+  <li><b>Correctness:</b> a driver is offered to at most one rider at a time (linearizable on driver state).</li>
+  <li><b>Fault tolerance:</b> a single AZ failure must not stall a city's dispatch; degrade gracefully (fallback to last-known location).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Location ingest: 1.25 M wps × 100 B = 125 MB/s; with 3× replication, ~10 TB/day.</li>
+  <li>Geo lookups: 3 K dispatch/sec × ~50 candidates each = 150 K spatial queries/sec.</li>
+  <li>In-memory state per city: ~50 K active drivers × 200 B = 10 MB; trivially fits in a single node.</li>
+  <li>Match decision compute: 50 candidates × road-network ETA (~5 ms each) → must parallelize: 8-way fan-out → ~30 ms.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/match/request {rideId, origin, productType, prefs}      → matchToken
+GET  /v1/match/status/{matchToken}                                → state, driverId?
+POST /v1/drivers/{id}/state {status, lat, lng, heading, ts}       → 200
+POST /v1/drivers/{id}/offer/respond {offerId, accept:bool}        → 200
+
+Internal:
+  GET /v1/geo/nearby?cell=...&amp;k=50                              → [driverId, distM, eta]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">                +------------------+
+[Driver app] -> | Ping Ingest      | --(Kafka: pings)-->
+                +------------------+                    |
+                                                        v
+                                              +------------------+
+                                              | Geo Index Shards |  (per-city, in-mem)
+                                              |  S2 cell -> set  |
+                                              +------------------+
+                                                        ^
+                                                        |
+[Rider app] -> [Match API] --> [Dispatch Coordinator] --+
+                                       |
+                                       v
+                             [Scorer (ETA + ranker)]
+                                       |
+                                       v
+                             [Offer Manager] --(push)--> [Driver app]
+                                       |
+                                       v
+                             [Kafka: dispatch_events]
+</div>
+<p>Geo Index is a sharded in-memory service, partitioned by city. Each shard owns the full set of drivers for its city (typically 30–80 K) — fits comfortably in a single 16 GB box, replicated 3-way. Dispatch Coordinator is stateless; it queries the index, scores candidates, and hands off to Offer Manager which owns the offer FSM.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Driver state (Redis cluster)</h3>
+<pre>HSET driver:{id} status ONLINE lat 37.78 lng -122.41 cell 9q8yyz ts ...
+ZADD geo:cell:9q8yyz {score=ts} {driver_id}     # for fast scan + TTL eviction
+SET  offer:{driver_id} {match_token} EX 15      # NX guards uniqueness</pre>
+<h3>7.2 Dispatch decision log (Kafka -> S3 + ClickHouse)</h3>
+<p>Every (request, candidates considered, offer outcome) tuple is logged. ClickHouse for ad-hoc analytics; S3 + Parquet for ML training (rider acceptance models, ETA models).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Geo index</h3>
+<p>S2 at level 12 (~1.2 km cells). Cells map to a sorted set of driver IDs ordered by last-update timestamp. On a query, we fetch the rider's cell and 8 neighbors — typical worst case 9 sets × ~80 drivers = 720 candidates, which we narrow to top-50 by haversine distance, then call the routing engine for true road ETA on those 50.</p>
+<h3>8.2 Scorer</h3>
+<p>Multi-objective: <code>score = w1*(1/eta) + w2*(driver_acceptance_rate) + w3*(driver_idle_minutes) - w4*(detour_cost_for_pool)</code>. Weights tuned per city via offline RL. Returns ranked list to the offer manager.</p>
+<h3>8.3 Offer manager</h3>
+<p>Holds offer state (<code>SET offer:driver_id NX EX 15</code> for linearizable single-offer guarantee). On accept, atomically transitions driver state to ASSIGNED; on decline/timeout, removes the lock and re-queries the next candidate. This is the only strongly-consistent path; the rest is eventually consistent.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot cells:</b> downtown rush hour can push 5 K drivers into one S2 cell; subdivide dynamically into level-13 children when count &gt; 1 K.</li>
+  <li><b>Repeated retries:</b> a flaky driver app re-pinging at 1 Hz can DoS the index; rate-limit per driver.</li>
+  <li><b>Cross-AZ failover:</b> use Redis sentinel + ping replay from Kafka to rebuild a hot replica in &lt;30s.</li>
+  <li><b>ETA service overload:</b> only score top 50 by haversine; use cached road-network ETAs for popular cell pairs.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>In-memory index per city</td><td>Sub-ms lookups</td><td>Extra rebuild on failure</td></tr>
+<tr><td>S2 fixed-level cells</td><td>Simple, fast</td><td>Hot cells need dynamic split</td></tr>
+<tr><td>Single offer at a time</td><td>No double dispatch</td><td>Adds 10–15s latency on declines</td></tr>
+<tr><td>Batch dispatch (every 2s)</td><td>Globally optimal assignment (Hungarian)</td><td>+latency vs greedy per-request</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — partition by city; rebalance at city-launch time.</li>
+  <li>Ch. 7 Transactions — single-key linearizability via Redis CAS for the offer lock.</li>
+  <li>Ch. 9 Consistency — when greedy vs batch matters: batch needs consistent snapshot.</li>
+  <li>Ch. 11 Stream Processing — pings as a stream that materializes the geo index.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd start with greedy per-request matching and add a 2-second batch window only in cities where we measure measurable utilization gains."</li>
+  <li>"The hardest bug class is double-dispatch under concurrent retries; my mitigation is the offer NX-lock with TTL and a Kafka decision log for forensics."</li>
+  <li>"I'd treat the index as a materialized view over the ping stream — that lets me rebuild it from Kafka after any failure."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>S2 (level 12, ~1.2 km)</td><td>The 9-cell scan (rider cell + 8 neighbors) returns ~720 candidates before the haversine cull to 50; Hilbert-curve key keeps it as a single-shard sorted-set range. Lookups stay in &lt;2 ms even at 150 K geo-queries/sec.</td><td>Geohash → uneven cells at high latitudes break the 8-neighbor assumption; H3 → no native 1D key for ZSET-style range scans.</td></tr>
+    <tr><td>H3 (resolution 13 split)</td><td>Reserved for hot-cell subdivision: when a level-12 cell exceeds 1 K drivers (downtown rush hour can pack 5 K), we re-key into level-13 children so a single Redis key stays under CPU-stall thresholds.</td><td>Static finer S2 → wastes memory in sparse cells; quadtree → no edge-uniform neighbor ring.</td></tr>
+    <tr><td>Redis cluster (geo state)</td><td>1.25 M location wps and 200 K reads/sec land in a sharded cluster keyed by S2 cell with sub-ms latency; SET NX EX 15 on offer:driver_id provides the linearizable single-offer lock that prevents double-dispatch.</td><td>Memcached → no sorted set or atomic NX; Aerospike → fine but heavier ops for the same access pattern.</td></tr>
+    <tr><td>Redis Sentinel</td><td>City-level dispatch must survive a single AZ outage in &lt;30s; Sentinel promotes a replica and the index rebuilds the missing 30s gap from Kafka rather than scanning durable storage.</td><td>Manual failover → SLO miss; Redis Cluster only → slower failover for the smaller per-city footprints.</td></tr>
+    <tr><td>Kafka (pings + decision log)</td><td>Partition pings by driver_id hash (not city) so NYC's 8% trip share doesn't melt one partition; replay rebuilds the in-memory index after AZ failure. Decision log feeds ML training without on-line cost.</td><td>RabbitMQ → no replay; Kinesis → fine but smaller Flink connector ecosystem.</td></tr>
+    <tr><td>ClickHouse (decision analytics)</td><td>Every (request, candidates considered, offer outcome) tuple at 3 K dispatches/sec × ~50 candidates = 150 K rows/sec is queried ad-hoc by ops; columnar compression lands these at &lt;1 GB/hr.</td><td>Druid → equally fine, ClickHouse is simpler ops; Postgres → would die under 150 K wps.</td></tr>
+    <tr><td>S3 + Parquet (ML training)</td><td>Long-term decision logs feed acceptance-rate and ETA models; columnar Parquet at day/region partitioning makes 90-day backfills feasible from a single Spark job.</td><td>HDFS → no managed multi-region; raw JSON → 5–10× storage and compute.</td></tr>
+    <tr><td>gRPC (internal)</td><td>Sub-1s p99 dispatch budget cannot afford JSON parsing across Match API → Coordinator → Scorer → Offer Manager; protobuf keeps each hop under 5 ms.</td><td>REST/JSON → too slow at p99; Thrift → smaller polyglot tooling.</td></tr>
+    <tr><td>MQTT (offer push)</td><td>Driver app must receive an offer push within the 10–15s acceptance window even on flaky LTE; persistent sessions over QUIC keep 5 M concurrent drivers connected at low battery cost.</td><td>FCM/APNs → 2–10s tail latency; WebSocket → heavier per-connection state.</td></tr>
+    <tr><td>Routing engine (CH/CRP)</td><td>The scorer evaluates true road-network ETA for the top 50 candidates; Contraction Hierarchies precomputed weekly returns each query in &lt;5 ms, so 50-way fan-out completes in ~30 ms with 8-way parallelism.</td><td>Haversine only → drops accuracy 20–30%; Live Dijkstra → 50–100 ms per query, blows budget.</td></tr>
+    <tr><td>Hungarian matcher (batch mode)</td><td>Optional 2-second batch window in cities where utilization gain justifies +latency; bipartite assignment is provably optimal for ~1 K riders × ~3 K drivers per batch.</td><td>Greedy only → leaves 5–8% utilization on the table in dense markets.</td></tr>
+    <tr><td>Flink (RL feature pipeline)</td><td>Streaming features (driver idle minutes, recent acceptance rate) materialize from the ping/offer events at 1 min cadence so the scorer's weights stay fresh; offline RL retunes weights weekly.</td><td>Spark Streaming → micro-batch latency too high; in-process counters → no cross-shard view.</td></tr>
+  </tbody>
+</table>
+

@@ -1,0 +1,219 @@
+<h1>Design Real-time Traffic System (probe data → tile aggregation)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">maps-location</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build the live traffic backbone that powers the colour-coded congestion overlay on Google/Apple Maps and feeds the routing engine. Ingest GPS/accelerometer "probes" from ~1 B mobile devices, map-match them to road edges, aggregate to per-edge speed estimates with confidence, publish to traffic tiles and to the routing engine — end-to-end latency &lt; 2 minutes. Detect incidents (sudden congestion) within 60 s.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Ingest GPS pings (lat, lng, speed, heading, ts, accuracy) from devices.</li>
+  <li>Map-match a sequence of pings to a road edge sequence (Hidden Markov Model).</li>
+  <li>Compute per-edge median speed in 1-min windows with confidence intervals.</li>
+  <li>Render traffic tiles at zoom 8-18 (green/yellow/red/dark-red) refreshed every 60 s.</li>
+  <li>Push edge speed updates to the routing engine for ETA recomputation.</li>
+  <li>Detect incidents: edges where speed &lt; 30% of free-flow for &gt; 90 s.</li>
+  <li>Historical traffic patterns (typical speed at hour h, day d) — for forecasting.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> ping → tile/edge update &lt; 120 s p99.</li>
+  <li><b>Scale:</b> 1 B devices × 1 ping/30 s peak = 33 M events/s; ~85 PB/year raw.</li>
+  <li><b>Tile refresh:</b> 30 M traffic-relevant tiles globally, 1-min cadence.</li>
+  <li><b>Privacy:</b> de-identified probes; no per-user trajectories retained &gt; 24 h in raw form.</li>
+  <li><b>Availability:</b> degrade gracefully — stale traffic is acceptable, dropped pings are not catastrophic.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Ingest: 33 M evts/s × 40 B (proto) = 1.3 GB/s into Kafka; replicated 3× = ~4 GB/s disk IO.</li>
+  <li>Map-match CPU: ~50 µs/ping × 33 M = 1700 cores steady-state.</li>
+  <li>Edge aggregator state: 400 M edges × 64 B running stats = 25 GB — sharded across 32 nodes.</li>
+  <li>Traffic tile cache: 30 M tiles × 8 KB = 240 GB; 1-min TTL → ~100 K tile re-renders/s.</li>
+  <li>Routing-engine fan-out: ~200 nodes subscribe to edge_factor topic; 400 M edges × 2 B × update fraction (5%) = 40 MB/min broadcast.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/probes/batch    {deviceIdHash, pings[]}                → 204
+GET   /v1/traffic/tile/{z}/{x}/{y}                                → MVT with edge colours
+GET   /v1/traffic/edges   ?bbox=                                  → [{edgeId, speed, conf, ts}]
+SUB   topic: traffic.edge_factor                                   → routing engine
+GET   /v1/incidents       ?bbox=                                  → [{edgeId, type, since}]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Mobile Probes] ──HTTPS batch (every 30 s)──▶ [Probe Ingest API]
+                                                       │
+                                                       ▼
+                                          [Kafka: probes (sharded by geohash5)]
+                                                       │
+                                                       ▼
+                                       [Flink: Map-matcher (HMM, edge-CSR)]
+                                                       │
+                                                       ▼
+                                       [Kafka: matched.edge_pings]
+                                                       │
+                                                       ▼
+                                  [Flink: Edge aggregator (1 min tumbling, edge_id keyed)]
+                                          │                    │
+                                          ▼                    ▼
+                              [Cassandra: edge_history]   [Kafka: traffic.edge_factor]
+                                          │                    │
+                                          ▼                    ▼
+                              [Tile Renderer]            [Routing CCH customizer]
+                                          │
+                                          ▼
+                              [Bigtable: traffic_tiles]──▶[CDN]──▶[Clients]
+
+[Forecast trainer (Spark daily)] ──▶ [Edge speed model: hour×day×edge → expected speed]
+[Incident detector (Flink)] ──▶ [Incidents store, push to clients]
+</div>
+<p>Pings shard by geohash so map-matchers maintain locality (a sequence of pings stays on the same operator). Aggregator output bifurcates: durable history (Cassandra), live edge-factor stream (routing engine), and tile renderer (visual layer).</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Probe record (Avro/Proto)</h3>
+<pre>{ device_id_hash:bytes16, ts:int64, lat:f32, lng:f32,
+  speed_mps:f16, heading:u8, accuracy_m:u8, source:enum }</pre>
+<h3>7.2 Matched edge ping (after map-match)</h3>
+<pre>{ edge_id:u32, ts:int64, speed_mps:f16, confidence:f16,
+  forward:bool, residual_match_err:f16 }</pre>
+<h3>7.3 Edge running stats (Flink keyed state)</h3>
+<pre>edge_id → ring_buffer&lt;1 min × 60 buckets&gt; of (count, median_p50, p15)
+emit when bucket closes; downstream reads "speed = median_speed × confidence + free_flow × (1−confidence)"</pre>
+<h3>7.4 Edge history (Cassandra)</h3>
+<pre>CREATE TABLE edge_speed (
+  edge_id int, ts timestamp,
+  median_mps float, count int,
+  PRIMARY KEY ((edge_id, day_bucket), ts)
+);  -- partition by day to bound row width</pre>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Map-matching (HMM)</h3>
+<p>Given a sequence of pings, hidden states are road edges; emission probability is Gaussian on perpendicular distance; transition probability is exp(−|gps_dist − road_dist|/β). Viterbi over a sliding 8-ping window gives 50 µs latency and is robust to GPS noise. Snap point also yields offset along edge — useful for rendering and incident localisation.</p>
+<h3>8.2 Confidence-weighted aggregation</h3>
+<p>For each edge: speed = (Σ w_i × s_i) / Σ w_i where w_i = 1 / accuracy². Below ~5 pings/min we fall back to historical (hour×day) expected speed weighted by 1 − confidence. This avoids "ghost congestion" on quiet roads.</p>
+<h3>8.3 Tile rendering (DDIA Ch. 10 batch + Ch. 11 stream)</h3>
+<p>Edge-factor topic feeds a vector-tile renderer: for each tile that contains updated edges, regenerate MVT with bucketed colour (green &gt;0.85 free flow, yellow 0.6-0.85, red 0.3-0.6, dark-red &lt;0.3). Only ~2-5% of tiles change per minute, keeping render load bounded.</p>
+<h3>8.4 Incident detection</h3>
+<p>Stream operator compares observed speed to forecast; sustained anomaly z-score &gt; 3 for 90 s → incident emitted. Cross-correlate with adjacent edges to classify: accident (sharp local), congestion (gradual spread), closure (zero count).</p>
+<h3>8.5 Privacy pipeline</h3>
+<p>Device-id hashed daily-rotating salt; raw pings aged out at 24 h; only edge-aggregated data persisted. Trip stitching is deliberately non-trivial server-side.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Map-match hot keys:</b> rush-hour highways concentrate probes; rebalance Flink parallelism by edge load not just hash.</li>
+  <li><b>Sparse edges:</b> rural roads see &lt;1 ping/hour — rely on historical model + Bayesian shrinkage.</li>
+  <li><b>Tile fan-out:</b> a single edge can be in 50+ tiles across zooms; keep an edge→tile reverse index.</li>
+  <li><b>Backpressure:</b> Kafka tiered storage absorbs bursts (e.g., post-game traffic).</li>
+  <li><b>Routing-engine update flood:</b> only emit edge-factor changes &gt; 10% delta — saves 80% of update volume.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>HMM map-matching</td><td>Robust to GPS noise; principled</td><td>Sliding-window latency; 50 µs/ping CPU</td></tr>
+<tr><td>1-min tumbling windows</td><td>Stable, easy to tile</td><td>1-min minimum freshness</td></tr>
+<tr><td>Confidence-weighted blend</td><td>Avoids false reds on quiet roads</td><td>Real congestion on rare roads detected slowly</td></tr>
+<tr><td>Aggregate-only retention</td><td>Privacy, cheap storage</td><td>Cannot replay raw for new features</td></tr>
+<tr><td>Edge-factor only on big delta</td><td>Saves 80% bandwidth</td><td>Tiny smooth changes invisible to routing</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 11 Stream Processing — windowed aggregations, watermarks, exactly-once via Flink checkpoints.</li>
+  <li>Ch. 10 Batch Processing — daily Spark forecast trainer for hour×day×edge models.</li>
+  <li>Ch. 6 Partitioning — geohash for ingest, edge_id for aggregation; rebalance on skew.</li>
+  <li>Ch. 5 Replication — Kafka multi-DC mirror for durability.</li>
+  <li>Ch. 12 Future — derived data flows: probe → edge → tile → routing all as eventual derivations.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"The two halves of this problem are independent: <i>good speed estimates per edge</i> (a stats/ML problem) and <i>get them to clients in 60 s</i> (a stream-engineering problem)."</li>
+  <li>"Confidence is everything — a red highway based on 1 probe is worse than no data; I'd defend that explicitly."</li>
+  <li>"Privacy is a design constraint, not an afterthought; aggregate-and-forget makes the system regulator-friendly."</li>
+  <li>"For MVP, do per-edge mean over 5-min windows on a single Flink job; defer HMM and forecasting to v2."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Kafka (probe ingest, sharded by geohash5)</td>
+      <td>33 M events/s × 40 B = 1.3 GB/s sustained ingest with bursty rush-hour spikes. Sharding by geohash5 (~5 km cells) co-locates a sequence of pings from one device on the same partition, so the downstream HMM map-matcher maintains state locality across an 8-ping sliding window without cross-partition shuffle.</td>
+      <td>Kinesis (1 MB/s/shard means ~1300 shards); Pulsar (smaller talent pool); SQS (no ordering, breaks HMM sequence assumption).</td>
+    </tr>
+    <tr>
+      <td>HMM map-matching (Viterbi over sliding window)</td>
+      <td>Raw GPS at 5-15 m accuracy frequently snaps wrong on parallel roads (highway vs frontage road). HMM with Gaussian emission on perpendicular distance + exponential transition on |gps_dist−road_dist|/β gives principled noise rejection at ~50 µs/ping — about 1700 cores total at 33 M evts/s.</td>
+      <td>Nearest-edge snap (40% wrong on parallel roads); Kalman filter (poor for road-network discrete states); deep neural matcher (10× CPU, marginal accuracy gain).</td>
+    </tr>
+    <tr>
+      <td>Flink (map-match + edge aggregation)</td>
+      <td>The whole pipeline is stateful streaming: HMM needs per-device sliding state, edge aggregator needs per-edge running stats with 1-min tumbling windows, and exactly-once is required (a probe must update edge_speed exactly once even on operator restart). Flink's checkpointing + event-time windowing match this exactly.</td>
+      <td>Spark Streaming (microbatch breaks 50 µs HMM latency); Kinesis Analytics (limited keyed state); Storm (no exactly-once); custom (rewrite Flink badly).</td>
+    </tr>
+    <tr>
+      <td>Cassandra (edge_history, day-partitioned)</td>
+      <td>400 M edges × periodic samples = TB-scale append-only timeseries with 2-year retention for forecast training. Partition key (edge_id, day_bucket) bounds row width to 1440 minutes max; clustering by ts gives cheap "yesterday's speed profile" reads. Linear write scaling matches our streaming output.</td>
+      <td>InfluxDB (cardinality cliff at 400 M series); TimescaleDB (write-throughput ceiling); ClickHouse (great for aggregates, awkward as live store); BigQuery (latency too high).</td>
+    </tr>
+    <tr>
+      <td>Bigtable (traffic_tiles)</td>
+      <td>30 M tiles × 8 KB = 240 GB with 1-min TTL, served at ~100 K tile re-renders/s and CDN-backed reads. Bigtable's row-major Morton-coded keys give viewport locality, and the seamless tablet split handles tile-region churn without operator intervention.</td>
+      <td>S3 (no native TTL at 1-min granularity); Cassandra (compaction overhead at 100 K wps with TTL); Redis (cost prohibitive at 240 GB hot working set with persistence).</td>
+    </tr>
+    <tr>
+      <td>Geohash5 partitioning (ingest path)</td>
+      <td>Geohash5 ≈ 5 km cells make ingest sharding trivial — a hashable 5-char string keys neatly into Kafka without S2 library complexity at the edge ingest tier. We accept the area distortion at high latitudes because ingest fairness matters less than aggregator locality.</td>
+      <td>S2 (better but heavier client lib for mobile SDK); H3 (similar trade-off); raw lat/lng range (poor distribution).</td>
+    </tr>
+    <tr>
+      <td>Avro/Protobuf (probe wire format)</td>
+      <td>40 B/probe × 33 M evts/s = 1.3 GB/s — every byte counts. Compact field tagging (no JSON keys), int32/f16 packing for lat/lng, and schema evolution support keep ingest cheap and let us add fields (e.g., barometric altitude) without breaking the existing fleet.</td>
+      <td>JSON (3-5× larger payload); MessagePack (no schema evolution); Thrift (similar; chose Proto for ecosystem).</td>
+    </tr>
+    <tr>
+      <td>Confidence-weighted aggregation w/ historical fallback</td>
+      <td>"5 pings in a minute on a rural road" is statistically meaningless; surfacing red traffic on 1 sample erodes user trust permanently. Blending median speed × confidence with hour×day historical expected speed × (1−confidence) gives a graceful degradation curve that avoids "ghost congestion".</td>
+      <td>Plain mean/median (false reds on sparse roads); fixed-N threshold (binary cliff); Kalman update over historical (overengineered, hard to debug at 400 M edges).</td>
+    </tr>
+    <tr>
+      <td>Spark (daily forecast trainer)</td>
+      <td>"Expected speed at hour h, day d, edge e" requires aggregating 2 years × 400 M edges × 24×7 buckets = TB-scale historical scan. Spark's batch model fits the workload perfectly: idempotent, replayable, integrates with Cassandra connector. Output is small (~100 GB model) and pushed to live forecast cache.</td>
+      <td>Flink batch (less mature for TB shuffles); BigQuery ML (vendor lock-in, harder to deploy custom features); Hadoop MR (10× more code).</td>
+    </tr>
+    <tr>
+      <td>Edge-factor delta filter (bandwidth)</td>
+      <td>~200 routing nodes subscribe to traffic.edge_factor; pushing every per-minute update on every edge would burn ~800 MB/min broadcast. Emitting only changes &gt;10% delta drops update volume by ~80% with imperceptible routing impact, since tiny multiplier wobbles don't shift CH route choice.</td>
+      <td>Push everything (8× bandwidth); periodic full snapshot (no incremental); per-route lookup pull (latency hit on routing path).</td>
+    </tr>
+    <tr>
+      <td>Edge→tile reverse index (fan-out optimisation)</td>
+      <td>One edge appears in up to 50 tiles across zoom levels; without a reverse index, "edge X changed" forces scanning all tiles. Maintaining edge_id→[tile_id...] lets us touch only the ~10-50 affected tiles per edge update, keeping render load under the 100 K tiles/s budget at 5% edge change rate.</td>
+      <td>Brute-force tile rescan (impossible); recompute tile-cover on the fly (CPU explosion); no zoom 18 (hurts UX).</td>
+    </tr>
+    <tr>
+      <td>Daily-rotating salt for device_id_hash</td>
+      <td>NFR forbids retaining per-user trajectories &gt;24 h. Hashing with a daily salt ensures cross-day unlinkability while preserving same-day dedup for spam control. Combined with raw-ping aging at 24 h and aggregate-only long-term retention, this satisfies both GDPR and US privacy regimes.</td>
+      <td>Static hash (linkable across days, regulatory risk); per-request salt (breaks dedup); homomorphic encryption (impractical at 33 M evts/s).</td>
+    </tr>
+    <tr>
+      <td>Z-score anomaly detection (incident detector)</td>
+      <td>Sustained z-score &gt; 3 vs forecast for &gt;90 s catches genuine incidents (accidents, closures) while filtering noise (single slow truck). Cross-correlating with adjacent edges classifies type — sharp local = accident, gradual spread = congestion, zero count = closure — a cheap heuristic that beats deep models at 60 s SLA.</td>
+      <td>Threshold-only (flaps wildly); LSTM anomaly (50 ms inference, hard to explain); changepoint detection (slower convergence); user-report-based (latency).</td>
+    </tr>
+    <tr>
+      <td>Kafka tiered storage (backpressure)</td>
+      <td>Post-game stadium traffic causes 10× ingest spikes (~330 M evts/s for 30 min). Kafka tiered storage offloads cold partitions to S3 transparently, letting brokers absorb bursts without disk-full failures while consumers catch up — the cheapest insurance for predictable peaks.</td>
+      <td>Static over-provision for peaks (10× cost); drop excess pings (dataset bias on event days); separate "hot Kafka" tier (extra ops).</td>
+    </tr>
+  </tbody>
+</table>

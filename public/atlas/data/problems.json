@@ -1,0 +1,3797 @@
+{
+  "version": 1,
+  "count": 132,
+  "problems": [
+    {
+      "id": "design-ad-auction",
+      "title": "Design Ad Auction Engine (second-price / VCG, reserve pricing)",
+      "summary": "In-process auction library implementing GSP and VCG with reserves, squashing, and deterministic audit logs at 1.2M auctions/sec.",
+      "difficulty": "Hard",
+      "categories": [
+        "ad-tech"
+      ],
+      "tags": [
+        "auction-theory",
+        "bigquery",
+        "bloom",
+        "clickhouse",
+        "ddia-ch11",
+        "ddia-ch7",
+        "gsp",
+        "kafka",
+        "parquet",
+        "pricing",
+        "s3",
+        "spanner",
+        "vcg"
+      ],
+      "path": "problems/ad-tech/ad-auction.html"
+    },
+    {
+      "id": "design-ad-click-tracking",
+      "title": "Design Ad Click Tracking (clickstream \u2192 idempotent counter)",
+      "summary": "HMAC-signed click redirects, Kafka+Flink dedup and bot filtering, exactly-once budget decrement, and billing-grade aggregates at 25k clicks/s.",
+      "difficulty": "Hard",
+      "categories": [
+        "ad-tech",
+        "analytics"
+      ],
+      "tags": [
+        "avro",
+        "bloom",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch7",
+        "druid",
+        "exactly-once",
+        "flink",
+        "hmac",
+        "idempotency",
+        "json",
+        "kafka",
+        "parquet",
+        "protobuf",
+        "redis",
+        "rocksdb",
+        "rust",
+        "s3"
+      ],
+      "path": "problems/ad-tech/ad-click-tracking.html"
+    },
+    {
+      "id": "design-budget-pacing",
+      "title": "Design Budget Pacing & Frequency Capping (avoid overspend, cap frequency)",
+      "summary": "PID-controlled token-bucket pacer with Redis-backed budget and frequency cap state, sub-millisecond admission at 5M QPS, async spend reconciliation.",
+      "difficulty": "Hard",
+      "categories": [
+        "ad-tech",
+        "storage-cache"
+      ],
+      "tags": [
+        "ddia-ch11",
+        "ddia-ch7",
+        "ddia-ch9",
+        "flink",
+        "hll",
+        "kafka",
+        "pid",
+        "redis",
+        "sharding",
+        "spanner",
+        "token-bucket"
+      ],
+      "path": "problems/ad-tech/budget-pacing.html"
+    },
+    {
+      "id": "design-google-ads",
+      "title": "Design Google Ads (auction + serving + reporting)",
+      "summary": "Search/display ad platform with sub-100ms auctions, Quality Score-based GSP pricing, and near-real-time advertiser reporting at 1.2M QPS.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "ad-tech",
+        "recommendation"
+      ],
+      "tags": [
+        "auction",
+        "bigquery",
+        "bigtable",
+        "ddia-ch11",
+        "ddia-ch6",
+        "druid",
+        "embedding",
+        "flink",
+        "gbdt",
+        "gsp",
+        "kafka",
+        "mysql",
+        "pctr",
+        "redis",
+        "sharding",
+        "spanner"
+      ],
+      "path": "problems/ad-tech/google-ads.html"
+    },
+    {
+      "id": "design-attribution",
+      "title": "Design Multi-touch Attribution System (last-touch \u2192 MTA models)",
+      "summary": "Cross-device journey stitching with last-touch, time-decay, Markov, and Shapley MTA models over 200B daily touchpoints.",
+      "difficulty": "Hard",
+      "categories": [
+        "ad-tech",
+        "analytics"
+      ],
+      "tags": [
+        "bigquery",
+        "cassandra",
+        "ddia-ch10",
+        "ddia-ch11",
+        "druid",
+        "flink",
+        "gdpr",
+        "kafka",
+        "markov",
+        "mta",
+        "s3",
+        "shapley",
+        "spanner",
+        "spark"
+      ],
+      "path": "problems/ad-tech/attribution.html"
+    },
+    {
+      "id": "design-rtb",
+      "title": "Design Real-time Bidding (RTB exchange \u2014 sub-100ms auction)",
+      "summary": "OpenRTB ad exchange that fans out to dozens of DSPs, runs second-price auctions, and handles 5M QPS within a hard 100ms budget.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "ad-tech"
+      ],
+      "tags": [
+        "clickhouse",
+        "ddia-ch11",
+        "ddia-ch7",
+        "flink",
+        "grpc",
+        "http2",
+        "json",
+        "kafka",
+        "low-latency",
+        "netty",
+        "openrtb",
+        "parquet",
+        "protobuf",
+        "redis",
+        "s3",
+        "scylladb",
+        "second-price"
+      ],
+      "path": "problems/ad-tech/rtb.html"
+    },
+    {
+      "id": "design-datadog-metrics",
+      "title": "Design Datadog-style Metrics Pipeline (ingest \u2192 tsdb \u2192 dashboards)",
+      "summary": "Trillions of metric points/day: agent ingest, Kafka fan-out, Gorilla TSDB shards, rollups, alerting, and tag-based query at sub-second latency.",
+      "difficulty": "Hard",
+      "categories": [
+        "analytics"
+      ],
+      "tags": [
+        "alerting",
+        "cassandra",
+        "consistent-hash",
+        "count-min",
+        "datadog",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch3",
+        "ddia-ch9",
+        "gorilla",
+        "kafka",
+        "lsm",
+        "lucene",
+        "observability",
+        "parquet",
+        "prometheus",
+        "quorum",
+        "raft",
+        "rate-limit",
+        "redis",
+        "rocksdb",
+        "s3",
+        "sharding",
+        "tsdb",
+        "zookeeper"
+      ],
+      "path": "problems/analytics/datadog-metrics.html"
+    },
+    {
+      "id": "design-distributed-tracing",
+      "title": "Design Distributed Tracing (OpenTelemetry / Jaeger \u2014 span propagation)",
+      "summary": "OTel ingest, trace-id partitioned Kafka, Flink sessionization for trace assembly, tail-based sampling, blob+index storage, and service-graph derivation.",
+      "difficulty": "Hard",
+      "categories": [
+        "analytics"
+      ],
+      "tags": [
+        "cassandra",
+        "circuit-breaker",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch7",
+        "elasticsearch",
+        "flink",
+        "grpc",
+        "hadoop",
+        "jaeger",
+        "kafka",
+        "opentelemetry",
+        "parquet",
+        "protobuf",
+        "rocksdb",
+        "sharding",
+        "tail-sampling"
+      ],
+      "path": "problems/analytics/distributed-tracing.html"
+    },
+    {
+      "id": "design-funnel-retention",
+      "title": "Design Funnel & Retention Analytics (sessionization at scale)",
+      "summary": "Lambda architecture for funnel + retention: Flink stream sessionizer, Spark batch re-derivation over Parquet, ClickHouse hot cube, RoaringBitmap retention.",
+      "difficulty": "Hard",
+      "categories": [
+        "analytics",
+        "database-ddia"
+      ],
+      "tags": [
+        "b-tree",
+        "clickhouse",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch12",
+        "flink",
+        "kafka",
+        "lambda",
+        "parquet",
+        "roaring-bitmap",
+        "rocksdb",
+        "s3",
+        "sessionization",
+        "sharding",
+        "spark"
+      ],
+      "path": "problems/analytics/funnel-retention.html"
+    },
+    {
+      "id": "design-log-aggregation",
+      "title": "Design Log Aggregation Pipeline (Splunk-style, Elasticsearch + Kafka)",
+      "summary": "200 TB/day log ingest with Kafka as durable buffer, Flink parser/enricher, Elasticsearch hot tier with ILM, and Parquet/S3 cold archive with restore.",
+      "difficulty": "Hard",
+      "categories": [
+        "analytics",
+        "search"
+      ],
+      "tags": [
+        "athena",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch5",
+        "elasticsearch",
+        "flink",
+        "hive",
+        "ilm",
+        "json",
+        "kafka",
+        "kubernetes",
+        "lsm",
+        "lucene",
+        "parquet",
+        "s3",
+        "sharding",
+        "splunk",
+        "trino"
+      ],
+      "path": "problems/analytics/log-aggregation.html"
+    },
+    {
+      "id": "design-event-analytics",
+      "title": "Design Mixpanel / Amplitude Event Analytics (funnel + cohort)",
+      "summary": "Product analytics over 50B events/day: schema-on-read events, ClickHouse hot tier, S3/Parquet cold lake, funnel and cohort queries with bitmap retention.",
+      "difficulty": "Hard",
+      "categories": [
+        "analytics",
+        "database-ddia"
+      ],
+      "tags": [
+        "clickhouse",
+        "cohort",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch3",
+        "druid",
+        "flink",
+        "funnel",
+        "json",
+        "kafka",
+        "lsm",
+        "parquet",
+        "s3",
+        "sharding",
+        "trino"
+      ],
+      "path": "problems/analytics/event-analytics.html"
+    },
+    {
+      "id": "design-event-collector",
+      "title": "Design Real-time Event Collector (HTTP \u2192 Kafka \u2192 S3, billions of events/day)",
+      "summary": "Public HTTPS collector at 600K rps peak: edge auth, idempotent Kafka producer, schema validation, exactly-once Parquet landing on S3, and DLQ.",
+      "difficulty": "Hard",
+      "categories": [
+        "analytics"
+      ],
+      "tags": [
+        "anycast",
+        "athena",
+        "bloom",
+        "cloudfront",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch6",
+        "ddia-ch7",
+        "ddia-ch9",
+        "flink",
+        "http2",
+        "json",
+        "kafka",
+        "parquet",
+        "quorum",
+        "rate-limit",
+        "redis",
+        "s3",
+        "segment",
+        "snowflake-dw",
+        "snowplow",
+        "spark",
+        "trino"
+      ],
+      "path": "problems/analytics/event-collector.html"
+    },
+    {
+      "id": "design-audible",
+      "title": "Design Audible (audiobook platform with offline)",
+      "summary": "Long-form audiobooks with entitlement, DRM downloads, and Whispersync cross-device resume.",
+      "difficulty": "Hard",
+      "categories": [
+        "audio-streaming",
+        "file-storage",
+        "payments"
+      ],
+      "tags": [
+        "athena",
+        "aurora",
+        "cdn",
+        "crdt",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "ddia-ch9",
+        "drm",
+        "dynamodb",
+        "kafka",
+        "kinesis",
+        "mqtt",
+        "mysql",
+        "offline",
+        "raft",
+        "s3",
+        "sharding",
+        "sqs",
+        "streaming",
+        "two-tower",
+        "whispersync"
+      ],
+      "path": "problems/audio-streaming/audible.html"
+    },
+    {
+      "id": "design-clubhouse",
+      "title": "Design Clubhouse / Twitter Spaces (live audio rooms with WebRTC)",
+      "summary": "Live audio rooms at scale: SFU media routing, cascading, presence, recording, and moderation.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "audio-streaming",
+        "messaging",
+        "video-streaming"
+      ],
+      "tags": [
+        "asr",
+        "cassandra",
+        "cdn",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch9",
+        "etcd",
+        "hls",
+        "kafka",
+        "leader-election",
+        "live",
+        "moderation",
+        "opus",
+        "postgres",
+        "presence",
+        "pubsub",
+        "raft",
+        "rate-limit",
+        "redis",
+        "s3",
+        "sfu",
+        "sharding",
+        "sticky-session",
+        "webrtc",
+        "websocket"
+      ],
+      "path": "problems/audio-streaming/clubhouse.html"
+    },
+    {
+      "id": "design-pandora",
+      "title": "Design Pandora (radio-style personalized streaming)",
+      "summary": "Lean-back personalized radio stations driven by the Music Genome and real-time thumbs feedback.",
+      "difficulty": "Hard",
+      "categories": [
+        "audio-streaming",
+        "recommendation"
+      ],
+      "tags": [
+        "ann",
+        "cassandra",
+        "cdn",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "dmca",
+        "embedding",
+        "genome",
+        "kafka",
+        "ml",
+        "personalization",
+        "radio",
+        "rate-limit",
+        "redis",
+        "s3",
+        "sharding",
+        "spark"
+      ],
+      "path": "problems/audio-streaming/pandora.html"
+    },
+    {
+      "id": "design-pocket-fm",
+      "title": "Design Pocket FM (audio series platform)",
+      "summary": "Serialized audio shows with coin-based unlocks, ad insertion, and aggressive personalization.",
+      "difficulty": "Hard",
+      "categories": [
+        "audio-streaming",
+        "recommendation",
+        "ad-tech"
+      ],
+      "tags": [
+        "ads",
+        "ann",
+        "cassandra",
+        "cdn",
+        "clickhouse",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch7",
+        "ddia-ch9",
+        "embedding",
+        "feature-store",
+        "flink",
+        "gbdt",
+        "kafka",
+        "mongodb",
+        "mysql",
+        "personalization",
+        "postgres",
+        "raft",
+        "rate-limit",
+        "redis",
+        "s3",
+        "sharding",
+        "spark",
+        "streaming",
+        "two-tower",
+        "wallet"
+      ],
+      "path": "problems/audio-streaming/pocket-fm.html"
+    },
+    {
+      "id": "design-soundcloud",
+      "title": "Design SoundCloud (UGC audio + waveform)",
+      "summary": "User-generated audio uploads with transcoding, waveform comments, social feed, and copyright fingerprinting.",
+      "difficulty": "Hard",
+      "categories": [
+        "audio-streaming",
+        "file-storage",
+        "social-network"
+      ],
+      "tags": [
+        "cassandra",
+        "cdn",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "elasticsearch",
+        "feed",
+        "fingerprint",
+        "hls",
+        "json",
+        "kafka",
+        "kubernetes",
+        "postgres",
+        "quorum",
+        "rate-limit",
+        "redis",
+        "s3",
+        "sharding",
+        "transcoding",
+        "ugc",
+        "waveform"
+      ],
+      "path": "problems/audio-streaming/soundcloud.html"
+    },
+    {
+      "id": "design-spotify",
+      "title": "Design Spotify (audio streaming at scale)",
+      "summary": "On-demand music streaming: catalog, playback, DRM, recommendations, royalty-grade play accounting.",
+      "difficulty": "Hard",
+      "categories": [
+        "audio-streaming",
+        "cdn",
+        "recommendation"
+      ],
+      "tags": [
+        "ann",
+        "bigquery",
+        "bigtable",
+        "cassandra",
+        "cdn",
+        "cloudfront",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "ddia-ch9",
+        "drm",
+        "dynamodb",
+        "elasticsearch",
+        "embedding",
+        "etcd",
+        "fairplay",
+        "fastly",
+        "feature-store",
+        "flink",
+        "gbdt",
+        "gcs",
+        "hls",
+        "hnsw",
+        "kafka",
+        "ml",
+        "postgres",
+        "redis",
+        "s3",
+        "sharding",
+        "spark",
+        "streaming",
+        "two-pc",
+        "websocket",
+        "widevine"
+      ],
+      "path": "problems/audio-streaming/spotify.html"
+    },
+    {
+      "id": "design-anycast-routing",
+      "title": "Design Anycast Routing for global CDN (BGP, geo-DNS, latency-based)",
+      "summary": "BGP anycast + GeoDNS + RUM-driven latency map to steer 50M req/s to optimal POPs with sub-second failover.",
+      "difficulty": "Hard",
+      "categories": [
+        "cdn"
+      ],
+      "tags": [
+        "anycast",
+        "bgp",
+        "cdn",
+        "consistent-hash",
+        "ddia-ch5",
+        "ddia-ch8",
+        "ddia-ch9",
+        "dns",
+        "flink",
+        "kafka",
+        "quic",
+        "routing",
+        "rum"
+      ],
+      "path": "problems/cdn/anycast-routing.html"
+    },
+    {
+      "id": "design-cdn-architecture",
+      "title": "Design CDN architecture (Cloudflare/Akamai-style, hierarchical caching)",
+      "summary": "Global CDN with anycast edge POPs, regional shield tier, NVMe slab cache, and 50M req/sec at the edge.",
+      "difficulty": "Hard",
+      "categories": [
+        "cdn",
+        "storage-cache"
+      ],
+      "tags": [
+        "akamai",
+        "anycast",
+        "cache",
+        "cdn",
+        "cloudflare",
+        "consistent-hash",
+        "ddia-ch5",
+        "ddia-ch6",
+        "envoy",
+        "http2",
+        "http3",
+        "nginx",
+        "nvme",
+        "quic",
+        "shield",
+        "tls"
+      ],
+      "path": "problems/cdn/cdn-architecture.html"
+    },
+    {
+      "id": "design-dynamic-acceleration",
+      "title": "Design Dynamic Content Acceleration (DSA, edge compute, route optimization)",
+      "summary": "Edge TLS termination, V8 isolate workers, persistent H2 origin pools, private overlay routing, and micro-caching for uncacheable APIs.",
+      "difficulty": "Hard",
+      "categories": [
+        "cdn"
+      ],
+      "tags": [
+        "akamai",
+        "argo",
+        "cdn",
+        "cloudflare",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "dsa",
+        "edge-compute",
+        "foundationdb",
+        "http2",
+        "http3",
+        "kafka",
+        "overlay",
+        "quic",
+        "redis",
+        "v8-isolates"
+      ],
+      "path": "problems/cdn/dynamic-acceleration.html"
+    },
+    {
+      "id": "design-cache-invalidation",
+      "title": "Design Edge Cache Invalidation (purge at billions of files)",
+      "summary": "Tag/URL/prefix purge across 300 POPs in <5s using Raft-ordered log, generation counters, and POP-local multicast fanout.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "cdn",
+        "storage-cache"
+      ],
+      "tags": [
+        "cache",
+        "cdn",
+        "cloudflare",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch9",
+        "grpc",
+        "kafka",
+        "pubsub",
+        "purge",
+        "raft",
+        "rate-limit",
+        "sharding",
+        "tags",
+        "trie"
+      ],
+      "path": "problems/cdn/cache-invalidation.html"
+    },
+    {
+      "id": "design-image-cdn",
+      "title": "Design Image CDN with on-the-fly resize / format conversion",
+      "summary": "URL-driven image transforms (AVIF/WebP/JPEG), tiered derivative cache, single-flight coalescing for viral images.",
+      "difficulty": "Hard",
+      "categories": [
+        "cdn",
+        "file-storage"
+      ],
+      "tags": [
+        "akamai",
+        "avif",
+        "cdn",
+        "cloudflare",
+        "ddia-ch11",
+        "ddia-ch5",
+        "dynamodb",
+        "gcs",
+        "grpc",
+        "images",
+        "json",
+        "libvips",
+        "postgres",
+        "s3",
+        "transform"
+      ],
+      "path": "problems/cdn/image-cdn.html"
+    },
+    {
+      "id": "design-multi-region-failover",
+      "title": "Design Multi-region Failover (active-active vs active-passive)",
+      "summary": "Per-workload RPO/RTO design: Postgres single-leader async vs Spanner/CRDT multi-leader, with fencing tokens and cross-region probing.",
+      "difficulty": "Hard",
+      "categories": [
+        "cdn",
+        "database-ddia"
+      ],
+      "tags": [
+        "anycast",
+        "cdn",
+        "cockroachdb",
+        "crdt",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "ddia-ch8",
+        "ddia-ch9",
+        "etcd",
+        "failover",
+        "paxos",
+        "postgres",
+        "quorum",
+        "raft",
+        "replication",
+        "rpo",
+        "rto",
+        "spanner",
+        "wal"
+      ],
+      "path": "problems/cdn/multi-region-failover.html"
+    },
+    {
+      "id": "design-document-version-history",
+      "title": "Design Document Version History (snapshots + ops-log + branching)",
+      "summary": "Time-travel and branching for collaborative docs: ordered op log + S3 snapshots every 1k ops, named versions, CRDT/OT merge, lifecycle to Glacier.",
+      "difficulty": "Hard",
+      "categories": [
+        "collaboration",
+        "database-ddia"
+      ],
+      "tags": [
+        "event-sourcing",
+        "snapshots",
+        "s3",
+        "spanner",
+        "branching"
+      ],
+      "path": "problems/collaboration/version-history.html"
+    },
+    {
+      "id": "design-figma",
+      "title": "Design Figma (CRDT, multiplayer cursors, vector graphics sync)",
+      "summary": "Multiplayer vector design tool using a tree CRDT (Yjs-style), fractional indexing, move-tree conflict resolution, and out-of-band cursors.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "collaboration"
+      ],
+      "tags": [
+        "actor-model",
+        "crdt",
+        "ddia-ch5",
+        "ddia-ch7",
+        "etcd",
+        "foundationdb",
+        "json",
+        "pubsub",
+        "r-tree",
+        "rust",
+        "s3",
+        "vector-clock",
+        "websocket",
+        "webtransport",
+        "yjs"
+      ],
+      "path": "problems/collaboration/figma.html"
+    },
+    {
+      "id": "design-google-docs",
+      "title": "Design Google Docs (Operational Transformation, OT)",
+      "summary": "Real-time rich-text co-editing with OT: server-serialized op log, transform functions, snapshots, presence, and offline merge.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "collaboration",
+        "file-storage"
+      ],
+      "tags": [
+        "bigtable",
+        "consistent-hash",
+        "crdt",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch9",
+        "etcd",
+        "gcs",
+        "operational-transform",
+        "protobuf",
+        "pubsub",
+        "realtime",
+        "s3",
+        "sharding",
+        "spanner",
+        "websocket"
+      ],
+      "path": "problems/collaboration/google-docs.html"
+    },
+    {
+      "id": "design-notion",
+      "title": "Design Notion (block-based docs, multi-tenant, sync engine)",
+      "summary": "Block-tree workspace with Postgres-per-tenant sharding, optimistic block ops, scoped Yjs for text, Kafka-fed search and audit.",
+      "difficulty": "Hard",
+      "categories": [
+        "collaboration",
+        "file-storage"
+      ],
+      "tags": [
+        "cdn",
+        "crdt",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "elasticsearch",
+        "json",
+        "kafka",
+        "multi-tenant",
+        "postgres",
+        "pubsub",
+        "redis",
+        "s3",
+        "sharding",
+        "wal",
+        "websocket",
+        "yjs"
+      ],
+      "path": "problems/collaboration/notion.html"
+    },
+    {
+      "id": "design-presence-cursor-service",
+      "title": "Design Presence + Live Cursor Service (ephemeral state, broadcast)",
+      "summary": "Horizontal presence service: 50M websocket connections, two-tier fanout, consistent-hash room shards, 5s disconnect detection, no durability.",
+      "difficulty": "Hard",
+      "categories": [
+        "collaboration",
+        "messaging"
+      ],
+      "tags": [
+        "websocket",
+        "presence",
+        "fanout",
+        "redis",
+        "anycast"
+      ],
+      "path": "problems/collaboration/presence-cursor.html"
+    },
+    {
+      "id": "design-realtime-whiteboard",
+      "title": "Design Real-time Whiteboard (Miro/Excalidraw \u2014 strokes, selection sync)",
+      "summary": "Infinite canvas with Y.Map CRDT for shapes, 60 Hz stroke streaming out-of-band, ScyllaDB op log, and viewport-aware loading.",
+      "difficulty": "Hard",
+      "categories": [
+        "collaboration"
+      ],
+      "tags": [
+        "crdt",
+        "yjs",
+        "scylladb",
+        "webtransport",
+        "canvas"
+      ],
+      "path": "problems/collaboration/whiteboard.html"
+    },
+    {
+      "id": "design-consensus-raft-paxos",
+      "title": "Design Consensus (Raft and Paxos walkthrough)",
+      "summary": "Raft leader election, log replication, safety invariants, snapshots, membership change; contrast with Paxos, Multi-Paxos, EPaxos, ZAB.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "database-ddia"
+      ],
+      "tags": [
+        "cockroachdb",
+        "consensus",
+        "consul",
+        "ddia-ch5",
+        "ddia-ch7",
+        "ddia-ch8",
+        "ddia-ch9",
+        "epaxos",
+        "etcd",
+        "kafka",
+        "leader-election",
+        "linearizable",
+        "mongodb",
+        "paxos",
+        "quorum",
+        "raft",
+        "sharding",
+        "spanner",
+        "two-pc",
+        "zab",
+        "zookeeper"
+      ],
+      "path": "problems/database-ddia/consensus-raft-paxos.html"
+    },
+    {
+      "id": "design-distributed-transactions",
+      "title": "Design Distributed Transactions (2PC, Saga, XA, Spanner-style TrueTime)",
+      "summary": "Atomic commit across shards/services: 2PC blocking problem, XA pitfalls, Saga with compensations, Percolator SI, Spanner TrueTime commit-wait.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "database-ddia",
+        "payments"
+      ],
+      "tags": [
+        "2pc",
+        "bigtable",
+        "cockroachdb",
+        "ddia-ch7",
+        "ddia-ch9",
+        "kafka",
+        "outbox",
+        "paxos",
+        "percolator",
+        "raft",
+        "saga",
+        "sharding",
+        "spanner",
+        "truetime",
+        "two-pc",
+        "xa"
+      ],
+      "path": "problems/database-ddia/distributed-transactions.html"
+    },
+    {
+      "id": "design-replication-strategies",
+      "title": "Design Replication: leader-based vs leaderless vs multi-leader",
+      "summary": "Single-leader sync/async, multi-leader with conflict resolution, Dynamo-style leaderless with quorums, lag anomalies and consistency knobs.",
+      "difficulty": "Hard",
+      "categories": [
+        "database-ddia"
+      ],
+      "tags": [
+        "replication",
+        "single-leader",
+        "multi-leader",
+        "leaderless",
+        "quorum",
+        "crdt",
+        "ddia-ch5"
+      ],
+      "path": "problems/database-ddia/replication.html"
+    },
+    {
+      "id": "design-btree-storage-engine",
+      "title": "Design a B-tree Storage Engine (page-based, WAL, buffer pool)",
+      "summary": "Disk-resident B+-tree behind Postgres/InnoDB: pages, splits, buffer pool, ARIES recovery, latches vs locks, MVCC, vacuum.",
+      "difficulty": "Hard",
+      "categories": [
+        "database-ddia"
+      ],
+      "tags": [
+        "btree",
+        "postgres",
+        "innodb",
+        "aries",
+        "buffer-pool",
+        "mvcc",
+        "ddia-ch3",
+        "ddia-ch7"
+      ],
+      "path": "problems/database-ddia/btree-engine.html"
+    },
+    {
+      "id": "design-write-ahead-log",
+      "title": "Design a Write-ahead Log (durability, replay, group commit)",
+      "summary": "Append-only durability primitive: record format, fsync semantics, group commit, segment rotation, CRC, recovery, CDC consumers.",
+      "difficulty": "Hard",
+      "categories": [
+        "database-ddia"
+      ],
+      "tags": [
+        "wal",
+        "fsync",
+        "group-commit",
+        "recovery",
+        "cdc",
+        "ddia-ch3",
+        "ddia-ch5"
+      ],
+      "path": "problems/database-ddia/wal.html"
+    },
+    {
+      "id": "design-lsm-tree-storage-engine",
+      "title": "Design an LSM-tree Storage Engine (memtable -> SSTable -> compaction)",
+      "summary": "Single-node KV engine: WAL + skiplist memtable, immutable sorted SSTables, leveled vs size-tiered compaction, bloom filters, MVCC via sequence numbers.",
+      "difficulty": "Hard",
+      "categories": [
+        "database-ddia",
+        "storage-cache"
+      ],
+      "tags": [
+        "lsm",
+        "rocksdb",
+        "cassandra",
+        "compaction",
+        "bloom-filter",
+        "wal",
+        "ddia-ch3"
+      ],
+      "path": "problems/database-ddia/lsm-tree.html"
+    },
+    {
+      "id": "design-amazon",
+      "title": "Design Amazon (product catalog + checkout + recs at scale)",
+      "summary": "Planet-scale e-commerce: 600M SKUs, faceted search, personalized recs, ACID checkout, payments saga across 300M customers.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "ecommerce",
+        "search",
+        "recommendation",
+        "payments"
+      ],
+      "tags": [
+        "ann",
+        "cdn",
+        "cloudfront",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "ddia-ch9",
+        "dynamodb",
+        "elasticsearch",
+        "embedding",
+        "faiss",
+        "feature-store",
+        "gbdt",
+        "json",
+        "kafka",
+        "leader-election",
+        "postgres",
+        "rate-limit",
+        "redis",
+        "s3",
+        "saga",
+        "sharding",
+        "solr",
+        "two-pc"
+      ],
+      "path": "problems/ecommerce/amazon.html"
+    },
+    {
+      "id": "design-flipkart",
+      "title": "Design Flipkart (Big Billion Day flash-sale handling)",
+      "summary": "BBD-grade flash-sale platform: virtual waiting room, serializable inventory decrement, idempotent payments, bot defense.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "ecommerce",
+        "payments"
+      ],
+      "tags": [
+        "akamai",
+        "cdn",
+        "circuit-breaker",
+        "ddia-ch11",
+        "ddia-ch7",
+        "ddia-ch9",
+        "idempotency",
+        "jwt",
+        "kafka",
+        "leader-election",
+        "postgres",
+        "psp",
+        "rate-limit",
+        "redis",
+        "saga",
+        "sharding",
+        "waiting-room"
+      ],
+      "path": "problems/ecommerce/flipkart.html"
+    },
+    {
+      "id": "design-inventory-at-scale",
+      "title": "Design Inventory Management at Scale (oversell prevention, multi-warehouse)",
+      "summary": "100M SKUs across 500 warehouses: serializable stock decrement, soft holds, bucketed counters for hot SKUs, WMS reconciliation.",
+      "difficulty": "Hard",
+      "categories": [
+        "ecommerce",
+        "database-ddia"
+      ],
+      "tags": [
+        "postgres",
+        "redis",
+        "kafka",
+        "atp",
+        "reservation",
+        "oversell",
+        "ddia-ch7",
+        "ddia-ch9"
+      ],
+      "path": "problems/ecommerce/inventory.html"
+    },
+    {
+      "id": "design-order-pipeline",
+      "title": "Design Order Pipeline / Order Lifecycle (state machine, saga, returns)",
+      "summary": "End-to-end order lifecycle: outbox-driven saga, orchestrated state machine, idempotent compensations, returns and refunds sub-saga.",
+      "difficulty": "Hard",
+      "categories": [
+        "ecommerce",
+        "payments"
+      ],
+      "tags": [
+        "bigquery",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch7",
+        "ddia-ch9",
+        "dynamodb",
+        "elasticsearch",
+        "idempotency",
+        "json",
+        "kafka",
+        "leader-election",
+        "outbox",
+        "postgres",
+        "saga",
+        "sharding",
+        "snowflake-dw",
+        "state-machine",
+        "two-pc"
+      ],
+      "path": "problems/ecommerce/order-pipeline.html"
+    },
+    {
+      "id": "design-shopify",
+      "title": "Design Shopify (multi-tenant SaaS for 1M+ merchants)",
+      "summary": "Cellular multi-tenant platform: 2M merchants, per-pod MySQL, BFCM survival, webhook fan-out, noisy-neighbor isolation.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "ecommerce",
+        "payments"
+      ],
+      "tags": [
+        "bigquery",
+        "cdn",
+        "cellular",
+        "circuit-breaker",
+        "ddia-ch11",
+        "ddia-ch6",
+        "ddia-ch7",
+        "ddia-ch9",
+        "dynamodb",
+        "fastly",
+        "json",
+        "kafka",
+        "leader-election",
+        "multi-tenant",
+        "mysql",
+        "oauth",
+        "outbox",
+        "redis",
+        "saga",
+        "sharding",
+        "webhooks"
+      ],
+      "path": "problems/ecommerce/shopify.html"
+    },
+    {
+      "id": "design-shopping-cart",
+      "title": "Design Shopping Cart (multi-device, persistence, abandoned-cart)",
+      "summary": "200M-user cart: DynamoDB durable + Redis cache, optimistic concurrency, WS multi-device sync, streaming abandonment pipeline.",
+      "difficulty": "Hard",
+      "categories": [
+        "ecommerce",
+        "storage-cache"
+      ],
+      "tags": [
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch7",
+        "ddia-ch9",
+        "dynamodb",
+        "kafka",
+        "optimistic-concurrency",
+        "pubsub",
+        "rate-limit",
+        "redis",
+        "ttl",
+        "websocket"
+      ],
+      "path": "problems/ecommerce/shopping-cart.html"
+    },
+    {
+      "id": "design-dropbox",
+      "title": "Design Dropbox / Google Drive (file sync + delta encoding)",
+      "summary": "Cloud file sync with content-addressed blocks, delta encoding via Rabin chunking, and WebSocket-based change notifications.",
+      "difficulty": "Hard",
+      "categories": [
+        "file-storage",
+        "collaboration"
+      ],
+      "tags": [
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "delta-encoding",
+        "kafka",
+        "mysql",
+        "object-store",
+        "rabin",
+        "s3",
+        "sharding",
+        "sync",
+        "websocket",
+        "websockets"
+      ],
+      "path": "problems/file-storage/dropbox.html"
+    },
+    {
+      "id": "design-file-dedup",
+      "title": "Design File Deduplication System (content-defined chunking, hash dedup)",
+      "summary": "Exabyte-scale dedup tier using FastCDC content-defined chunking, BLAKE3 hashing, sharded LSM index, and epoch-based GC.",
+      "difficulty": "Hard",
+      "categories": [
+        "file-storage",
+        "storage-cache"
+      ],
+      "tags": [
+        "blake3",
+        "bloom",
+        "bloom-filter",
+        "ddia-ch3",
+        "ddia-ch5",
+        "ddia-ch6",
+        "dedup",
+        "fastcdc",
+        "lsm",
+        "merkle",
+        "merkle-tree",
+        "redis",
+        "rocksdb",
+        "sharding"
+      ],
+      "path": "problems/file-storage/file-dedup.html"
+    },
+    {
+      "id": "design-large-file-upload",
+      "title": "Design Large File Upload (chunked, resumable, multipart, virus scan)",
+      "summary": "Resumable multi-terabyte uploads via presigned direct-to-storage parts, idempotent retries, and async virus scanning.",
+      "difficulty": "Hard",
+      "categories": [
+        "file-storage"
+      ],
+      "tags": [
+        "clamav",
+        "ddia-ch11",
+        "ddia-ch5",
+        "idempotency",
+        "kafka",
+        "multipart",
+        "object-store",
+        "postgres",
+        "presigned-url",
+        "presigned-urls",
+        "rate-limit",
+        "redis",
+        "resumable",
+        "sharding"
+      ],
+      "path": "problems/file-storage/large-file-upload.html"
+    },
+    {
+      "id": "design-realtime-file-sync",
+      "title": "Design Real-time File Sync (multi-device, conflict resolution)",
+      "summary": "Per-file op log over Kafka with vector clocks, hybrid WebSocket + silent-push delivery, and pluggable conflict resolution (LWW / 3-way / CRDT).",
+      "difficulty": "Hard",
+      "categories": [
+        "file-storage",
+        "collaboration"
+      ],
+      "tags": [
+        "sync",
+        "vector-clocks",
+        "crdt",
+        "kafka",
+        "websockets",
+        "causal-consistency"
+      ],
+      "path": "problems/file-storage/file-sync.html"
+    },
+    {
+      "id": "design-s3-object-storage",
+      "title": "Design S3-style Object Storage (durability 11-9s, erasure coding)",
+      "summary": "Exabyte-scale object store with Reed-Solomon 10+4 erasure coding, sharded linearizable index, and 11 nines of durability.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "file-storage",
+        "database-ddia"
+      ],
+      "tags": [
+        "s3",
+        "erasure-coding",
+        "reed-solomon",
+        "raft",
+        "lsm",
+        "durability"
+      ],
+      "path": "problems/file-storage/s3.html"
+    },
+    {
+      "id": "design-icloud-photos",
+      "title": "Design iCloud Photos (cross-device sync, ML tagging, encryption)",
+      "summary": "End-to-end encrypted photo library with on-device ML tagging, encrypted search index, and CRDT-based tag sync.",
+      "difficulty": "Hard",
+      "categories": [
+        "file-storage",
+        "recommendation"
+      ],
+      "tags": [
+        "cloudkit",
+        "crdt",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "e2ee",
+        "embedding",
+        "foundationdb",
+        "kafka",
+        "on-device-ml",
+        "photos",
+        "r-tree",
+        "s3",
+        "search"
+      ],
+      "path": "problems/file-storage/icloud-photos.html"
+    },
+    {
+      "id": "design-dispatch-routing",
+      "title": "Design Delivery Dispatch & Routing (batching, courier assignment, ETA)",
+      "summary": "Region-sharded VRP solver on Kafka streams: min-cost flow assignment, batched offers, ETA service.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "food-delivery",
+        "ride-sharing",
+        "maps-location"
+      ],
+      "tags": [
+        "cassandra",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch9",
+        "etcd",
+        "flink",
+        "kafka",
+        "or-tools",
+        "redis",
+        "redis-geo",
+        "sharding",
+        "vrp",
+        "zookeeper"
+      ],
+      "path": "problems/food-delivery/dispatch-routing.html"
+    },
+    {
+      "id": "design-doordash",
+      "title": "Design DoorDash (3-sided marketplace at US scale)",
+      "summary": "10M orders/day marketplace: VRP-based Deep Red dispatch, batched deliveries, multi-region Cockroach catalog.",
+      "difficulty": "Hard",
+      "categories": [
+        "food-delivery",
+        "ride-sharing",
+        "maps-location"
+      ],
+      "tags": [
+        "cassandra",
+        "cloudflare",
+        "cockroachdb",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "elasticsearch",
+        "envoy",
+        "feature-store",
+        "h3-grid",
+        "kafka",
+        "kubernetes",
+        "postgres",
+        "protobuf",
+        "rate-limit",
+        "redis",
+        "s3",
+        "sharding",
+        "snowflake-dw",
+        "sse",
+        "vitess",
+        "vrp"
+      ],
+      "path": "problems/food-delivery/doordash.html"
+    },
+    {
+      "id": "design-order-tracking",
+      "title": "Design Real-time Order Tracking (driver location \u2192 customer in <2s)",
+      "summary": "Sub-2s ping fanout: WS gateways, Flink keyed join on courier_id, protobuf deltas, Redis Streams replay.",
+      "difficulty": "Hard",
+      "categories": [
+        "food-delivery",
+        "maps-location",
+        "messaging"
+      ],
+      "tags": [
+        "cassandra",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch6",
+        "fcm",
+        "flink",
+        "json",
+        "jwt",
+        "kafka",
+        "kafka-streams",
+        "protobuf",
+        "rate-limit",
+        "redis",
+        "redis-streams",
+        "s3",
+        "sharding",
+        "websocket"
+      ],
+      "path": "problems/food-delivery/order-tracking.html"
+    },
+    {
+      "id": "design-restaurant-search",
+      "title": "Design Restaurant Search & Discovery (location + cuisine + ranking)",
+      "summary": "Sub-250ms hybrid retrieval: ES geo+BM25 plus ANN semantic recall, learned LightGBM ranker.",
+      "difficulty": "Hard",
+      "categories": [
+        "food-delivery",
+        "search",
+        "maps-location"
+      ],
+      "tags": [
+        "ann",
+        "cdn",
+        "ddia-ch11",
+        "ddia-ch6",
+        "dynamodb",
+        "elasticsearch",
+        "embedding",
+        "faiss",
+        "feature-store",
+        "gbdt",
+        "geohash",
+        "hnsw",
+        "kafka",
+        "lightgbm",
+        "lucene",
+        "mysql",
+        "redis",
+        "s3",
+        "sharding",
+        "spark",
+        "trie"
+      ],
+      "path": "problems/food-delivery/restaurant-search.html"
+    },
+    {
+      "id": "design-swiggy",
+      "title": "Design Swiggy (food delivery in India: dispatch + routing)",
+      "summary": "End-to-end Indian food-delivery: discovery, orders, dispatch, live tracking under 2G/peak-spike conditions.",
+      "difficulty": "Hard",
+      "categories": [
+        "food-delivery",
+        "ride-sharing",
+        "maps-location"
+      ],
+      "tags": [
+        "cassandra",
+        "ddia-ch11",
+        "ddia-ch6",
+        "ddia-ch7",
+        "dispatch",
+        "gbdt",
+        "geohash",
+        "kafka",
+        "osrm",
+        "postgres",
+        "protobuf",
+        "pubsub",
+        "redis",
+        "redis-geo",
+        "sharding",
+        "sse",
+        "sticky-session",
+        "websocket"
+      ],
+      "path": "problems/food-delivery/swiggy.html"
+    },
+    {
+      "id": "design-zomato",
+      "title": "Design Zomato (restaurant discovery + delivery)",
+      "summary": "Discovery-first food platform: search, ranking, reviews, ads, with delivery layered on top.",
+      "difficulty": "Hard",
+      "categories": [
+        "food-delivery",
+        "search",
+        "maps-location"
+      ],
+      "tags": [
+        "ads",
+        "ann",
+        "cassandra",
+        "cdc",
+        "cdn",
+        "cloudflare",
+        "ddia-ch11",
+        "ddia-ch6",
+        "debezium",
+        "elasticsearch",
+        "embedding",
+        "feature-store",
+        "flink",
+        "gbdt",
+        "hnsw",
+        "json",
+        "kafka",
+        "lucene",
+        "mysql",
+        "postgres",
+        "ranking",
+        "redis",
+        "s3",
+        "sharding",
+        "snowflake-dw",
+        "spark",
+        "two-tower"
+      ],
+      "path": "problems/food-delivery/zomato.html"
+    },
+    {
+      "id": "design-find-my-friend",
+      "title": "Design Find My Friend / Find My Device (real-time location)",
+      "summary": "E2E-encrypted live location sharing with crowdsourced BLE offline finding, geofences, websocket fanout.",
+      "difficulty": "Hard",
+      "categories": [
+        "maps-location",
+        "messaging"
+      ],
+      "tags": [
+        "ble",
+        "cassandra",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "e2ee",
+        "geofence",
+        "grpc",
+        "kafka",
+        "privacy",
+        "pubsub",
+        "r-tree",
+        "redis",
+        "rocksdb",
+        "sharding",
+        "websocket",
+        "x3dh"
+      ],
+      "path": "problems/maps-location/find-my-friend.html"
+    },
+    {
+      "id": "design-geo-nearby",
+      "title": "Design Geo-search Nearby (top-K within radius, geohash + KD-tree)",
+      "summary": "Generic geo-nearby primitive: geohash, S2/H3, KD-tree, R-tree trade-offs; 50M moving entities, 1M rps.",
+      "difficulty": "Hard",
+      "categories": [
+        "maps-location",
+        "search"
+      ],
+      "tags": [
+        "b-tree",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch6",
+        "elasticsearch",
+        "geohash",
+        "h3-grid",
+        "in-memory",
+        "kafka",
+        "kd-tree",
+        "lsm",
+        "r-tree",
+        "redis",
+        "s2-cells",
+        "s3",
+        "sharding",
+        "wal"
+      ],
+      "path": "problems/maps-location/geo-nearby.html"
+    },
+    {
+      "id": "design-google-maps",
+      "title": "Design Google Maps (tile serving + routing + Places)",
+      "summary": "Planet-scale maps: vector tile pipeline, CH-based routing engine, Places search, live-traffic ingestion at 1B+ MAU.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "maps-location",
+        "search",
+        "cdn"
+      ],
+      "tags": [
+        "bigtable",
+        "cdn",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch6",
+        "elasticsearch",
+        "feature-store",
+        "flink",
+        "gbdt",
+        "kafka",
+        "rocksdb",
+        "routing",
+        "sharding",
+        "spanner",
+        "spark",
+        "sqs",
+        "tiles"
+      ],
+      "path": "problems/maps-location/google-maps.html"
+    },
+    {
+      "id": "design-realtime-traffic",
+      "title": "Design Real-time Traffic System (probe data to tile aggregation)",
+      "summary": "33M probes/s ingest, HMM map-matching, 1-min edge aggregation, vector traffic tiles, incident detection in 60s.",
+      "difficulty": "Hard",
+      "categories": [
+        "maps-location",
+        "analytics"
+      ],
+      "tags": [
+        "avro",
+        "bigtable",
+        "cassandra",
+        "cdn",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "flink",
+        "geohash",
+        "hmm",
+        "kafka",
+        "map-matching",
+        "sharding",
+        "spark",
+        "stream-processing",
+        "tiles"
+      ],
+      "path": "problems/maps-location/realtime-traffic.html"
+    },
+    {
+      "id": "design-routing-engine",
+      "title": "Design Routing Engine (Dijkstra to contraction hierarchies for road graphs)",
+      "summary": "Algorithmic ladder Dijkstra to bidirectional to A*/ALT to CH/CCH; 10B routes/day with sub-100ms p99 and live traffic.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "maps-location"
+      ],
+      "tags": [
+        "a-star",
+        "ccs",
+        "contraction-hierarchies",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch6",
+        "ddia-ch7",
+        "dijkstra",
+        "flink",
+        "graph",
+        "in-memory",
+        "kafka",
+        "osm",
+        "pubsub",
+        "sharding",
+        "spark"
+      ],
+      "path": "problems/maps-location/routing-engine.html"
+    },
+    {
+      "id": "design-yelp",
+      "title": "Design Yelp / nearby places review platform",
+      "summary": "Location-based discovery: S2 geo index, ranked nearby feed, 250M reviews, photo CDN, owner portal, ML ranking.",
+      "difficulty": "Hard",
+      "categories": [
+        "maps-location",
+        "search",
+        "recommendation"
+      ],
+      "tags": [
+        "cassandra",
+        "cdn",
+        "cloudfront",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "elasticsearch",
+        "feature-store",
+        "flink",
+        "gbdt",
+        "geohash",
+        "json",
+        "kafka",
+        "mysql",
+        "ranking",
+        "rate-limit",
+        "redis",
+        "s2-cells",
+        "s3",
+        "sharding",
+        "spam-detection"
+      ],
+      "path": "problems/maps-location/yelp.html"
+    },
+    {
+      "id": "design-discord",
+      "title": "Design Discord (low-latency voice + text + servers)",
+      "summary": "Guilds, low-latency voice via SFU, text in ScyllaDB, lazy guild fan-out for huge member counts.",
+      "difficulty": "Hard",
+      "categories": [
+        "messaging",
+        "video-streaming",
+        "audio-streaming"
+      ],
+      "tags": [
+        "cassandra",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "elixir",
+        "kafka",
+        "nats",
+        "postgres",
+        "pubsub",
+        "redis",
+        "rust",
+        "scylladb",
+        "sfu",
+        "sharding",
+        "snowflake-dw",
+        "udp",
+        "webrtc"
+      ],
+      "path": "problems/messaging/discord.html"
+    },
+    {
+      "id": "design-e2e-encrypted-messaging",
+      "title": "Design End-to-End Encrypted Messaging (Signal protocol, double ratchet)",
+      "summary": "Signal protocol: X3DH, double ratchet, sender keys, sealed sender, private contact discovery via SGX/PIR.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "messaging"
+      ],
+      "tags": [
+        "signal-protocol",
+        "double-ratchet",
+        "x3dh",
+        "mls",
+        "sgx"
+      ],
+      "path": "problems/messaging/e2e-encrypted.html"
+    },
+    {
+      "id": "design-presence-service",
+      "title": "Design Presence Service (online/offline/typing across 1B users)",
+      "summary": "Soft-state presence at 300M concurrent connections with sharded in-memory ring and pull-mode for celebrities.",
+      "difficulty": "Hard",
+      "categories": [
+        "messaging"
+      ],
+      "tags": [
+        "redis",
+        "pubsub",
+        "phi-accrual",
+        "fan-out"
+      ],
+      "path": "problems/messaging/presence.html"
+    },
+    {
+      "id": "design-slack",
+      "title": "Design Slack (workspaces, channels, threads, search)",
+      "summary": "Team chat with workspaces, channels, threads, and full-text search across years of history; Vitess + Solr.",
+      "difficulty": "Hard",
+      "categories": [
+        "messaging",
+        "search"
+      ],
+      "tags": [
+        "cdn",
+        "ddia-ch11",
+        "ddia-ch6",
+        "json",
+        "kafka",
+        "memcached",
+        "mysql",
+        "nats",
+        "pubsub",
+        "redis",
+        "s3",
+        "sharding",
+        "solr",
+        "vitess",
+        "websocket"
+      ],
+      "path": "problems/messaging/slack.html"
+    },
+    {
+      "id": "design-telegram",
+      "title": "Design Telegram (cloud-stored chats + channels at hundreds of M)",
+      "summary": "Cloud-first messenger with home-DC routing, pull-based channels, MTProto, and optional E2E secret chats.",
+      "difficulty": "Hard",
+      "categories": [
+        "messaging"
+      ],
+      "tags": [
+        "cdn",
+        "channels",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "lsm",
+        "mtproto",
+        "multi-dc",
+        "outbox",
+        "postgres",
+        "rate-limit",
+        "sharding"
+      ],
+      "path": "problems/messaging/telegram.html"
+    },
+    {
+      "id": "design-whatsapp",
+      "title": "Design WhatsApp (1:1, groups, E2E encryption, presence)",
+      "summary": "Globally distributed E2E messenger: persistent sockets, Signal protocol, presence, group fan-out at 100B msgs/day.",
+      "difficulty": "Hard",
+      "categories": [
+        "messaging",
+        "notifications"
+      ],
+      "tags": [
+        "cassandra",
+        "cdn",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "erlang",
+        "http2",
+        "pubsub",
+        "push",
+        "rate-limit",
+        "redis",
+        "s3",
+        "sharding",
+        "signal-protocol",
+        "websocket",
+        "x3dh"
+      ],
+      "path": "problems/messaging/whatsapp.html"
+    },
+    {
+      "id": "design-blockchain-ledger",
+      "title": "Design Blockchain-style Append-only Ledger (Merkle tree, BFT consensus)",
+      "summary": "Permissioned BFT (HotStuff) ledger, Merkle proofs, BLS threshold sigs, channel privacy, 10K tx/s with 2 s finality.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "misc",
+        "database-ddia",
+        "payments"
+      ],
+      "tags": [
+        "bft",
+        "bls",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "ddia-ch9",
+        "gossip",
+        "hotstuff",
+        "ledger",
+        "merkle",
+        "merkle-tree",
+        "quorum",
+        "raft",
+        "rocksdb"
+      ],
+      "path": "problems/misc/blockchain-ledger.html"
+    },
+    {
+      "id": "design-code-sandbox",
+      "title": "Design Code Execution Sandbox (Docker + cgroups + seccomp, multi-language)",
+      "summary": "Multi-tenant remote code execution as a service with gVisor + cgroups v2 + seccomp, warm pools, weighted-fair queueing, and per-tenant quotas.",
+      "difficulty": "Hard",
+      "categories": [
+        "misc"
+      ],
+      "tags": [
+        "cassandra",
+        "cgroups",
+        "ddia-ch11",
+        "ddia-ch6",
+        "docker",
+        "grpc",
+        "gvisor",
+        "hll",
+        "kafka",
+        "kubernetes",
+        "multi-tenant",
+        "p2p",
+        "redis",
+        "s3",
+        "sandbox",
+        "seccomp",
+        "websocket"
+      ],
+      "path": "problems/misc/code-sandbox.html"
+    },
+    {
+      "id": "design-distributed-cron",
+      "title": "Design Distributed Cron / Scheduler (Quartz at scale, exactly-once trigger)",
+      "summary": "Sharded scheduler firing millions of cron jobs/min with optimistic CAS claim, etcd leases, Kafka due-bus, and effectively-once dispatch via LWT fire log.",
+      "difficulty": "Hard",
+      "categories": [
+        "misc",
+        "database-ddia"
+      ],
+      "tags": [
+        "airflow",
+        "b-tree",
+        "cassandra",
+        "cockroachdb",
+        "count-min",
+        "cron",
+        "ddia-ch11",
+        "ddia-ch8",
+        "ddia-ch9",
+        "etcd",
+        "exactly-once",
+        "grpc",
+        "kafka",
+        "postgres",
+        "rate-limit",
+        "s3",
+        "scheduler",
+        "sharding",
+        "sqs"
+      ],
+      "path": "problems/misc/distributed-cron.html"
+    },
+    {
+      "id": "design-distributed-id",
+      "title": "Design Distributed ID Generator (Snowflake, ULID, K-sortable)",
+      "summary": "64-bit Snowflake (ts/worker/seq), ZooKeeper worker leases, ULID variant, clock-skew defense, k-sortability for B-trees.",
+      "difficulty": "Hard",
+      "categories": [
+        "misc",
+        "database-ddia"
+      ],
+      "tags": [
+        "b-tree",
+        "ddia-ch3",
+        "ddia-ch6",
+        "grpc",
+        "k-sortable",
+        "kafka",
+        "lsm",
+        "mongodb",
+        "mysql",
+        "ntp",
+        "postgres",
+        "sharding",
+        "snowflake-dw",
+        "snowflake-id",
+        "spanner",
+        "ulid",
+        "uuidv7",
+        "zookeeper"
+      ],
+      "path": "problems/misc/distributed-id.html"
+    },
+    {
+      "id": "design-iot-pipeline",
+      "title": "Design IoT Data Pipeline (1B devices, MQTT \u2192 time-series store)",
+      "summary": "MQTT broker fleet, Kafka backbone, Flink rules + rollups, Druid + Cassandra shadow, downlink commands, kappa-style design.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "misc",
+        "analytics"
+      ],
+      "tags": [
+        "athena",
+        "cassandra",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "druid",
+        "flink",
+        "gossip",
+        "http2",
+        "kafka",
+        "lsm",
+        "mqtt",
+        "parquet",
+        "rate-limit",
+        "rocksdb",
+        "s3",
+        "sharding",
+        "spark",
+        "timeseries",
+        "trino"
+      ],
+      "path": "problems/misc/iot-pipeline.html"
+    },
+    {
+      "id": "design-live-polling",
+      "title": "Design Live Polling / Voting at Scale (1M+ votes/sec, real-time aggregation)",
+      "summary": "1.5 M votes/sec live poll system with sharded Redis counters, Flink combiner pre-agg, idempotent dedup, and Merkle-signed final tally.",
+      "difficulty": "Hard",
+      "categories": [
+        "misc",
+        "analytics"
+      ],
+      "tags": [
+        "cassandra",
+        "cdn",
+        "count-min",
+        "ddia-ch11",
+        "ddia-ch5",
+        "flink",
+        "fraud-detection",
+        "hll",
+        "jwt",
+        "kafka",
+        "merkle",
+        "merkle-tree",
+        "rate-limit",
+        "redis",
+        "sharding",
+        "sse",
+        "voting"
+      ],
+      "path": "problems/misc/live-polling.html"
+    },
+    {
+      "id": "design-online-judge",
+      "title": "Design Online Judge (LeetCode/HackerRank \u2014 sandboxed code execution)",
+      "summary": "Multi-language competitive programming platform with Firecracker/gVisor sandboxing, contest-grade fairness, and real-time leaderboards.",
+      "difficulty": "Hard",
+      "categories": [
+        "misc"
+      ],
+      "tags": [
+        "avro",
+        "cassandra",
+        "cdn",
+        "cgroups",
+        "contests",
+        "count-min",
+        "ddia-ch11",
+        "firecracker",
+        "hll",
+        "kafka",
+        "postgres",
+        "redis",
+        "rust",
+        "s3",
+        "sandbox",
+        "seccomp",
+        "sse"
+      ],
+      "path": "problems/misc/online-judge.html"
+    },
+    {
+      "id": "design-pastebin",
+      "title": "Design Pastebin (text + code paste with syntax highlight, expiry)",
+      "summary": "Postgres metadata + S3 bodies, Tree-sitter highlight, Redis HTML cache, expiry sweeper, abuse pipeline.",
+      "difficulty": "Medium",
+      "categories": [
+        "misc",
+        "file-storage"
+      ],
+      "tags": [
+        "b-tree",
+        "cdn",
+        "ddia-ch11",
+        "ddia-ch3",
+        "ddia-ch5",
+        "ddia-ch6",
+        "dynamodb",
+        "expiry",
+        "kafka",
+        "postgres",
+        "redis",
+        "rust",
+        "s3",
+        "sharding",
+        "tree-sitter"
+      ],
+      "path": "problems/misc/pastebin.html"
+    },
+    {
+      "id": "design-leaderboard",
+      "title": "Design Real-time Leaderboard (gaming, top-K via Redis sorted set + sharding)",
+      "summary": "50 M MAU global game leaderboard using sharded Redis ZSETs, scatter-gather top-K merge, t-digest for long-tail rank, and Kafka-fed Cassandra audit.",
+      "difficulty": "Hard",
+      "categories": [
+        "misc",
+        "storage-cache"
+      ],
+      "tags": [
+        "cassandra",
+        "count-min",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "flink",
+        "gaming",
+        "hll",
+        "kafka",
+        "leaderboard",
+        "postgres",
+        "redis",
+        "sharding",
+        "top-k",
+        "zset"
+      ],
+      "path": "problems/misc/leaderboard.html"
+    },
+    {
+      "id": "design-twitter-trending",
+      "title": "Design Twitter Trending Topics (count-min sketch, top-K streaming)",
+      "summary": "Streaming top-K trends from 500 K tweets/sec using count-min sketch + Space-Saving + HLL, with z-score spike detection and bot suppression.",
+      "difficulty": "Hard",
+      "categories": [
+        "misc",
+        "social-network",
+        "analytics"
+      ],
+      "tags": [
+        "avro",
+        "cassandra",
+        "count-min",
+        "count-min-sketch",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "flink",
+        "hll",
+        "json",
+        "kafka",
+        "redis",
+        "rocksdb",
+        "streaming",
+        "top-k",
+        "trends"
+      ],
+      "path": "problems/misc/twitter-trending.html"
+    },
+    {
+      "id": "design-url-shortener",
+      "title": "Design URL Shortener (TinyURL/Bitly \u2014 base62, click analytics)",
+      "summary": "Base62 short codes, multi-region KV, Kafka click stream, ClickHouse analytics, 40K rps redirect path.",
+      "difficulty": "Medium",
+      "categories": [
+        "misc",
+        "storage-cache",
+        "analytics"
+      ],
+      "tags": [
+        "anycast",
+        "base62",
+        "bloom",
+        "cdn",
+        "clickhouse",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "dynamodb",
+        "flink",
+        "kafka",
+        "mysql",
+        "rate-limit",
+        "redis",
+        "sharding",
+        "snowflake-dw",
+        "zookeeper"
+      ],
+      "path": "problems/misc/url-shortener.html"
+    },
+    {
+      "id": "design-webhook-delivery",
+      "title": "Design Webhook Delivery Service (at-least-once, retry, signing)",
+      "summary": "Kafka spine, per-endpoint isolation queues, exponential backoff to 72 h, HMAC-SHA256 signing, SSRF defense, replay UI.",
+      "difficulty": "Hard",
+      "categories": [
+        "misc",
+        "notifications"
+      ],
+      "tags": [
+        "b-tree",
+        "cassandra",
+        "circuit-breaker",
+        "ddia-ch11",
+        "ddia-ch3",
+        "ddia-ch9",
+        "hmac",
+        "http2",
+        "json",
+        "kafka",
+        "lsm",
+        "mtls",
+        "postgres",
+        "redis",
+        "redis-streams",
+        "retry",
+        "s3",
+        "sharding"
+      ],
+      "path": "problems/misc/webhook-delivery.html"
+    },
+    {
+      "id": "design-email-service",
+      "title": "Design Email Service (transactional + marketing at scale, SES-style)",
+      "summary": "SES-style email platform: templates, DKIM signing, IP pool reputation, bounce/complaint feedback, 5B/day.",
+      "difficulty": "Hard",
+      "categories": [
+        "notifications"
+      ],
+      "tags": [
+        "cassandra",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch7",
+        "deliverability",
+        "dkim",
+        "dynamodb",
+        "email",
+        "kafka",
+        "rate-limit",
+        "redis",
+        "rocksdb",
+        "s3",
+        "sharding",
+        "smtp"
+      ],
+      "path": "problems/notifications/email-service.html"
+    },
+    {
+      "id": "design-in-app-notifications",
+      "title": "Design In-app Notifications (real-time inbox, read/unread, badge counts)",
+      "summary": "Per-user inbox with WebSocket fan-out, atomic badge counters, and cross-device read-state sync at 5M concurrent connections.",
+      "difficulty": "Hard",
+      "categories": [
+        "notifications",
+        "messaging"
+      ],
+      "tags": [
+        "cassandra",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch6",
+        "ddia-ch9",
+        "inbox",
+        "jwt",
+        "kafka",
+        "nats",
+        "pubsub",
+        "realtime",
+        "redis",
+        "s3",
+        "sharding",
+        "sse",
+        "ulid",
+        "websocket"
+      ],
+      "path": "problems/notifications/in-app-notifications.html"
+    },
+    {
+      "id": "design-notification-orchestrator",
+      "title": "Design Multi-channel Notification Orchestrator (channel choice, dedup, prefs)",
+      "summary": "Channel selection, dedup, frequency caps, quiet hours, and async fallback across push/email/SMS/in-app.",
+      "difficulty": "Hard",
+      "categories": [
+        "notifications"
+      ],
+      "tags": [
+        "cassandra",
+        "ddia-ch11",
+        "ddia-ch7",
+        "dedup",
+        "dynamodb",
+        "feature-store",
+        "kafka",
+        "orchestration",
+        "parquet",
+        "policy",
+        "preferences",
+        "rate-limit",
+        "redis",
+        "s3",
+        "sharding"
+      ],
+      "path": "problems/notifications/notification-orchestrator.html"
+    },
+    {
+      "id": "design-notification-scheduler",
+      "title": "Design Notification Scheduler (cron + delayed jobs at billion-scale)",
+      "summary": "Durable cron + delayed job firing with sharded time-bucket index, leases, and exactly-once dispatch at 200k fires/sec.",
+      "difficulty": "Hard",
+      "categories": [
+        "notifications",
+        "misc"
+      ],
+      "tags": [
+        "cassandra",
+        "cron",
+        "ddia-ch11",
+        "ddia-ch9",
+        "delay-queue",
+        "etcd",
+        "kafka",
+        "leases",
+        "scheduler",
+        "sharding",
+        "zookeeper"
+      ],
+      "path": "problems/notifications/notification-scheduler.html"
+    },
+    {
+      "id": "design-push-notifications",
+      "title": "Design Push Notification System (APNs + FCM at 100M+ devices)",
+      "summary": "Multi-provider push fan-out with token management, priority lanes, and feedback-driven token GC at 250k sends/sec.",
+      "difficulty": "Hard",
+      "categories": [
+        "notifications",
+        "messaging"
+      ],
+      "tags": [
+        "apns",
+        "cassandra",
+        "circuit-breaker",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "fcm",
+        "http2",
+        "kafka",
+        "push",
+        "rate-limit",
+        "redis",
+        "sharding"
+      ],
+      "path": "problems/notifications/push-notifications.html"
+    },
+    {
+      "id": "design-sms-gateway",
+      "title": "Design SMS Gateway (multi-carrier, deliverability, fallback)",
+      "summary": "Global A2P SMS routing across aggregators and direct SMPP with health-aware failover and DLR ingestion.",
+      "difficulty": "Hard",
+      "categories": [
+        "notifications"
+      ],
+      "tags": [
+        "cassandra",
+        "ddia-ch11",
+        "dynamodb",
+        "flink",
+        "kafka",
+        "otp",
+        "redis",
+        "routing",
+        "smpp",
+        "sms",
+        "twilio"
+      ],
+      "path": "problems/notifications/sms-gateway.html"
+    },
+    {
+      "id": "design-ledger",
+      "title": "Design Double-Entry Ledger System (immutable, balanced, auditable)",
+      "summary": "Append-only double-entry ledger: zero-sum invariant, SSI, hash chain, point-in-time balances.",
+      "difficulty": "Hard",
+      "categories": [
+        "payments",
+        "database-ddia"
+      ],
+      "tags": [
+        "athena",
+        "audit",
+        "clickhouse",
+        "cockroachdb",
+        "ddia",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch7",
+        "ddia-ch9",
+        "double-entry",
+        "event-sourcing",
+        "kafka",
+        "leader-election",
+        "ledger",
+        "outbox",
+        "parquet",
+        "payments",
+        "postgres",
+        "quorum",
+        "raft",
+        "redis",
+        "s3",
+        "sharding",
+        "snowflake-dw",
+        "spanner",
+        "ssi",
+        "tidb",
+        "two-pc",
+        "wal"
+      ],
+      "path": "problems/payments/ledger.html"
+    },
+    {
+      "id": "design-fraud-detection",
+      "title": "Design Fraud Detection at Scale (real-time ML scoring)",
+      "summary": "Inline ML risk scoring: feature store, Flink pipelines, GBT models, rule engine, graph features.",
+      "difficulty": "Hard",
+      "categories": [
+        "payments",
+        "recommendation",
+        "analytics"
+      ],
+      "tags": [
+        "cassandra",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch7",
+        "ddia-ch9",
+        "etcd",
+        "feature-store",
+        "flink",
+        "fraud",
+        "gbdt",
+        "graph",
+        "kafka",
+        "ml",
+        "parquet",
+        "payments",
+        "redis",
+        "rocksdb",
+        "s3",
+        "spark"
+      ],
+      "path": "problems/payments/fraud-detection.html"
+    },
+    {
+      "id": "design-idempotent-payments",
+      "title": "Design Idempotent Payment Processing (no double-charge)",
+      "summary": "Bulletproof idempotency layer: keys, hashes, in-flight states, transactional binding to side effects.",
+      "difficulty": "Hard",
+      "categories": [
+        "payments",
+        "database-ddia"
+      ],
+      "tags": [
+        "cockroachdb",
+        "ddia",
+        "ddia-ch7",
+        "ddia-ch9",
+        "dynamodb",
+        "idempotency",
+        "json",
+        "payments",
+        "postgres",
+        "quorum",
+        "raft",
+        "rate-limit",
+        "redis",
+        "sharding",
+        "spanner",
+        "transactions"
+      ],
+      "path": "problems/payments/idempotent-payments.html"
+    },
+    {
+      "id": "design-paypal",
+      "title": "Design PayPal (P2P payments, multi-currency, fraud)",
+      "summary": "Global P2P + merchant payments: multi-currency wallets, sagas, ledger, fraud, FX, idempotency.",
+      "difficulty": "Hard",
+      "categories": [
+        "payments",
+        "ecommerce"
+      ],
+      "tags": [
+        "cassandra",
+        "ddia-ch11",
+        "ddia-ch7",
+        "ddia-ch9",
+        "etcd",
+        "feature-store",
+        "flink",
+        "fraud",
+        "fx",
+        "kafka",
+        "leader-election",
+        "ledger",
+        "otp",
+        "outbox",
+        "p2p",
+        "payments",
+        "postgres",
+        "raft",
+        "redis",
+        "saga",
+        "sharding",
+        "two-pc"
+      ],
+      "path": "problems/payments/paypal.html"
+    },
+    {
+      "id": "design-stripe",
+      "title": "Design Stripe (payments-as-API for merchants)",
+      "summary": "Developer-first payments API: idempotency, PaymentIntents, webhooks, ledger, acquirer connectors.",
+      "difficulty": "Hard",
+      "categories": [
+        "payments",
+        "ecommerce"
+      ],
+      "tags": [
+        "anycast",
+        "api",
+        "circuit-breaker",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch7",
+        "ddia-ch9",
+        "etcd",
+        "flink",
+        "idempotency",
+        "kafka",
+        "leader-election",
+        "mongo",
+        "mongodb",
+        "outbox",
+        "payments",
+        "postgres",
+        "raft",
+        "rate-limit",
+        "redis",
+        "sharding",
+        "vault",
+        "webhooks"
+      ],
+      "path": "problems/payments/stripe.html"
+    },
+    {
+      "id": "design-upi",
+      "title": "Design UPI (unified payments interface, NPCI-style)",
+      "summary": "Real-time interbank rail: VPA directory, two-leg saga across banks, settlement, 10B txns/month.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "payments"
+      ],
+      "tags": [
+        "circuit-breaker",
+        "cockroachdb",
+        "ddia-ch11",
+        "ddia-ch7",
+        "ddia-ch9",
+        "kafka",
+        "leader-election",
+        "npci",
+        "payments",
+        "postgres",
+        "raft",
+        "redis",
+        "saga",
+        "settlement",
+        "sharding",
+        "spanner",
+        "switch",
+        "two-pc",
+        "upi"
+      ],
+      "path": "problems/payments/upi.html"
+    },
+    {
+      "id": "design-ab-testing-platform",
+      "title": "Design A/B Testing Platform (bucketing, stats engine, guardrails)",
+      "summary": "Deterministic SDK bucketing, exposure dedupe via Flink, CUPED + sequential testing, automated guardrail halts at 1000-experiment scale.",
+      "difficulty": "Hard",
+      "categories": [
+        "recommendation",
+        "analytics"
+      ],
+      "tags": [
+        "experimentation",
+        "flink",
+        "iceberg",
+        "stats",
+        "guardrails"
+      ],
+      "path": "problems/recommendation/ab-testing.html"
+    },
+    {
+      "id": "design-candidate-generation-pipeline",
+      "title": "Design Candidate Generation Pipeline (ANN, FAISS/HNSW, recall-focused)",
+      "summary": "Multi-source recall stage merging two-tower, item-CF, graph and trending retrievers via scatter-gather with hedged requests under 50ms.",
+      "difficulty": "Hard",
+      "categories": [
+        "recommendation",
+        "search"
+      ],
+      "tags": [
+        "ann",
+        "hnsw",
+        "faiss",
+        "scatter-gather",
+        "kafka"
+      ],
+      "path": "problems/recommendation/candidate-generation.html"
+    },
+    {
+      "id": "design-cold-start-recommender",
+      "title": "Design Cold-start Recommender (new users / new items)",
+      "summary": "Onboarding bootstrap, content-based ANN, exploration budget and Thompson bandits to warm up 5M new items/day with safety guardrails.",
+      "difficulty": "Hard",
+      "categories": [
+        "recommendation"
+      ],
+      "tags": [
+        "cold-start",
+        "exploration",
+        "content-tower",
+        "bandit",
+        "meta-learning"
+      ],
+      "path": "problems/recommendation/cold-start.html"
+    },
+    {
+      "id": "design-multi-armed-bandit-recommender",
+      "title": "Design Multi-armed Bandit Recommender (exploration vs exploitation, Thompson)",
+      "summary": "Thompson Sampling and LinUCB with Flink-driven posterior updates, propensity logging, and IPS off-policy evaluation at 580K decisions/sec.",
+      "difficulty": "Hard",
+      "categories": [
+        "recommendation",
+        "ad-tech"
+      ],
+      "tags": [
+        "thompson",
+        "linucb",
+        "off-policy",
+        "flink",
+        "redis"
+      ],
+      "path": "problems/recommendation/multi-armed-bandit.html"
+    },
+    {
+      "id": "design-ranking-service",
+      "title": "Design Ranking Service (GBDT to DLRM, feature store, real-time)",
+      "summary": "Precision-stage scorer evolving XGBoost to DLRM, multi-objective combiner, online+offline feature store, 1.16B scoring ops/sec.",
+      "difficulty": "Hard",
+      "categories": [
+        "recommendation",
+        "ad-tech"
+      ],
+      "tags": [
+        "calibration",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch9",
+        "dlrm",
+        "embedding",
+        "feature-store",
+        "flink",
+        "gbdt",
+        "kafka",
+        "protobuf",
+        "redis",
+        "rocksdb",
+        "s3",
+        "sharding",
+        "spark",
+        "tf-serving",
+        "xgboost"
+      ],
+      "path": "problems/recommendation/ranking-service.html"
+    },
+    {
+      "id": "design-two-tower-recommender",
+      "title": "Design Two-tower Recommender System (user/item embeddings, ANN serving)",
+      "summary": "User/item dual encoders, sampled-softmax training, FAISS/ScaNN ANN serving for sub-30ms candidate retrieval at 500M-item scale.",
+      "difficulty": "Hard",
+      "categories": [
+        "recommendation"
+      ],
+      "tags": [
+        "embeddings",
+        "ann",
+        "faiss",
+        "tensorflow",
+        "feature-store"
+      ],
+      "path": "problems/recommendation/two-tower.html"
+    },
+    {
+      "id": "design-driver-matching",
+      "title": "Design Driver Matching Engine (geospatial + supply/demand)",
+      "summary": "Sub-second dispatch over 5M concurrent drivers using S2 cells, scoring, and offer locks.",
+      "difficulty": "Hard",
+      "categories": [
+        "ride-sharing",
+        "maps-location"
+      ],
+      "tags": [
+        "clickhouse",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "dispatch",
+        "kafka",
+        "matching",
+        "parquet",
+        "rate-limit",
+        "redis",
+        "s2-cells",
+        "s3",
+        "scoring",
+        "sharding"
+      ],
+      "path": "problems/ride-sharing/driver-matching.html"
+    },
+    {
+      "id": "design-eta-prediction",
+      "title": "Design ETA Prediction Service (ML-based, real-time traffic)",
+      "summary": "Two-stage ETA: contraction-hierarchy router plus GBM ranker over live traffic at 500K QPS.",
+      "difficulty": "Hard",
+      "categories": [
+        "ride-sharing",
+        "maps-location",
+        "recommendation"
+      ],
+      "tags": [
+        "cdn",
+        "ddia-ch10",
+        "ddia-ch11",
+        "embedding",
+        "eta",
+        "flink",
+        "gbm",
+        "kafka",
+        "ml",
+        "parquet",
+        "redis",
+        "rocksdb",
+        "routing",
+        "s3",
+        "sharding",
+        "spark",
+        "traffic"
+      ],
+      "path": "problems/ride-sharing/eta-prediction.html"
+    },
+    {
+      "id": "design-geo-indexing",
+      "title": "Design Geo-Indexing with S2 / H3 / Geohash (city quad-trees)",
+      "summary": "Generic geo-index for kNN and polygon queries across 10M live points and 1.25M writes/sec.",
+      "difficulty": "Hard",
+      "categories": [
+        "ride-sharing",
+        "maps-location",
+        "storage-cache"
+      ],
+      "tags": [
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch6",
+        "geohash",
+        "h3-grid",
+        "kafka",
+        "knn",
+        "parquet",
+        "postgis",
+        "redis",
+        "s2-cells",
+        "s3",
+        "sharding"
+      ],
+      "path": "problems/ride-sharing/geo-indexing.html"
+    },
+    {
+      "id": "design-lyft",
+      "title": "Design Lyft (multi-modal: rideshare + bikes + scooters)",
+      "summary": "Unified mobility platform spanning cars, bikes, and scooters with shared wallet and IoT unlock.",
+      "difficulty": "Hard",
+      "categories": [
+        "ride-sharing",
+        "maps-location"
+      ],
+      "tags": [
+        "amqp",
+        "bloom",
+        "cdn",
+        "ddia-ch11",
+        "ddia-ch6",
+        "dynamodb",
+        "geofence",
+        "h3-grid",
+        "iot",
+        "kafka",
+        "mqtt",
+        "multimodal",
+        "postgis",
+        "postgres",
+        "r-tree"
+      ],
+      "path": "problems/ride-sharing/lyft.html"
+    },
+    {
+      "id": "design-surge-pricing",
+      "title": "Design Surge Pricing (real-time supply-demand pricing)",
+      "summary": "Per-cell multipliers from streaming D/S ratios with hysteresis, caps, and quote locking.",
+      "difficulty": "Hard",
+      "categories": [
+        "ride-sharing",
+        "analytics"
+      ],
+      "tags": [
+        "clickhouse",
+        "ddia-ch11",
+        "ddia-ch7",
+        "flink",
+        "h3-grid",
+        "kafka",
+        "postgres",
+        "pricing",
+        "redis",
+        "surge"
+      ],
+      "path": "problems/ride-sharing/surge-pricing.html"
+    },
+    {
+      "id": "design-uber",
+      "title": "Design Uber (rider/driver matching at city scale)",
+      "summary": "City-scale rideshare: dispatch, geo-index, trip FSM, and payments at 25M trips/day.",
+      "difficulty": "Hard",
+      "categories": [
+        "ride-sharing",
+        "maps-location",
+        "payments"
+      ],
+      "tags": [
+        "cassandra",
+        "ddia-ch11",
+        "ddia-ch3",
+        "ddia-ch5",
+        "ddia-ch6",
+        "dispatch",
+        "flink",
+        "grpc",
+        "h3-grid",
+        "kafka",
+        "mqtt",
+        "mysql",
+        "payments",
+        "postgres",
+        "quic",
+        "redis",
+        "s2-cells",
+        "saga",
+        "sharding"
+      ],
+      "path": "problems/ride-sharing/uber.html"
+    },
+    {
+      "id": "design-autocomplete",
+      "title": "Design Autocomplete / Typeahead (sub-100ms, top-K trie)",
+      "summary": "Sub-100ms keystroke suggestions backed by a precomputed top-K trie/FST and trending overlay.",
+      "difficulty": "Hard",
+      "categories": [
+        "search",
+        "storage-cache"
+      ],
+      "tags": [
+        "bloom",
+        "count-min",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch6",
+        "flink",
+        "fst",
+        "gcs",
+        "hadoop",
+        "kafka",
+        "lucene",
+        "redis",
+        "s3",
+        "sharding",
+        "spark",
+        "trie",
+        "typeahead"
+      ],
+      "path": "problems/search/autocomplete.html"
+    },
+    {
+      "id": "design-elasticsearch",
+      "title": "Design Elasticsearch architecture (inverted index, sharded, near-real-time)",
+      "summary": "Distributed Lucene-on-shards engine with NRT refresh, leader-based replication, and aggregations.",
+      "difficulty": "Hard",
+      "categories": [
+        "search",
+        "storage-cache",
+        "database-ddia"
+      ],
+      "tags": [
+        "ddia-ch3",
+        "ddia-ch5",
+        "ddia-ch6",
+        "elasticsearch",
+        "fst",
+        "json",
+        "lsm",
+        "lucene",
+        "opensearch",
+        "quorum",
+        "raft",
+        "replication",
+        "sharding",
+        "translog"
+      ],
+      "path": "problems/search/elasticsearch.html"
+    },
+    {
+      "id": "design-google-search",
+      "title": "Design Google Web Search (crawler + indexer + serving)",
+      "summary": "Planet-scale crawl, inverted-index build, and sub-300ms serving for ~100B queries/month.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "search"
+      ],
+      "tags": [
+        "bigtable",
+        "bloom",
+        "crawler",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch3",
+        "ddia-ch6",
+        "inverted-index",
+        "lsm",
+        "ltr",
+        "mapreduce",
+        "pagerank",
+        "pubsub",
+        "sharding"
+      ],
+      "path": "problems/search/google-search.html"
+    },
+    {
+      "id": "design-image-search",
+      "title": "Design Image / Visual Search (embeddings + ANN: FAISS / HNSW)",
+      "summary": "Billion-scale visual similarity search with vision embeddings, IVF-PQ, HNSW, and full-precision rerank.",
+      "difficulty": "Hard",
+      "categories": [
+        "search",
+        "recommendation"
+      ],
+      "tags": [
+        "ann",
+        "cassandra",
+        "cdn",
+        "clip",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "embedding",
+        "embeddings",
+        "faiss",
+        "hnsw",
+        "ivf-pq",
+        "kafka",
+        "s3",
+        "sharding",
+        "spark"
+      ],
+      "path": "problems/search/image-search.html"
+    },
+    {
+      "id": "design-search-ranking",
+      "title": "Design Search Ranking Service (BM25 -> learning-to-rank)",
+      "summary": "Multi-stage ranking cascade from BM25 candidates to GBDT and transformer cross-encoder rerankers.",
+      "difficulty": "Hard",
+      "categories": [
+        "search",
+        "recommendation"
+      ],
+      "tags": [
+        "ann",
+        "bm25",
+        "ddia-ch10",
+        "ddia-ch11",
+        "feature-store",
+        "flink",
+        "gbdt",
+        "kafka",
+        "lambdamart",
+        "ltr",
+        "ndcg",
+        "parquet",
+        "redis",
+        "s3",
+        "sharding",
+        "spark"
+      ],
+      "path": "problems/search/search-ranking.html"
+    },
+    {
+      "id": "design-spell-checker",
+      "title": "Design Spell Checker / Did-You-Mean (edit distance, ngrams)",
+      "summary": "Noisy-channel spell correction over a Levenshtein-FST term dictionary with bigram language model.",
+      "difficulty": "Hard",
+      "categories": [
+        "search"
+      ],
+      "tags": [
+        "ddia-ch10",
+        "ddia-ch11",
+        "fst",
+        "kenlm",
+        "levenshtein",
+        "lucene",
+        "noisy-channel",
+        "s3",
+        "spark",
+        "symspell",
+        "viterbi"
+      ],
+      "path": "problems/search/spell-checker.html"
+    },
+    {
+      "id": "design-facebook-feed",
+      "title": "Design Facebook News Feed (push/pull/hybrid fanout)",
+      "summary": "Personalized News Feed at 3B MAU: hybrid push/pull fanout, Redis ZSET timelines, ranked candidate generation under 200 ms p99.",
+      "difficulty": "Hard",
+      "categories": [
+        "social-network",
+        "recommendation"
+      ],
+      "tags": [
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "embedding",
+        "fanout",
+        "feature-store",
+        "gbdt",
+        "json",
+        "kafka",
+        "mysql",
+        "ranking",
+        "redis",
+        "rocksdb",
+        "sharding",
+        "snowflake-dw",
+        "timeline"
+      ],
+      "path": "problems/social-network/facebook-feed.html"
+    },
+    {
+      "id": "design-instagram",
+      "title": "Design Instagram (feed + stories + reels)",
+      "summary": "Three-surface media-first network at 2B MAU: feed posts, 24h ephemeral Stories, Reels short-video discovery; transcode pipeline, multi-CDN, separate rankers.",
+      "difficulty": "Hard",
+      "categories": [
+        "social-network",
+        "video-streaming",
+        "file-storage"
+      ],
+      "tags": [
+        "akamai",
+        "ann",
+        "bloom",
+        "cassandra",
+        "cassandra-ttl",
+        "cdn",
+        "cloudflare",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "embedding",
+        "faiss",
+        "feature-store",
+        "hls",
+        "json",
+        "kafka",
+        "mysql",
+        "presigned-url",
+        "redis",
+        "reels",
+        "rocksdb",
+        "s3",
+        "scann",
+        "sharding",
+        "snowflake-dw",
+        "stories",
+        "transcode"
+      ],
+      "path": "problems/social-network/instagram.html"
+    },
+    {
+      "id": "design-feed-ranking",
+      "title": "Design News Feed Ranking Service (EdgeRank-style)",
+      "summary": "Ranking service between candidate generator and rendered feed: EdgeRank baseline evolving to multi-task DNN, online feature store, shadow A/B, train-serve skew controls.",
+      "difficulty": "Hard",
+      "categories": [
+        "social-network",
+        "recommendation"
+      ],
+      "tags": [
+        "ab-testing",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "edgerank",
+        "embedding",
+        "feature-store",
+        "flink",
+        "kafka",
+        "ml-serving",
+        "mmr",
+        "parquet",
+        "ranking",
+        "redis",
+        "sharding"
+      ],
+      "path": "problems/social-network/feed-ranking.html"
+    },
+    {
+      "id": "design-reddit",
+      "title": "Design Reddit (threaded comments + voting + subreddits)",
+      "summary": "Community-organized link aggregator: deeply threaded comments via materialized paths, Cassandra counter-based voting, Wilson Best sort, Hot ranking.",
+      "difficulty": "Hard",
+      "categories": [
+        "social-network",
+        "search"
+      ],
+      "tags": [
+        "cassandra",
+        "cdn",
+        "counters",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "elasticsearch",
+        "kafka",
+        "ltree",
+        "postgres",
+        "r-tree",
+        "rate-limit",
+        "redis",
+        "rocksdb",
+        "sharding",
+        "threaded-comments",
+        "wilson-score"
+      ],
+      "path": "problems/social-network/reddit.html"
+    },
+    {
+      "id": "design-tiktok-fyp",
+      "title": "Design TikTok For You feed (heavy ML-driven recommendation)",
+      "summary": "Algorithmic short-video feed at 1B DAU: multi-source candidate generation, two-tower ANN, multi-task DNN ranker, real-time feature loop in seconds.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "social-network",
+        "video-streaming",
+        "recommendation"
+      ],
+      "tags": [
+        "ann",
+        "cassandra",
+        "cdn",
+        "cdn-prefetch",
+        "clickhouse",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "embedding",
+        "faiss",
+        "feature-store",
+        "flink",
+        "hadoop",
+        "hnsw",
+        "kafka",
+        "parquet",
+        "recommendation",
+        "redis",
+        "scann",
+        "sharding",
+        "two-tower"
+      ],
+      "path": "problems/social-network/tiktok-fyp.html"
+    },
+    {
+      "id": "design-twitter-timeline",
+      "title": "Design Twitter / X Timeline (with celeb fanout problem)",
+      "summary": "Home timeline at 500M MAU with the asymmetric celebrity fanout problem; hybrid push/pull at the 10K-follower threshold, Manhattan KV, Snowflake-keyed ZSETs.",
+      "difficulty": "Hard",
+      "categories": [
+        "social-network",
+        "messaging"
+      ],
+      "tags": [
+        "celebrity-problem",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "fanout",
+        "hadoop",
+        "kafka",
+        "manhattan",
+        "mysql",
+        "redis",
+        "sharding",
+        "snowflake-dw",
+        "snowflake-id"
+      ],
+      "path": "problems/social-network/twitter-timeline.html"
+    },
+    {
+      "id": "design-distributed-counter",
+      "title": "Design Distributed Counter (per-tweet view counter at 1M+ events/sec)",
+      "summary": "Stream-aggregated counters with Kafka+Flink, Redis fast path, Cassandra rollups, HLL for cardinality, batch reconciliation for exact counts.",
+      "difficulty": "Hard",
+      "categories": [
+        "storage-cache",
+        "analytics"
+      ],
+      "tags": [
+        "bloom",
+        "cassandra",
+        "count-min",
+        "counter",
+        "crdt",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "flink",
+        "hadoop",
+        "hll",
+        "kafka",
+        "lambda-architecture",
+        "rate-limit",
+        "redis",
+        "samza",
+        "sharding"
+      ],
+      "path": "problems/storage-cache/distributed-counter.html"
+    },
+    {
+      "id": "design-rate-limiter",
+      "title": "Design Distributed Rate Limiter (token bucket / leaky bucket, multi-region)",
+      "summary": "Two-tier rate limiter using token bucket Lua scripts in Redis, in-pod leases, sliding-window counters, CRDT cross-region sync.",
+      "difficulty": "Hard",
+      "categories": [
+        "storage-cache"
+      ],
+      "tags": [
+        "circuit-breaker",
+        "consistent-hash",
+        "crdt",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "ddia-ch9",
+        "lua",
+        "multi-region",
+        "rate-limit",
+        "rate-limiting",
+        "redis",
+        "sharding",
+        "token-bucket"
+      ],
+      "path": "problems/storage-cache/rate-limiter.html"
+    },
+    {
+      "id": "design-session-store",
+      "title": "Design Distributed Session Store (sticky vs shared, eviction, TTL)",
+      "summary": "Hybrid JWT + opaque-refresh-token session store, Redis volatile-LRU eviction, sliding TTL, Kafka-based cross-region revocation.",
+      "difficulty": "Hard",
+      "categories": [
+        "storage-cache"
+      ],
+      "tags": [
+        "auth",
+        "ddia-ch5",
+        "ddia-ch6",
+        "jwt",
+        "kafka",
+        "mysql",
+        "postgres",
+        "rate-limit",
+        "redis",
+        "revocation",
+        "session",
+        "sharding",
+        "ttl"
+      ],
+      "path": "problems/storage-cache/session-store.html"
+    },
+    {
+      "id": "design-dynamodb-kv",
+      "title": "Design DynamoDB-style KV store (consistent hashing, vector clocks, gossip)",
+      "summary": "Leaderless AP key-value store with vnodes, tunable N/R/W quorums, vector-clock conflict resolution, hinted handoff and Merkle anti-entropy.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "storage-cache",
+        "database-ddia"
+      ],
+      "tags": [
+        "dynamo",
+        "lsm",
+        "quorum",
+        "vector-clock",
+        "gossip",
+        "merkle"
+      ],
+      "path": "problems/storage-cache/dynamodb.html"
+    },
+    {
+      "id": "design-memcached",
+      "title": "Design Memcached (LRU, consistent-hash, multi-tenant)",
+      "summary": "Multi-tenant look-aside cache with slab allocator, segmented LRU, consistent hashing via mcrouter, lease-based stampede protection.",
+      "difficulty": "Hard",
+      "categories": [
+        "storage-cache"
+      ],
+      "tags": [
+        "cache",
+        "consistent-hash",
+        "consistent-hashing",
+        "ddia-ch3",
+        "ddia-ch5",
+        "ddia-ch6",
+        "ddia-ch7",
+        "lru",
+        "mcrouter",
+        "memcached",
+        "redis",
+        "slab"
+      ],
+      "path": "problems/storage-cache/memcached.html"
+    },
+    {
+      "id": "design-redis-cluster",
+      "title": "Design Redis Cluster (16384 hash slots, replication, failover)",
+      "summary": "Sharded in-memory KV with CRC16 hash slots, async master-replica replication, gossip-based failover, and online resharding.",
+      "difficulty": "Hard",
+      "categories": [
+        "storage-cache",
+        "database-ddia"
+      ],
+      "tags": [
+        "cache",
+        "consistent-hash",
+        "ddia-ch5",
+        "ddia-ch6",
+        "failover",
+        "gossip",
+        "pubsub",
+        "quorum",
+        "raft",
+        "redis",
+        "replication",
+        "sharding"
+      ],
+      "path": "problems/storage-cache/redis-cluster.html"
+    },
+    {
+      "id": "design-cloud-gaming",
+      "title": "Design Cloud Gaming (Stadia / GeForce Now \u2014 sub-50ms input-to-pixel)",
+      "summary": "GPU-backed cloud gaming with NVENC H.265, WebRTC transport, MIG multi-tenancy, and 50-PoP edge fleet.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "video-streaming",
+        "cdn"
+      ],
+      "tags": [
+        "cdn",
+        "cloud-gaming",
+        "ddia-ch11",
+        "ddia-ch5",
+        "gpu",
+        "h265",
+        "mig",
+        "nvenc",
+        "redis",
+        "s3",
+        "webrtc",
+        "websocket"
+      ],
+      "path": "problems/video-streaming/cloud-gaming.html"
+    },
+    {
+      "id": "design-google-meet",
+      "title": "Design Google Meet (browser-based VC, WebRTC)",
+      "summary": "Browser-first conferencing with VP9 SVC, Spanner control plane, ASR captions, and cascaded SFU mesh.",
+      "difficulty": "Hard",
+      "categories": [
+        "video-streaming",
+        "messaging"
+      ],
+      "tags": [
+        "bigtable",
+        "borg",
+        "captions",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch9",
+        "sfu",
+        "spanner",
+        "sse",
+        "vp9-svc",
+        "webrtc"
+      ],
+      "path": "problems/video-streaming/google-meet.html"
+    },
+    {
+      "id": "design-hotstar",
+      "title": "Design Hotstar / JioCinema (live + VOD with 25M+ concurrent)",
+      "summary": "Live cricket streaming at 30M+ concurrent: multi-CDN steering, LL-HLS, surge handling, reactions fanout.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "video-streaming",
+        "cdn"
+      ],
+      "tags": [
+        "akamai",
+        "cassandra",
+        "cdn",
+        "circuit-breaker",
+        "cloudfront",
+        "cmaf",
+        "ddia-ch11",
+        "ddia-ch6",
+        "flink",
+        "hls",
+        "kafka",
+        "live",
+        "ll-hls",
+        "multi-cdn",
+        "pulsar",
+        "rate-limit",
+        "redis",
+        "s3",
+        "sharding"
+      ],
+      "path": "problems/video-streaming/hotstar.html"
+    },
+    {
+      "id": "design-low-latency-live",
+      "title": "Design Low-latency Live Streaming (LL-HLS, CMAF, sub-3s glass-to-glass)",
+      "summary": "CDN-scale 2-3s glass-to-glass live streaming via CMAF chunked transfer, blocking playlists, and origin shield.",
+      "difficulty": "Hard",
+      "categories": [
+        "video-streaming",
+        "cdn"
+      ],
+      "tags": [
+        "cassandra",
+        "cdn",
+        "cmaf",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "drm",
+        "fairplay",
+        "hadoop",
+        "hls",
+        "http2",
+        "ll-dash",
+        "ll-hls",
+        "playready",
+        "redis",
+        "rtmp",
+        "s3",
+        "sharding",
+        "srt",
+        "webrtc",
+        "widevine"
+      ],
+      "path": "problems/video-streaming/low-latency-live.html"
+    },
+    {
+      "id": "design-netflix",
+      "title": "Design Netflix (VOD at planetary scale)",
+      "summary": "Global VOD: Open Connect CDN, multi-region control plane, personalization, and viewer-state at 250M MAU.",
+      "difficulty": "Hard",
+      "categories": [
+        "video-streaming",
+        "cdn",
+        "recommendation"
+      ],
+      "tags": [
+        "abr",
+        "ann",
+        "cassandra",
+        "cdn",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "drm",
+        "elasticsearch",
+        "embedding",
+        "fairplay",
+        "feature-store",
+        "flink",
+        "gbdt",
+        "kafka",
+        "mysql",
+        "playready",
+        "quorum",
+        "rate-limit",
+        "s3",
+        "streaming",
+        "widevine"
+      ],
+      "path": "problems/video-streaming/netflix.html"
+    },
+    {
+      "id": "design-twitch",
+      "title": "Design Twitch (live streaming with chat at 10M concurrent)",
+      "summary": "Live RTMP ingest, ABR transcode, LL-HLS CDN delivery, and Erlang-backed chat fanout for 10M concurrent viewers.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "video-streaming",
+        "messaging",
+        "cdn"
+      ],
+      "tags": [
+        "anycast",
+        "cassandra",
+        "cdn",
+        "cmaf",
+        "consistent-hash",
+        "ddia-ch11",
+        "ddia-ch5",
+        "ddia-ch6",
+        "dynamodb",
+        "erlang",
+        "haproxy",
+        "hls",
+        "http2",
+        "kafka",
+        "live-streaming",
+        "ll-hls",
+        "postgres",
+        "pubsub",
+        "rate-limit",
+        "redis",
+        "rtmp",
+        "s3",
+        "sharding",
+        "srt",
+        "webrtc",
+        "websocket"
+      ],
+      "path": "problems/video-streaming/twitch.html"
+    },
+    {
+      "id": "design-video-recommendation",
+      "title": "Design Video Recommendation System (candidate gen + ranking)",
+      "summary": "Two-stage reco at billion-item corpus: ANN candidate gen, multi-task DNN ranker, real-time features, cold start.",
+      "difficulty": "Hard",
+      "categories": [
+        "video-streaming",
+        "recommendation"
+      ],
+      "tags": [
+        "ann",
+        "bigquery",
+        "bigtable",
+        "consistent-hash",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch6",
+        "embedding",
+        "embeddings",
+        "faiss",
+        "feature-store",
+        "flink",
+        "hnsw",
+        "kafka",
+        "ml",
+        "ranking",
+        "redis",
+        "scann",
+        "sharding",
+        "spark",
+        "vespa"
+      ],
+      "path": "problems/video-streaming/video-recommendation.html"
+    },
+    {
+      "id": "design-video-transcoding",
+      "title": "Design Video Transcoding Pipeline (multi-bitrate, multi-codec)",
+      "summary": "Chunked parallel encode/stitch DAG: probe, ABR ladder, per-title encoding, VMAF gate, AV1 backfill at 30k hr/hr.",
+      "difficulty": "Hard",
+      "categories": [
+        "video-streaming",
+        "file-storage"
+      ],
+      "tags": [
+        "airflow",
+        "av1",
+        "cassandra",
+        "cdn",
+        "cmaf",
+        "ddia-ch10",
+        "ddia-ch11",
+        "dynamodb",
+        "ffmpeg",
+        "gcs",
+        "hevc",
+        "hls",
+        "kubernetes",
+        "pubsub",
+        "rate-limit",
+        "s3",
+        "spot",
+        "sqs",
+        "temporal",
+        "transcoding",
+        "vmaf"
+      ],
+      "path": "problems/video-streaming/video-transcoding.html"
+    },
+    {
+      "id": "design-video-upload",
+      "title": "Design Video Upload & Processing Pipeline (chunked, resumable, virus scan, thumbnails)",
+      "summary": "Resumable presigned multipart uploads, SHA-256 verify, virus scan gate, probe, thumbnails, dedupe before transcode.",
+      "difficulty": "Hard",
+      "categories": [
+        "video-streaming",
+        "file-storage"
+      ],
+      "tags": [
+        "clamav",
+        "ddia-ch11",
+        "ddia-ch7",
+        "dedup",
+        "dynamodb",
+        "ffprobe",
+        "kafka",
+        "presigned",
+        "presigned-url",
+        "s3",
+        "s3-multipart",
+        "upload"
+      ],
+      "path": "problems/video-streaming/video-upload.html"
+    },
+    {
+      "id": "design-webrtc-sfu-vs-mcu",
+      "title": "Design WebRTC SFU vs MCU architecture for group video calls",
+      "summary": "Compare mesh, SFU, MCU, and hybrid topologies; per-subscriber layer selection, cascading, and SFrame E2E.",
+      "difficulty": "Hard",
+      "categories": [
+        "video-streaming",
+        "messaging"
+      ],
+      "tags": [
+        "webrtc",
+        "sfu",
+        "mcu",
+        "simulcast",
+        "svc",
+        "sframe"
+      ],
+      "path": "problems/video-streaming/webrtc-sfu.html"
+    },
+    {
+      "id": "design-youtube",
+      "title": "Design YouTube (UGC video platform)",
+      "summary": "User-generated video at 2.7B MAU: chunked uploads, transcoding, search, two-stage recommendations, Content ID.",
+      "difficulty": "Hard",
+      "categories": [
+        "video-streaming",
+        "cdn",
+        "recommendation",
+        "search"
+      ],
+      "tags": [
+        "ann",
+        "bigquery",
+        "bigtable",
+        "cdn",
+        "ddia-ch10",
+        "ddia-ch11",
+        "ddia-ch6",
+        "embedding",
+        "feature-store",
+        "gcs",
+        "kubernetes",
+        "lsm",
+        "pubsub",
+        "search",
+        "sharding",
+        "spanner",
+        "streaming",
+        "two-tower"
+      ],
+      "path": "problems/video-streaming/youtube.html"
+    },
+    {
+      "id": "design-zoom",
+      "title": "Design Zoom (video conferencing)",
+      "summary": "Planet-scale video conferencing on SFU media plane with simulcast, breakout rooms, recording, and PSTN bridging.",
+      "difficulty": "Very Hard",
+      "categories": [
+        "video-streaming",
+        "messaging"
+      ],
+      "tags": [
+        "conferencing",
+        "ddia-ch11",
+        "ddia-ch9",
+        "dynamodb",
+        "etcd",
+        "kafka",
+        "postgres",
+        "pubsub",
+        "quic",
+        "raft",
+        "redis",
+        "s3",
+        "sfu",
+        "sharding",
+        "simulcast",
+        "srtp",
+        "udp",
+        "webrtc"
+      ],
+      "path": "problems/video-streaming/zoom.html"
+    }
+  ]
+}

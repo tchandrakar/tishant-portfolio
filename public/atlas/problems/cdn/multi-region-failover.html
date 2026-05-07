@@ -1,0 +1,139 @@
+<h1>Design Multi-region Failover (active-active vs active-passive)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">cdn</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the regional-failover layer that sits behind the CDN edge: when an entire AWS region or origin DC goes dark, traffic should drain to a healthy region with bounded data loss and bounded user-visible disruption. We need to choose, per workload, between active-active (all regions serve writes) and active-passive (one writer, others stand by), and prove the trade-offs with concrete RPO/RTO numbers.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Detect region failure in &lt; 60 s (false-positive rate &lt; 0.01%/yr).</li>
+  <li>Drain user traffic from a failed region within &lt; 2 min via DNS + anycast withdraw.</li>
+  <li>Replicate state across regions: stateless cache (best-effort), session store (≤ 1 s lag), source-of-truth DB (configurable RPO).</li>
+  <li>Run game-day drills: planned failover with zero data loss.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>RTO:</b> ≤ 2 min user-visible unavailability for stateless tier; ≤ 5 min for stateful tier.</li>
+  <li><b>RPO:</b> 0 (active-active payments), 1 s (active-passive sessions), 10 s (analytics).</li>
+  <li><b>Scale:</b> 5 regions × 10 M req/s; 200 TB hot dataset replicated across regions.</li>
+  <li><b>Availability target:</b> 99.99% per region → 99.9999% multi-region (independent failures).</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Cross-region replication bandwidth: 200 TB dataset × 1% daily change × 5 regions = 10 TB/day per peer = ~1 Gbps sustained, peaks to 20 Gbps.</li>
+  <li>Health-check QPS: 5 regions × 1k probes/s × 100 services = 500 k/s.</li>
+  <li>Failover state machine actions: ~100 actions per drill, each must be idempotent.</li>
+  <li>Cost: active-active = 5× compute + cross-region egress. Active-passive ~1.2× (passive runs warm).</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>// Failover control plane
+POST /api/v1/failover/declare      { regionId, reason }       → {drillId}
+GET  /api/v1/failover/status/{id}                              → {state, drainedPct}
+POST /api/v1/failover/abort        { drillId }                 → 200
+
+// Per-service health
+GET  /healthz                                                   → 200 {writable, lag_ms}
+POST /api/v1/route/weight          { regionId, weight 0..100 } → 200</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">                ┌───────── Global Health Plane ──────────┐
+                │  (Raft-replicated control state)        │
+                └───────┬─────────────────────┬──────────┘
+                        ▼                     ▼
+[GeoDNS / Anycast]  ─── steering weights ─── per-region
+        │
+        ▼
+┌──────────────────┐   async replication   ┌──────────────────┐
+│   Region A       │ ◄───────────────────► │   Region B       │
+│  Edge → Origin   │                       │  Edge → Origin   │
+│  ┌──────────┐    │                       │  ┌──────────┐    │
+│  │ Postgres │ ─► │ ──── physical WAL ──► │ ►│ Postgres │    │
+│  │ (leader) │    │                       │  │(replica) │    │
+│  └──────────┘    │   ◄── Spanner/CRDT ─► │  └──────────┘    │
+└──────────────────┘                       └──────────────────┘
+</div>
+<p>The control plane (a small Raft cluster, e.g. etcd across 5 regions) holds region health and steering weights. The data plane uses two replication models: physical-log (Postgres streaming) for active-passive workloads, and Spanner/CockroachDB-style multi-leader Paxos or CRDTs for active-active.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Active-passive (most workloads)</h3>
+<pre>region_state:
+  region_id PK, role enum(leader|replica|drained),
+  wal_lsn bigint, lag_ms int, healthy bool,
+  last_heartbeat timestamptz</pre>
+<p>Per DDIA Ch. 5: single-leader async replication. RPO is bounded by replication lag at failover (typical 100–500 ms; spike to 5 s under load). After failover, we promote the lowest-lag replica using a fencing token (Ch. 8) so the old leader can never accept writes again.</p>
+<h3>7.2 Active-active (payments, inventory)</h3>
+<p>Use Spanner/CockroachDB or a CRDT-backed store. Each row is replicated by Paxos across 3–5 regions; writes commit at quorum (DDIA Ch. 9 linearizability). RPO is 0 because no committed write can be lost. Write latency &gt; 80 ms cross-region — acceptable only if business permits.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Health detection</h3>
+<p>Each region runs N independent prober instances in <i>other</i> regions (cross-region probing avoids the "sick region certifies itself healthy" anti-pattern). A region is declared down when ≥ 3 of 5 external probers agree for 30 s. The Raft control plane records the verdict.</p>
+<h3>8.2 Traffic drain</h3>
+<p>Steering weights flow to GeoDNS + the L4 LB control plane. New connections are weighted to 0 first; existing connections drain over 60 s. BGP withdraw is the last resort because it takes longer to reconverge.</p>
+<h3>8.3 DB failover with fencing</h3>
+<p>Promote new leader → bump epoch number in Raft → all clients refuse writes signed with the old epoch (DDIA Ch. 8 fencing tokens). Without fencing, a network-partitioned old leader can keep accepting writes ("split brain"), corrupting data.</p>
+<h3>8.4 Active-active conflict resolution</h3>
+<p>For inventory: serializable transactions via Spanner (TrueTime). For shopping carts: CRDTs (OR-Set) merging concurrent adds. For counters: PN-Counter CRDT (DDIA Ch. 5 multi-leader replication, Ch. 9 linearizability vs causal).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Replication lag spikes</b> during traffic peaks → RPO breached. Mitigation: dedicate replication NICs, alert at lag &gt; 500 ms.</li>
+  <li><b>Failover storm:</b> when a region fails, 1.25× capacity hits each survivor. Pre-provision 25% headroom or auto-scale aggressively.</li>
+  <li><b>Cross-region write latency</b> (active-active): 60–150 ms per commit. Use regional partitioning (a row's "home region" handles writes; reads are local).</li>
+  <li><b>Flapping region:</b> Hysteresis — require N consecutive healthy probes before re-admitting traffic.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Active-passive (single leader)</td><td>Simple, cheap, low write-latency</td><td>Non-zero RPO; promotion is risky</td></tr>
+<tr><td>Active-active (multi-leader / Paxos)</td><td>RPO 0, RTO seconds</td><td>2–3× cost, +80 ms p99 writes, conflicts</td></tr>
+<tr><td>DNS-based failover</td><td>Works for any client</td><td>TTL stickiness; 5 min real-world worst case</td></tr>
+<tr><td>Anycast withdraw</td><td>Sub-second for new flows</td><td>Existing flows die; no per-tenant policy</td></tr>
+<tr><td>External probers (cross-region)</td><td>Avoids self-certification</td><td>Cost; harder to reason about quorum</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — single-leader (async) for active-passive; multi-leader (Spanner / CRDT) for active-active; replication lag, write conflicts, last-write-wins hazards.</li>
+  <li>Ch. 8 Distributed Systems — split-brain, fencing tokens, the "two generals" nature of failover, why timeouts must be carefully tuned.</li>
+  <li>Ch. 9 Consistency &amp; Consensus — Raft for the control plane; linearizability of failover declarations; CAP under partition.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Choose the replication model per workload, not per company. Payments demand RPO 0; product images don't."</li>
+  <li>"The most dangerous failure isn't a dead region — it's a half-dead region. External cross-region probing + fencing tokens is non-negotiable."</li>
+  <li>"I default to active-passive with rigorous game-days. Active-active is a strong technical answer but a costly product answer; only adopt where RPO 0 is a real requirement."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+<thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+<tbody>
+<tr><td>etcd / Raft control plane (5 regions)</td><td>Region health and steering weights must be linearizable — two regions cannot both believe they are leader. 5-region Raft tolerates 2 simultaneous failures while keeping a quorum, hitting our 99.9999% multi-region availability target. Per-region etcd would risk split-brain.</td><td>ZooKeeper (operationally heavier); Consul (gossip-based, weaker consistency); single-region DB (single point of failure).</td></tr>
+<tr><td>Fencing tokens on DB promotion (DDIA Ch. 8)</td><td>The dangerous failure is a network-partitioned old leader still accepting writes. Bumping an epoch number in Raft means every storage operation carries a token; the old leader's tokens are rejected, eliminating the split-brain corruption that killed many real-world failovers.</td><td>STONITH only (slow, manual); no fencing (data corruption inevitable); leases (clock-dependent).</td></tr>
+<tr><td>Postgres streaming replication (active-passive)</td><td>Most workloads tolerate 100–500 ms RPO. Postgres physical-WAL streaming gives this with minimal CPU overhead — far cheaper than Spanner-class infrastructure for the 80% of tables where RPO 0 isn't required.</td><td>Logical replication (per-row overhead); MySQL (weaker tooling); rsync (no LSN tracking).</td></tr>
+<tr><td>Spanner / CockroachDB (active-active payments)</td><td>RPO 0 with multi-region Paxos commits is non-negotiable for payments. Spanner's TrueTime gives external consistency at quorum write cost (60–150 ms cross-region), acceptable when business permits and required by financial compliance.</td><td>Multi-leader async (lost writes); single-leader cross-region (write latency cliff); two-phase commit (coordinator failure).</td></tr>
+<tr><td>CRDTs (OR-Set, PN-Counter) for shopping carts &amp; counters</td><td>Active-active cart adds and view counters don't need linearizability — they need "no lost adds." OR-Set merges concurrent additions deterministically; PN-Counter handles concurrent increments. No coordination on the 10 M req/s hot path.</td><td>Last-write-wins (drops cart items); single-leader (cross-region latency); locking (10× write cost).</td></tr>
+<tr><td>Cross-region external probers (3-of-5 consensus)</td><td>Avoids the "sick region certifies itself healthy" anti-pattern. Probers in 5 other regions agree on a 30 s window before declaring failure — keeps the false-positive rate &lt;0.01%/yr while detecting in &lt;60 s.</td><td>Self-probing (sick-self-certifies); single external prober (single point of failure); customer-only beacons (slow).</td></tr>
+<tr><td>Connection draining (60 s) before BGP withdraw</td><td>BGP withdraw kills existing TCP flows; weighted DNS shifts new flows first while existing flows naturally drain. This hits the &lt;2 min RTO without dropping in-flight work — critical for long-running uploads or video sessions.</td><td>Hard cutover (drops sessions); weight-only (slow drain on long-lived).</td></tr>
+<tr><td>GeoDNS + anycast withdraw (dual-layer steering)</td><td>DNS is for policy (e.g., GDPR EU-only); anycast is for speed of failover. Stacking them gives sub-second for stateless reqs and minutes for full regional drain — covering both ends of the RTO/RPO matrix.</td><td>DNS-only (TTL stickiness, 5 min worst case); anycast-only (no per-tenant policy).</td></tr>
+<tr><td>Spanner TrueTime for serializable inventory</td><td>Inventory decrements must never go negative across regions. TrueTime's bounded clock uncertainty (~7 ms) lets Spanner provide external consistency with ~80 ms p99 commits — the only viable path for active-active inventory at 200 TB.</td><td>Optimistic concurrency (high abort rate); single-leader (cross-region latency).</td></tr>
+<tr><td>Dedicated replication NICs</td><td>Replication lag spikes during traffic peaks because user traffic and WAL ship compete for NIC bandwidth. Dedicated 25/100 Gbps NICs for replication isolate the 1 Gbps sustained / 20 Gbps peak cross-region replication from user load, holding RPO &lt;500 ms.</td><td>Shared NIC (lag spikes under load); WAN-shared (peer congestion).</td></tr>
+<tr><td>Hysteresis (N consecutive healthy probes) for re-admission</td><td>Flapping regions cause routing storms. Requiring N consecutive healthy probes before re-admitting traffic dampens oscillation — same logic as BGP route dampening but applied at the steering layer.</td><td>Single healthy probe (flap chatter); manual re-admit (operator burden).</td></tr>
+<tr><td>25% capacity headroom per region</td><td>5-region failure means 1.25× load on each survivor. Pre-provisioning 25% headroom absorbs the failover storm without auto-scaling latency. Cheaper than over-provisioning to 50% (covers 2-region failure with auto-scaling).</td><td>No headroom (cascading overload); 100% headroom (2× cost).</td></tr>
+<tr><td>Idempotent failover state-machine actions (~100 per drill)</td><td>Game-day drills replay the same sequence multiple times; without idempotency a partial failure leaves the system in an unknown state. Each action carries an action-id and is safe to retry, enabling automated drills with confidence.</td><td>Stateful actions (manual recovery); fire-and-forget (silent partial failure).</td></tr>
+<tr><td>Regional row-pinning ("home region" reads/writes local)</td><td>Active-active cross-region writes cost 60–150 ms p99. Pinning each row's writes to its home region keeps the bulk of writes local; cross-region traffic only on home-region failover. Hits the cost target without giving up RPO 0.</td><td>Global writes (latency cliff); per-customer single region (loses A-A benefits).</td></tr>
+</tbody>
+</table>
+

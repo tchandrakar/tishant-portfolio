@@ -116,9 +116,10 @@ function SkillBar({ name, level, delay = 0 }: { name: string; level: number; del
 
 interface ClassicPortfolioProps {
   onSwitchPortfolio: () => void;
+  onOpenAtlas?: () => void;
 }
 
-export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolioProps) {
+export default function ClassicPortfolio({ onSwitchPortfolio, onOpenAtlas }: ClassicPortfolioProps) {
   const [scrolled, setScrolled] = useState(false);
   const [mobileMenu, setMobileMenu] = useState(false);
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
@@ -160,7 +161,9 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
     setTimeout(() => setMessageSent(false), 3000);
   };
 
-  const NAV = ['about', 'experience', 'projects', 'skills', 'contact'];
+  const NAV = ['about', 'experience', 'projects', 'atlas', 'skills', 'contact'];
+
+  const openAtlas = () => onOpenAtlas?.();
 
   const FEATURES = [
     { icon: Server, title: 'Backend Architecture', desc: 'Scalable microservices with AWS, Docker, and distributed systems' },
@@ -187,10 +190,17 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
 
           <div className="hidden md:flex items-center gap-8">
             {NAV.map(id => (
-              <button key={id} onClick={() => scrollTo(id)} className="text-sm text-gray-400 hover:text-white transition-colors capitalize">
+              <button
+                key={id}
+                onClick={() => scrollTo(id)}
+                className={`text-sm transition-colors capitalize ${id === 'atlas' ? 'text-cyan-300 hover:text-cyan-200' : 'text-gray-400 hover:text-white'}`}
+              >
                 {id}
               </button>
             ))}
+            <button onClick={openAtlas} className="hidden lg:flex items-center gap-1.5 text-xs text-cyan-300/70 hover:text-cyan-200 transition-colors">
+              Launch Atlas →
+            </button>
             <button onClick={onSwitchPortfolio} className="flex items-center gap-1.5 text-xs text-amber-400/70 hover:text-amber-400 transition-colors">
               <Cpu className="w-3.5 h-3.5" /> Desktop Mode
             </button>
@@ -204,7 +214,13 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
         {mobileMenu && (
           <div className="md:hidden bg-[#0a0a12]/95 backdrop-blur-xl border-b border-white/5 px-4 py-4 space-y-3">
             {NAV.map(id => (
-              <button key={id} onClick={() => scrollTo(id)} className="block w-full text-left text-sm text-gray-400 hover:text-white capitalize">{id}</button>
+              <button
+                key={id}
+                onClick={() => scrollTo(id)}
+                className={`block w-full text-left text-sm capitalize ${id === 'atlas' ? 'text-cyan-300' : 'text-gray-400 hover:text-white'}`}
+              >
+                {id}
+              </button>
             ))}
             <button onClick={() => { setMobileMenu(false); onSwitchPortfolio(); }} className="flex items-center gap-1.5 text-xs text-amber-400/70">
               <Cpu className="w-3.5 h-3.5" /> Desktop Mode
@@ -458,6 +474,81 @@ export default function ClassicPortfolio({ onSwitchPortfolio }: ClassicPortfolio
               </Reveal3D>
             ))}
           </div>
+        </div>
+      </section>
+
+      {/* ═══════════════════ CODEX ═══════════════════ */}
+      <section id="atlas" className="relative z-10 py-20 px-4">
+        <div className="max-w-5xl mx-auto">
+          <Reveal3D>
+            <h2 className="text-sm text-cyan-300 font-mono mb-2">Architect's Atlas</h2>
+            <p className="text-2xl sm:text-3xl font-bold text-white mb-3">A system design vault, built and shared.</p>
+            <p className="text-sm text-gray-400 max-w-2xl mb-10">
+              132 high-level design problems across 20 categories, plus a 30-lesson learning ladder that climbs from foundations
+              to staff-level architecture. DDIA-grounded. Multi-category. Tech rationale on every choice.
+              Built end-to-end (including this React port) by orchestrating <span className="text-cyan-300">50+ parallel
+              Claude sub-agents</span> &mdash; from authoring the docs to wiring the UI.
+            </p>
+          </Reveal3D>
+
+          {/* Stats strip */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-10">
+            {[
+              { n: '132', l: 'HLD problems' },
+              { n: '20',  l: 'categories' },
+              { n: '30',  l: 'lessons' },
+              { n: '12',  l: 'sections per doc' },
+            ].map((s, i) => (
+              <Reveal3D key={s.l} delay={i * 80}>
+                <TiltCard className="bg-white/[0.03] border border-white/[0.06] rounded-2xl p-5 text-center">
+                  <div className="text-3xl font-bold text-cyan-300 font-mono">{s.n}</div>
+                  <div className="text-xs text-gray-500 mt-1">{s.l}</div>
+                </TiltCard>
+              </Reveal3D>
+            ))}
+          </div>
+
+          {/* Three level previews */}
+          <div className="grid sm:grid-cols-3 gap-4 mb-8">
+            {[
+              { level: 'Easy',   color: 'from-emerald-400/30 to-emerald-400/0', accent: 'text-emerald-300', count: 10, sample: 'CAP · sharding · replication' },
+              { level: 'Medium', color: 'from-amber-400/30  to-amber-400/0',  accent: 'text-amber-300',  count: 10, sample: 'Raft · CRDT · idempotency' },
+              { level: 'Hard',   color: 'from-pink-400/30   to-pink-400/0',   accent: 'text-pink-300',   count: 10, sample: 'Multi-region · hot-key · capacity' },
+            ].map((lv, i) => (
+              <Reveal3D key={lv.level} direction="up" delay={i * 100}>
+                <TiltCard className="bg-white/[0.03] border border-white/[0.06] rounded-2xl p-5 h-full relative overflow-hidden">
+                  <div className={`absolute inset-0 bg-gradient-to-br ${lv.color} pointer-events-none`} />
+                  <div className="relative">
+                    <div className="flex items-center justify-between mb-2">
+                      <h3 className={`text-sm font-bold ${lv.accent}`}>{lv.level}</h3>
+                      <span className="text-xs text-gray-500 font-mono">{lv.count} lessons</span>
+                    </div>
+                    <p className="text-xs text-gray-400">{lv.sample}</p>
+                  </div>
+                </TiltCard>
+              </Reveal3D>
+            ))}
+          </div>
+
+          {/* CTA */}
+          <Reveal3D>
+            <div className="flex flex-wrap gap-3">
+              <button
+                onClick={openAtlas}
+                className="group inline-flex items-center gap-2 px-6 py-3 bg-cyan-300/10 border border-cyan-300/40 rounded-full text-cyan-200 hover:bg-cyan-300/15 hover:border-cyan-300/60 transition-all"
+              >
+                Launch the Atlas
+                <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
+              </button>
+              <a
+                href="#atlas"
+                onClick={(e) => { e.preventDefault(); openAtlas(); }}
+                className="text-xs text-gray-500 self-center"
+              >
+                Or share a deep link → <span className="font-mono text-cyan-300/70">/#atlas</span>
+              </a>
+            </div>
+          </Reveal3D>
         </div>
       </section>
 

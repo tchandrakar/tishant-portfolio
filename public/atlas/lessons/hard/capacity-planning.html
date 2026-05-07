@@ -1,0 +1,77 @@
+<h1>Capacity planning with real numbers (back-of-envelope)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">capacity</span>
+  <span class="tag">estimation</span>
+  <span class="tag">interview</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Back-of-envelope (BOE) capacity planning is the act of converting product requirements into rough numbers — QPS, storage, bandwidth, fan-out — quickly enough to drive a design decision. The point is not precision; it is to be within an order of magnitude so you can choose between "single database" and "shard across 50 nodes." The skill is memorizing a small set of constants, multiplying through, and being honest about peak-vs-average.</p>
+
+<h2>Why it matters</h2>
+<p>Every interview HLD answer hinges on one early calculation. If you say "500M users, 5 posts/day each = 30k writes/sec," every later choice — partitioning, queue throughput, replication factor — flows logically. If you skip the math, you end up handwaving "we'll just use Cassandra," which is the answer interviewers and PMs both punish. In production, BOE math is what stops a team from buying 10x the hardware they need or, worse, 1/10th.</p>
+
+<h2>Numbers worth memorizing</h2>
+<ul>
+  <li><b>L1 cache:</b> ~1 ns; <b>L2:</b> ~4 ns; <b>main RAM:</b> ~100 ns; <b>SSD random read:</b> ~100 µs; <b>spinning disk seek:</b> ~10 ms; <b>same-DC RTT:</b> ~0.5 ms; <b>cross-region RTT:</b> 50–150 ms.</li>
+  <li><b>1 day = 86,400 s ≈ 10^5 s.</b> So 1B/day ≈ 12k/s; 100M/day ≈ 1.2k/s.</li>
+  <li><b>Peak factor:</b> daily peak ≈ 2–3x average; monthly peak (Black Friday, World Cup) can be 10x.</li>
+  <li><b>One commodity SSD node:</b> ~50–100k QPS for KV reads, ~10k QPS for SQL row reads, ~1–5 GB/s sequential I/O.</li>
+  <li><b>One Kafka broker:</b> ~100 MB/s sustained per partition leader.</li>
+  <li><b>HTTP request overhead:</b> ~500 B headers; JSON payload ~1–5 KB typical.</li>
+  <li><b>Year:</b> 1B events/day × 365 ≈ 365B/year; at 1KB/event ≈ 365 TB/year.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  Product spec        Numbers              Storage / QPS
+  -------------       -------------------  -------------------
+  N users             N                    -
+  W writes/user/day   N * W / 86400        QPS_write (avg)
+                      * peak_factor (2-3)  QPS_write (peak)
+  R reads / write     QPS_write * R        QPS_read
+  S bytes / record    N * W * S            bytes/day
+                      * 365                bytes/year
+                      * RF (replication)   stored bytes
+  fan-out F           QPS_write * F        downstream QPS
+
+  Sanity check: does QPS fit on N nodes given per-node ceiling?
+</div>
+
+<h2>A worked example: design a "likes" service</h2>
+<p>Assume 300M DAU, 50 likes/user/day, 100 reads per like (feed views), record = 40 B (user_id 8B + post_id 8B + ts 8B + index overhead ~16B).</p>
+<ul>
+  <li><b>Write QPS:</b> 300M × 50 / 86,400 ≈ 174k/s avg → ~500k/s peak.</li>
+  <li><b>Read QPS:</b> 174k × 100 ≈ 17.4M/s avg → ~50M/s peak. Cache or denormalize counters.</li>
+  <li><b>Storage/year:</b> 300M × 50 × 365 × 40 B ≈ 220 TB/year raw; ×3 replication ≈ 660 TB.</li>
+  <li><b>Sharding:</b> at 100k QPS/node, peak 500k writes/s needs ≥5 write-shards (use 16 for headroom + rebalancing).</li>
+  <li><b>Bandwidth:</b> 174k writes × 40B ≈ 7 MB/s — trivial. Reads at 17M × 40B ≈ 680 MB/s — that's why you cache aggregate counts, not raw rows.</li>
+</ul>
+<p>Now you can argue for: counter cache (Redis) in front, append-only writes to a sharded LSM store (Cassandra/Scylla), batched analytics export to a columnar store. None of this is hand-wave — the numbers forced each decision.</p>
+
+<h2>Peak, percentiles, and headroom</h2>
+<p>Always plan capacity at <b>p99 latency under peak QPS</b>, not average under average. A useful heuristic: provision for <code>2× peak</code> so you can lose a region, do a rolling deploy, and absorb a marketing spike simultaneously. For storage, add 30–50% over the projected year so compaction, tombstones, and snapshots have room. For network, watch the egress side — many services discover too late that 10 Gb/s NICs become the real ceiling, not CPU.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Quoting average QPS as if it were peak.</li>
+  <li>Forgetting replication factor when sizing storage.</li>
+  <li>Ignoring index and metadata overhead — a "40B row" often takes 200B on disk after indexes.</li>
+  <li>Confusing per-event size with per-day footprint after compression (3–10x typical).</li>
+  <li>Pretending caches are free. Hot keys still hit one shard.</li>
+  <li>Not adding fan-out: 1 write that triggers 10 downstream writes is 10x the QPS.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Estimate capacity for a video upload service: 50M DAU, 1 in 100 uploads daily, average video 200 MB, average watch fan-out of 50 viewers per upload, viewers stream at 2 Mbps. Compute peak ingest, storage/year (with 3x replication and 5 transcoded variants at 1.5x base size), and peak egress.
+  <br/>
+  <b>Hint:</b> Uploads/day = 500k. Peak uploads/s ≈ 500k × 3 / 86,400 ≈ 17/s. Storage = 500k × 200MB × 365 × 3 × (1+1.5×5)/1 ≈ very large; do the math. Egress dominated by reads: 25M concurrent viewers × 2 Mbps = 50 Tbps — that is why you need a CDN.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-youtube">Design YouTube</a> — egress-dominated capacity story.</li>
+  <li><a href="#problem/design-twitter">Design Twitter</a> — fan-out math drives the whole architecture.</li>
+  <li><a href="#problem/design-whatsapp">Design WhatsApp</a> — concurrent connection ceilings, not QPS, define capacity.</li>
+</ul>

@@ -1,0 +1,137 @@
+<h1>Design Dropbox / Google Drive (file sync + delta encoding)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">file-storage</span>
+  <span class="tag">collaboration</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a cloud file-sync product where any change made on one device (Mac, Windows, Linux, iOS, Android, web) is reflected on every other linked device within seconds. Files range from a 12 KB <code>.txt</code> note to a 50 GB Final Cut Pro project. Users expect offline edits, selective sync, shared folders, version history, and bandwidth-cheap updates when only a few bytes change inside a multi-gigabyte file.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Upload, download, rename, move, delete files and folders.</li>
+  <li>Bi-directional sync across N devices per user; offline writes reconcile on reconnect.</li>
+  <li>Shared folders with per-user ACLs (viewer / commenter / editor).</li>
+  <li>Version history (30 days free, 1 year paid) and undo of any change.</li>
+  <li>Delta sync: only changed byte ranges are transferred.</li>
+  <li>Cross-user deduplication (server-side block dedup).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> change-event fan-out under 1 s p95 within a region; first-byte download under 200 ms p95 from edge.</li>
+  <li><b>Scale:</b> 700 M registered users, 100 M DAU, 100 B files, 5 EB stored.</li>
+  <li><b>Durability:</b> 11-9s on object storage; metadata RPO &lt; 1 s.</li>
+  <li><b>Availability:</b> 99.95% on the metadata plane.</li>
+  <li><b>Bandwidth efficient:</b> a 1 KB edit in a 1 GB Keynote should transfer ~4 KB, not 1 GB.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>QPS: 100 M DAU x 50 metadata ops/day / 86,400 = ~58 K metadata QPS avg, 250 K peak.</li>
+  <li>Storage: 5 EB raw + 30% version overhead = ~6.5 EB; with 35% global dedup savings, ~4.2 EB physical.</li>
+  <li>Bandwidth: 8 PB/day uploaded, 24 PB/day downloaded → 280 Gbps and 850 Gbps respectively.</li>
+  <li>Notification fan-out: 100 M DAU x 5 devices = 500 M long-lived WebSocket connections at peak.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/files/commit       {path, parent_rev, blocklist}    → new_rev
+GET  /v1/files/download     {file_id, rev}                    → stream
+POST /v1/blocks/upload      {hash, size, data}                → block_id
+GET  /v1/delta              {cursor}                          → {entries, cursor}
+POST /v1/share              {folder_id, email, role}          → share_id
+GET  /v1/longpoll_delta?cursor=...                            → {changes:true}</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client FS Watcher] ── chunker ──► [Block Server] ──► [S3 / blob store]
+        │                              │
+        │ metadata                     │ block_id
+        ▼                              ▼
+   [Metadata API] ──► [Sharded MySQL: namespace] ──► [Kafka delta log]
+        │                                                  │
+        ▼                                                  ▼
+   [Notification Svc / WebSockets] ◄──── [Indexer / Search] [Version GC]
+</div>
+<p>Walk-through: the client watcher detects a changed file, runs rolling-hash chunking (4 MB target), uploads only new blocks to the Block Server, then commits metadata referring to the new block list. The metadata commit appends to a per-namespace Kafka log; the Notification service tails it and pushes a "something changed" ping over the user's WebSocket. Each peer device then pulls a <code>/delta</code> page and downloads only the missing blocks. This split (block plane vs metadata plane) is the core Dropbox design and exactly what the original <i>Magic Pocket</i> paper describes.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Metadata (sharded MySQL)</h3>
+<pre>CREATE TABLE fs_node (
+  ns_id        BIGINT,
+  node_id      BIGINT,
+  parent_id    BIGINT,
+  name         VARBINARY(1024),
+  type         TINYINT,        -- file / dir
+  rev          BIGINT,
+  block_list   VARBINARY,      -- ordered SHA-256 block hashes
+  size         BIGINT,
+  mtime        BIGINT,
+  PRIMARY KEY (ns_id, node_id)
+) ENGINE=InnoDB;</pre>
+<p>Sharded by <code>ns_id</code> (namespace = user or shared folder). Joins always live on a single shard.</p>
+<h3>7.2 Blocks (object store)</h3>
+<p>Content-addressed: object key = <code>SHA-256(block)</code>. Immutable, never overwritten. Erasure coded 10+4 across 4 AZs. Reference-counted by metadata commits; GC sweeps unreferenced blocks after 7 days.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Delta encoding</h3>
+<p>Variable-size chunking with a 64-byte rolling hash (Rabin or Buzhash) avoids the boundary-shift problem of fixed chunking. A 1-byte insert near the front of a 1 GB file shifts only the chunk it lands in; subsequent chunk boundaries re-align. Average 4 MB chunks, min 1 MB, max 8 MB.</p>
+<h3>8.2 Notification &amp; longpoll</h3>
+<p>500 M WebSockets are served from a sharded edge tier (one Go process per CPU, ~50 K conns each). The server holds the longpoll for up to 90 s and replies with <code>{changes:true}</code> when the user's namespace cursor advances.</p>
+<h3>8.3 Conflict resolution</h3>
+<p>Two devices commit against the same parent rev → second commit fails with HTTP 409. The losing client renames its copy <code>file (Alice's conflicted copy 2026-05-06).docx</code> and re-commits. No silent overwrite.</p>
+<h3>8.4 Shared folders</h3>
+<p>Each shared folder is its own namespace. Joining a share is a metadata mount, not a copy — disk usage is counted against the folder owner.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot namespaces (large shares):</b> a 5,000-person engineering folder gets sharded by sub-tree; commit lock is per sub-tree, not per namespace.</li>
+  <li><b>Block put thundering herd:</b> client first calls <code>HEAD /blocks/{hash}</code>; if present, skip the upload. Saves bandwidth on cross-user dedup.</li>
+  <li><b>WebSocket fan-out:</b> notification service is stateless and uses consistent hashing on <code>user_id</code> so reconnects land on the same node 99% of the time, preserving the cursor cache.</li>
+  <li><b>Metadata cross-shard moves:</b> moving a 1 M-file folder between namespaces is implemented as a logical re-parent + lazy copy.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Variable chunking (Rabin)</td><td>Robust to inserts, great delta ratio</td><td>~5% CPU on client</td></tr>
+<tr><td>Content-addressed blocks</td><td>Free dedup, immutability simplifies GC</td><td>Cannot encrypt per-user without losing dedup</td></tr>
+<tr><td>Sharded MySQL for metadata</td><td>Strong consistency, mature ops</td><td>Re-sharding is painful</td></tr>
+<tr><td>Last-writer-wins + conflict copy</td><td>Simple, predictable</td><td>No automatic merge</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — single-leader per shard for metadata; async replication to read replicas.</li>
+  <li>Ch. 6 Partitioning — partition-by-namespace, secondary index for shared-folder membership.</li>
+  <li>Ch. 7 Transactions — commit uses optimistic concurrency on <code>(node_id, parent_rev)</code>.</li>
+  <li>Ch. 11 Stream Processing — Kafka delta log feeds search indexer and notification fan-out.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd separate the block plane from the metadata plane on day one — that single decision is what lets Dropbox dedup across users and run them on totally different storage backends."</li>
+  <li>"The hardest part is delta sync on huge files; Rabin chunking is the textbook answer but I'd benchmark it against FastCDC for our workload."</li>
+  <li>"Version history is just retention on immutable blocks — it costs almost nothing extra because of dedup."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>Sharded MySQL (InnoDB) for metadata</td><td>Per-namespace sharding gives single-shard joins for the <code>fs_node</code> tree; InnoDB OCC on <code>(node_id, parent_rev)</code> is exactly the strong consistency we need so two devices racing on the same parent rev cleanly produce a 409. At 250 K peak metadata QPS this is a mature, battle-tested fit.</td><td>CockroachDB (cross-shard txns add latency we don't need); Cassandra (no OCC primitive for commit-revs).</td></tr>
+    <tr><td>Content-addressed object store with Reed-Solomon 10+4</td><td>5 EB raw storage at 3x replication = 15 EB; RS 10+4 brings it to 1.4x = 7 EB physical, saving roughly 8 EB of disk while still tolerating loss of any 4 of 14 shards across 4 AZs. Immutable blocks make GC trivial.</td><td>3x replication (cost prohibitive at 5 EB); LRC codes (lower repair cost but more complex shard placement).</td></tr>
+    <tr><td>Rabin / Buzhash rolling-hash chunking (4 MB target)</td><td>Variable chunking is the only thing that delivers the "1 KB edit in a 1 GB Keynote ≈ 4 KB transfer" NFR. Fixed chunking shifts every boundary after a 1-byte insert, collapsing the dedup ratio toward 1x.</td><td>Fixed 4 MB chunks (boundary-shift problem); FastCDC (worth A/B testing for slightly better speed).</td></tr>
+    <tr><td>SHA-256 for block hashes</td><td>Acts as both the storage key and the dedup key. With 35% global dedup target, hash collisions must be cryptographically unforgeable — a malicious user must not be able to forge a hash that overwrites another user's block.</td><td>BLAKE3 (faster, considered for client CPU); MD5/SHA-1 (broken; collision risk unacceptable for a content-addressed store).</td></tr>
+    <tr><td>Kafka delta log per namespace</td><td>Notification fan-out, search indexer, and version-GC are all stream consumers of the same commit log. Decouples write path from N downstream consumers and lets each replay independently — essential when 500 M WebSockets need a "something changed" ping.</td><td>Direct DB triggers (couples writers to consumers); Kinesis (vendor lock; Kafka was already operationally mature here).</td></tr>
+    <tr><td>Go-based WebSocket gateway (sharded by user_id)</td><td>500 M long-lived connections at ~50 K conns/process means ~10 K processes; Go's goroutine model handles this with single-digit MB per connection. Consistent hashing on user_id keeps reconnects on the same node 99% of the time, preserving the cursor cache.</td><td>Node.js (single-thread limits per-process conn count); Erlang/OTP (great fit, smaller talent pool); raw HTTP longpoll only (more bandwidth, worse p95).</td></tr>
+    <tr><td>HTTP longpoll fallback (90 s)</td><td>Some corporate networks and old mobile stacks block WebSockets; longpoll guarantees the change-event NFR (&lt;1 s p95) still holds for the 5–10% of clients on hostile networks.</td><td>Server-Sent Events (firewall-friendly but unidirectional, awkward for cursor advance); MQTT (operational overhead not justified).</td></tr>
+    <tr><td>HEAD-before-PUT block protocol</td><td>Avoids the thundering-herd PUT on already-stored blocks during the 35% cross-user dedup case — saves both client upload bandwidth (8 PB/day uploaded uplink) and server write IOPS on the object store.</td><td>Always-PUT (wastes uplink); client-side bloom filter (stale, doesn't account for inflight writes).</td></tr>
+    <tr><td>Per-shard Raft / single-leader replication</td><td>Each MySQL shard runs leader-based replication (DDIA Ch. 5) so the OCC commit at <code>(node_id, parent_rev)</code> is linearizable on a single node. With RPO &lt; 1 s, async replicas would violate the SLO; semi-sync is the sweet spot.</td><td>Multi-leader (loses single-key linearizability); fully async (RPO too loose).</td></tr>
+    <tr><td>S3-class blob backend for the data plane</td><td>Splitting block plane from metadata plane (per the Magic Pocket paper) lets us run blocks on commodity HDD-heavy storage at fractions of a cent per GB while keeping metadata on fast NVMe MySQL — different cost curves served on different hardware.</td><td>Single store for both (forces compromise on hardware); HDFS (no native EC at this geometry; ops burden).</td></tr>
+    <tr><td>Reference-counted GC with 7-day grace</td><td>Immutable blocks make ref-counting tractable; the 7-day window prevents accidental deletion when a metadata commit is mid-flight, and aligns with the "30 days free / 1 year paid" version retention business rule.</td><td>Immediate delete (race conditions with in-flight commits); mark-and-sweep (full scan of trillions of blocks is operationally painful).</td></tr>
+  </tbody>
+</table>

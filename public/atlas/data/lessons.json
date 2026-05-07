@@ -1,0 +1,590 @@
+{
+  "version": 1,
+  "count": 30,
+  "lessons": [
+    {
+      "id": "lesson-scalability",
+      "level": "easy",
+      "order": 1,
+      "title": "Why scalability matters: vertical vs horizontal scaling",
+      "summary": "Scale up vs scale out: when one big box wins, when many small ones do, and the hidden cost of going horizontal.",
+      "minutes": 6,
+      "tags": [
+        "scalability",
+        "capacity",
+        "fundamentals"
+      ],
+      "relatedProblems": [
+        "design-netflix",
+        "design-amazon",
+        "design-uber"
+      ],
+      "path": "lessons/easy/scalability.html"
+    },
+    {
+      "id": "lesson-load-balancers",
+      "level": "easy",
+      "order": 2,
+      "title": "Load balancers: L4 vs L7, algorithms",
+      "summary": "How traffic gets spread across servers: L4 vs L7, round-robin vs least-conn vs consistent hashing, and when each breaks.",
+      "minutes": 7,
+      "tags": [
+        "load-balancing",
+        "networking",
+        "routing"
+      ],
+      "relatedProblems": [
+        "design-whatsapp",
+        "design-redis-cluster",
+        "design-netflix"
+      ],
+      "path": "lessons/easy/load-balancers.html"
+    },
+    {
+      "id": "lesson-caching-basics",
+      "level": "easy",
+      "order": 3,
+      "title": "Caching basics: write-through, write-back, write-around, eviction",
+      "summary": "Pick a write strategy, pick an eviction policy, avoid stampedes: the three knobs that decide if your cache helps or hurts.",
+      "minutes": 7,
+      "tags": [
+        "caching",
+        "performance",
+        "consistency"
+      ],
+      "relatedProblems": [
+        "design-redis-cluster",
+        "design-amazon",
+        "design-netflix"
+      ],
+      "path": "lessons/easy/caching-basics.html"
+    },
+    {
+      "id": "lesson-sql-vs-nosql",
+      "level": "easy",
+      "order": 4,
+      "title": "Database choice: SQL vs NoSQL, ACID vs BASE",
+      "summary": "ACID gives invariants; BASE gives scale. How to pick a database from access patterns, not vibes.",
+      "minutes": 7,
+      "tags": [
+        "databases",
+        "acid",
+        "nosql"
+      ],
+      "relatedProblems": [
+        "design-uber",
+        "design-dynamodb",
+        "design-amazon"
+      ],
+      "path": "lessons/easy/sql-vs-nosql.html"
+    },
+    {
+      "id": "lesson-sharding",
+      "level": "easy",
+      "order": 5,
+      "title": "Sharding (partitioning): range, hash, directory",
+      "summary": "Range, hash, and directory partitioning: how to split data across nodes without creating hot shards or resharding pain.",
+      "minutes": 7,
+      "tags": [
+        "sharding",
+        "partitioning",
+        "scalability"
+      ],
+      "relatedProblems": [
+        "design-dynamodb",
+        "design-cassandra-cluster",
+        "design-uber"
+      ],
+      "path": "lessons/easy/sharding.html"
+    },
+    {
+      "id": "lesson-replication",
+      "level": "easy",
+      "order": 6,
+      "title": "Replication: single-leader, multi-leader, leaderless",
+      "summary": "Three shapes of write ownership and the trade-offs they bake in.",
+      "minutes": 7,
+      "tags": [
+        "replication",
+        "availability",
+        "consistency"
+      ],
+      "relatedProblems": [
+        "design-dynamodb",
+        "design-spanner-style",
+        "design-google-docs"
+      ],
+      "path": "lessons/easy/replication.html"
+    },
+    {
+      "id": "lesson-cdn-basics",
+      "level": "easy",
+      "order": 7,
+      "title": "CDN basics: how it works, push vs pull, edge caching",
+      "summary": "Why a fleet of edge caches makes a global site feel local.",
+      "minutes": 6,
+      "tags": [
+        "cdn",
+        "caching",
+        "latency"
+      ],
+      "relatedProblems": [
+        "design-youtube",
+        "design-netflix",
+        "design-image-cdn"
+      ],
+      "path": "lessons/easy/cdn-basics.html"
+    },
+    {
+      "id": "lesson-cap-pacelc",
+      "level": "easy",
+      "order": 8,
+      "title": "CAP theorem and PACELC",
+      "summary": "Why you can't have all three under partition \u2014 and what 'else' costs on a sunny day.",
+      "minutes": 7,
+      "tags": [
+        "cap",
+        "pacelc",
+        "consistency"
+      ],
+      "relatedProblems": [
+        "design-dynamodb",
+        "design-spanner-style",
+        "design-shopping-cart"
+      ],
+      "path": "lessons/easy/cap-pacelc.html"
+    },
+    {
+      "id": "lesson-consistency-models",
+      "level": "easy",
+      "order": 9,
+      "title": "Consistency models: strong, eventual, causal, RYW, monotonic",
+      "summary": "The contract between storage and clients \u2014 strong to eventual, with the useful middle ground.",
+      "minutes": 7,
+      "tags": [
+        "consistency",
+        "distributed-systems"
+      ],
+      "relatedProblems": [
+        "design-twitter",
+        "design-dynamodb",
+        "design-google-docs"
+      ],
+      "path": "lessons/easy/consistency-models.html"
+    },
+    {
+      "id": "lesson-indexes",
+      "level": "easy",
+      "order": 10,
+      "title": "Indexes: B-tree, hash, inverted, secondary",
+      "summary": "Four index shapes, what they cost on writes, and when each one earns its keep.",
+      "minutes": 7,
+      "tags": [
+        "indexes",
+        "storage",
+        "databases"
+      ],
+      "relatedProblems": [
+        "design-search-engine",
+        "design-dynamodb",
+        "design-newsfeed"
+      ],
+      "path": "lessons/easy/indexes.html"
+    },
+    {
+      "id": "lesson-message-queues",
+      "level": "medium",
+      "order": 11,
+      "title": "Message queues: Kafka vs RabbitMQ vs SQS \u2014 when to use which",
+      "summary": "Three brokers, three different bets \u2014 log vs router vs managed pipe. How to pick without regretting it in six months.",
+      "minutes": 9,
+      "tags": [
+        "queues",
+        "kafka",
+        "rabbitmq",
+        "sqs"
+      ],
+      "relatedProblems": [
+        "design-event-collector",
+        "design-idempotent-payments",
+        "design-twitter-trending"
+      ],
+      "path": "lessons/medium/message-queues.html"
+    },
+    {
+      "id": "lesson-pubsub-patterns",
+      "level": "medium",
+      "order": 12,
+      "title": "Pub-sub patterns: fanout, topic, exchange",
+      "summary": "Fanout, topic, direct \u2014 three routing models that cover most real systems, plus how to design routing keys that age well.",
+      "minutes": 8,
+      "tags": [
+        "pubsub",
+        "fanout",
+        "routing"
+      ],
+      "relatedProblems": [
+        "design-event-collector",
+        "design-twitter-trending",
+        "design-notification-service"
+      ],
+      "path": "lessons/medium/pubsub-patterns.html"
+    },
+    {
+      "id": "lesson-rate-limiting",
+      "level": "medium",
+      "order": 13,
+      "title": "Distributed counters & rate limiting (token / leaky bucket)",
+      "summary": "Token vs leaky bucket, sliding windows that actually slide, and how to keep limits accurate across N edge servers.",
+      "minutes": 9,
+      "tags": [
+        "rate-limiting",
+        "token-bucket",
+        "leaky-bucket"
+      ],
+      "relatedProblems": [
+        "design-rate-limiter",
+        "design-distributed-counter",
+        "design-api-gateway"
+      ],
+      "path": "lessons/medium/rate-limiting.html"
+    },
+    {
+      "id": "lesson-probabilistic-ds",
+      "level": "medium",
+      "order": 14,
+      "title": "Probabilistic data structures: Bloom, Count-min, HyperLogLog",
+      "summary": "Trade a tiny bounded error for orders-of-magnitude less memory \u2014 membership, frequency, and cardinality at scale.",
+      "minutes": 8,
+      "tags": [
+        "bloom-filter",
+        "count-min",
+        "hyperloglog"
+      ],
+      "relatedProblems": [
+        "design-twitter-trending",
+        "design-distributed-counter",
+        "design-web-crawler"
+      ],
+      "path": "lessons/medium/probabilistic-ds.html"
+    },
+    {
+      "id": "lesson-distributed-tx",
+      "level": "medium",
+      "order": 15,
+      "title": "Distributed transactions: 2PC, Saga, Outbox",
+      "summary": "Why ACID stops being free across services, and the three patterns that get you back atomicity-shaped behavior.",
+      "minutes": 9,
+      "tags": [
+        "transactions",
+        "saga",
+        "outbox",
+        "2pc"
+      ],
+      "relatedProblems": [
+        "design-paypal",
+        "design-idempotent-payments",
+        "design-ecommerce-checkout"
+      ],
+      "path": "lessons/medium/distributed-tx.html"
+    },
+    {
+      "id": "lesson-idempotency",
+      "level": "medium",
+      "order": 16,
+      "title": "Idempotency & exactly-once delivery",
+      "summary": "Why exactly-once is at-least-once + idempotent processing, and how to design dedup keys that survive retries.",
+      "minutes": 9,
+      "tags": [
+        "idempotency",
+        "delivery-semantics",
+        "retries",
+        "dedup"
+      ],
+      "relatedProblems": [
+        "design-paypal",
+        "design-distributed-transactions",
+        "design-stripe"
+      ],
+      "path": "lessons/medium/idempotency.html"
+    },
+    {
+      "id": "lesson-consensus",
+      "level": "medium",
+      "order": 17,
+      "title": "Consensus: Raft & Paxos in plain English",
+      "summary": "Leader election, replicated logs, and quorums \u2014 how a flaky cluster agrees on one truth.",
+      "minutes": 10,
+      "tags": [
+        "consensus",
+        "raft",
+        "paxos",
+        "replication"
+      ],
+      "relatedProblems": [
+        "design-consensus-raft-paxos",
+        "design-distributed-lock",
+        "design-spanner-style"
+      ],
+      "path": "lessons/medium/consensus.html"
+    },
+    {
+      "id": "lesson-distributed-time",
+      "level": "medium",
+      "order": 18,
+      "title": "Distributed time: Lamport, vector clocks, HLC",
+      "summary": "Why wall clocks lie and how logical clocks order events safely across unreliable nodes.",
+      "minutes": 9,
+      "tags": [
+        "clocks",
+        "causality",
+        "ordering",
+        "hlc"
+      ],
+      "relatedProblems": [
+        "design-dynamodb",
+        "design-spanner-style",
+        "design-distributed-transactions"
+      ],
+      "path": "lessons/medium/distributed-time.html"
+    },
+    {
+      "id": "lesson-event-sourcing",
+      "level": "medium",
+      "order": 19,
+      "title": "Event sourcing & CQRS",
+      "summary": "Store the history, not the state \u2014 and split commands from queries to scale them independently.",
+      "minutes": 9,
+      "tags": [
+        "event-sourcing",
+        "cqrs",
+        "audit",
+        "projections"
+      ],
+      "relatedProblems": [
+        "design-distributed-transactions",
+        "design-paypal",
+        "design-wal"
+      ],
+      "path": "lessons/medium/event-sourcing.html"
+    },
+    {
+      "id": "lesson-storage-internals",
+      "level": "medium",
+      "order": 20,
+      "title": "Storage internals: WAL, LSM-tree, B-tree",
+      "summary": "How databases turn random writes into sequential ones, and when to pick LSM over B-tree.",
+      "minutes": 10,
+      "tags": [
+        "storage",
+        "lsm",
+        "btree",
+        "wal"
+      ],
+      "relatedProblems": [
+        "design-lsm-tree",
+        "design-btree-engine",
+        "design-wal"
+      ],
+      "path": "lessons/medium/storage-internals.html"
+    },
+    {
+      "id": "lesson-crdt-vs-ot",
+      "level": "hard",
+      "order": 21,
+      "title": "CRDTs vs OT for collaborative editing",
+      "summary": "Two paths to real-time co-editing: a centralized transform server vs a data structure that merges itself. When each one wins.",
+      "minutes": 12,
+      "tags": [
+        "crdt",
+        "ot",
+        "collaboration",
+        "consistency"
+      ],
+      "relatedProblems": [
+        "design-google-docs",
+        "design-figma"
+      ],
+      "path": "lessons/hard/crdt-vs-ot.html"
+    },
+    {
+      "id": "lesson-lambda-vs-kappa",
+      "level": "hard",
+      "order": 22,
+      "title": "Lambda vs Kappa architecture for analytics",
+      "summary": "Two pipelines or one? The dual-pipeline batch+stream design vs the replay-everything streaming design, and where each is honest about its costs.",
+      "minutes": 11,
+      "tags": [
+        "analytics",
+        "streaming",
+        "batch",
+        "lambda",
+        "kappa"
+      ],
+      "relatedProblems": [
+        "design-funnel-retention",
+        "design-distributed-counter"
+      ],
+      "path": "lessons/hard/lambda-vs-kappa.html"
+    },
+    {
+      "id": "lesson-multi-region",
+      "level": "hard",
+      "order": 23,
+      "title": "Multi-region strategies: active-active vs active-passive",
+      "summary": "RPO, RTO, split-brain, conflict semantics, and the honest trade-offs between paying cross-region latency and tolerating regional sharding.",
+      "minutes": 13,
+      "tags": [
+        "multi-region",
+        "disaster-recovery",
+        "replication",
+        "availability"
+      ],
+      "relatedProblems": [
+        "design-multi-region-failover",
+        "design-twitter-timeline"
+      ],
+      "path": "lessons/hard/multi-region.html"
+    },
+    {
+      "id": "lesson-hot-key",
+      "level": "hard",
+      "order": 24,
+      "title": "The hot-key / celebrity-fanout problem",
+      "summary": "Why uniform hashing doesn't save you from skew, and the read-side and write-side patterns for surviving virality.",
+      "minutes": 12,
+      "tags": [
+        "hot-key",
+        "fanout",
+        "scaling",
+        "skew"
+      ],
+      "relatedProblems": [
+        "design-twitter-timeline",
+        "design-distributed-counter",
+        "design-rate-limiter"
+      ],
+      "path": "lessons/hard/hot-key.html"
+    },
+    {
+      "id": "lesson-backpressure",
+      "level": "hard",
+      "order": 25,
+      "title": "Backpressure & flow control",
+      "summary": "Why most overload outages are backpressure failures, and the bounded-queue/credit/pull patterns that turn overload into graceful degradation.",
+      "minutes": 12,
+      "tags": [
+        "backpressure",
+        "flow-control",
+        "resilience",
+        "queues"
+      ],
+      "relatedProblems": [
+        "design-rate-limiter",
+        "design-distributed-counter"
+      ],
+      "path": "lessons/hard/backpressure.html"
+    },
+    {
+      "id": "lesson-resilience-patterns",
+      "level": "hard",
+      "order": 26,
+      "title": "Resilience patterns: circuit breakers, bulkheads, timeouts",
+      "summary": "Fail fast, isolate blast radius, propagate deadlines \u2014 the three primitives that stop one slow dependency from collapsing the whole graph.",
+      "minutes": 9,
+      "tags": [
+        "resilience",
+        "fault-tolerance",
+        "circuit-breaker",
+        "bulkhead",
+        "timeouts"
+      ],
+      "relatedProblems": [
+        "design-payment-gateway",
+        "design-api-gateway",
+        "design-uber"
+      ],
+      "path": "lessons/hard/resilience-patterns.html"
+    },
+    {
+      "id": "lesson-design-for-10x",
+      "level": "hard",
+      "order": 27,
+      "title": "Designing for 10x growth: how to identify bottlenecks early",
+      "summary": "How to predict the next three bottlenecks, buy cheap optionality at v1, and avoid scaling rewrites under fire.",
+      "minutes": 8,
+      "tags": [
+        "scalability",
+        "capacity",
+        "architecture",
+        "growth"
+      ],
+      "relatedProblems": [
+        "design-url-shortener",
+        "design-twitter",
+        "design-instagram"
+      ],
+      "path": "lessons/hard/design-for-10x.html"
+    },
+    {
+      "id": "lesson-capacity-planning",
+      "level": "hard",
+      "order": 28,
+      "title": "Capacity planning with real numbers (back-of-envelope)",
+      "summary": "Memorize a small set of constants, multiply through, and turn product specs into QPS, storage, and bandwidth in three minutes.",
+      "minutes": 9,
+      "tags": [
+        "capacity",
+        "estimation",
+        "interview",
+        "boe"
+      ],
+      "relatedProblems": [
+        "design-youtube",
+        "design-twitter",
+        "design-whatsapp"
+      ],
+      "path": "lessons/hard/capacity-planning.html"
+    },
+    {
+      "id": "lesson-approx-algorithms",
+      "level": "hard",
+      "order": 29,
+      "title": "Approximate algorithms at interview scale",
+      "summary": "Bloom, HyperLogLog, Count-Min, Misra-Gries / Space-Saving, and t-digest \u2014 what each one estimates, the math intuition, and when to reach for it.",
+      "minutes": 11,
+      "tags": [
+        "probabilistic",
+        "streaming",
+        "data-structures",
+        "sketches"
+      ],
+      "relatedProblems": [
+        "design-trending-topics",
+        "design-distributed-cache",
+        "design-metrics-system"
+      ],
+      "path": "lessons/hard/approx-algorithms.html"
+    },
+    {
+      "id": "lesson-interview-frame",
+      "level": "hard",
+      "order": 30,
+      "title": "The 12-step interview frame: how to deliver an HLD answer",
+      "summary": "A canonical 12-section structure (problem -> FRs -> NFRs -> capacity -> API -> architecture -> data -> components -> scaling -> trade-offs -> DDIA -> rationale) with phrasing cues for each step.",
+      "minutes": 10,
+      "tags": [
+        "interview",
+        "framework",
+        "communication",
+        "structure"
+      ],
+      "relatedProblems": [
+        "design-twitter",
+        "design-uber",
+        "design-dropbox"
+      ],
+      "path": "lessons/hard/interview-frame.html"
+    }
+  ]
+}

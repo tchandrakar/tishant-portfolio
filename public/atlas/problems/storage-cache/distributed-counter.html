@@ -1,0 +1,193 @@
+<h1>Design Distributed Counter (per-tweet view counter at 1M+ events/sec)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">storage-cache</span>
+  <span class="tag">analytics</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a sharded counter service that increments per-object counters (tweet views, like counts, ad impressions) at 1M+ events/sec globally, returns a "good enough" value with sub-100 ms staleness, and an exact value within 1 minute. Must survive node loss, deduplicate retried events, and remain cheap (no per-event ACID writes to OLTP).</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>incr(objectId, delta=1, eventId) — idempotent on eventId.</li>
+  <li>get(objectId) → approxCount (fresh ≤ 1s) and exactCount (≤ 1 min).</li>
+  <li>Time-bucketed reads: count in last 1 min / 1 hr / 1 day.</li>
+  <li>Per-tenant rate limits and admission control.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Throughput:</b> 1M increments/sec sustained, 5M peak (live event).</li>
+  <li><b>Latency:</b> incr p99 &lt; 20 ms (fire-and-forget); get p99 &lt; 50 ms.</li>
+  <li><b>Accuracy:</b> approx within 1% of true; exact within 60s SLA.</li>
+  <li><b>Durability:</b> No more than 1s of events lost on broker failure.</li>
+  <li><b>Cost:</b> &lt; $0.10 per million increments end-to-end.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>1M events/sec * 100 B = 100 MB/s; partitioned across 100 Kafka partitions = 1 MB/s/partition.</li>
+  <li>Active hot objects: 100k tweets with QPS &gt; 100; long-tail: 10B objects with QPS &lt; 1.</li>
+  <li>Storage: 10B counters * 32 B (id+count+ts) = 320 GB resident in Redis, plus rollups 1 TB in Cassandra.</li>
+  <li>Aggregator memory: 100k partial counters/window/aggregator * 64 B = 6.4 MB; 100 aggregators fit in 1 box.</li>
+  <li>Network: 100 MB/s in, 10 MB/s flush to KV every 1s = 10x reduction.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST /v1/incr  {objectId, delta, eventId, ts}      → 202 Accepted
+GET  /v1/count/{objectId}?mode=approx|exact         → {count, freshnessMs}
+GET  /v1/count/{objectId}/window?w=1m|1h|1d         → {bucket:[{ts,count}...]}
+GET  /v1/topk?ns=tweet&amp;w=5m&amp;k=100                   → [{id,count},...]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[client]──incr──►[edge svc]──►[Kafka topic: events, 100 partitions]
+                                          │
+                                          ▼
+                            [Flink/Samza aggregator]── pre-aggregate 1s tumbling
+                                          │
+                              ┌───────────┼────────────┐
+                              ▼           ▼            ▼
+                       [Redis HLL/INCR][Cassandra ts-rollup][HDFS exact archive]
+                              ▲                              ▲
+                              │                              │
+                          fast read                   nightly batch reconcile
+</div>
+<p>Producers append to Kafka with key=objectId for partition stickiness. Stream job sums per-key in 1s windows and emits deltas to Redis (fast path) and to a time-series rollup in Cassandra (durable). Batch job reconciles exact totals from raw events.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 Redis fast layer</h3>
+<pre>// One key per object, INCRBY is atomic
+counter:{objectId} = int64
+// Bucketed for windowed reads
+window:{objectId}:{minute_epoch} = int64, TTL = 2h</pre>
+<h3>7.2 Cassandra time-rollup</h3>
+<pre>CREATE TABLE counts_by_min (
+  object_id text, bucket_min timestamp,
+  delta counter,
+  PRIMARY KEY ((object_id), bucket_min)
+) WITH CLUSTERING ORDER BY (bucket_min DESC);</pre>
+<p>Cassandra counter columns use vector-clock-style increment merging — eventual consistency, but commutative (DDIA Ch.5 "Conflict-Free Replicated Datatypes"). For exact dedupe we keep a Bloom filter of recent eventIds in Redis (24h TTL).</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Sharding hot keys</h3>
+<p>A single tweet at 100k incr/s exceeds one Redis shard. Split into K logical shards: <code>counter:{tweetId}:{shard0..K-1}</code>; client picks random shard for write, sums all K on read. Adaptive K based on observed QPS (1k QPS/shard target).</p>
+<h3>8.2 Idempotency &amp; dedupe</h3>
+<p>Producer assigns eventId = uuid. Aggregator keeps last 5 min eventIds in a per-window Bloom filter (1% FP, ~10 bits/event). Cross-window exactness comes from batch reconciliation (Lambda architecture, DDIA Ch.10/11).</p>
+<h3>8.3 Approximate count via HLL</h3>
+<p>For "unique viewers" counters use HyperLogLog with 14-bit registers (16 KB) → 1% standard error at billions of cardinalities. Fits in a single Redis key; supports PFMERGE for windowed aggregation.</p>
+<h3>8.4 Backpressure</h3>
+<p>If Kafka lag &gt; 60s, drop fidelity: switch to count-min sketch (CMS) sampling at 10% with extrapolation. Cheaper than dropping events; configurable per-tenant.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot key (Elon tweets):</b> K-way sharding + client-side L1 LRU of read counts (1s TTL).</li>
+  <li><b>Kafka partition skew:</b> partition by hash(objectId)+rand%K for hot keys; consumer rebalances are expensive — pin assignments.</li>
+  <li><b>Cassandra counters anti-pattern:</b> retried writes can double-count; we mitigate by never retrying the counter write — instead replay from Kafka.</li>
+  <li><b>Clock skew:</b> 1-min buckets tolerate ~10s skew; use ingestion ts (broker) not client ts.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Pre-aggregate in Flink</td><td>10x fewer KV writes, smooth latency</td><td>Adds 1s end-to-end staleness</td></tr>
+<tr><td>Redis INCR fast path</td><td>Sub-ms reads</td><td>Lost on cache flush; durable copy in Cassandra</td></tr>
+<tr><td>HLL for unique counts</td><td>Constant memory regardless of cardinality</td><td>1% error; can't undo a count</td></tr>
+<tr><td>Lambda (stream+batch)</td><td>Speed + correctness</td><td>Two codepaths to maintain (DDIA Ch.10)</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch.5 Replication — counter merge as CRDT (commutative); Cassandra counter caveats.</li>
+  <li>Ch.6 Partitioning — hot-key sharding via key-suffix; rebalancing across consumer groups.</li>
+  <li>Ch.10 Batch Processing — nightly reconciliation from raw events for exact ground truth.</li>
+  <li>Ch.11 Stream Processing — windowed aggregation, exactly-once via Kafka+Flink checkpoints.</li>
+  <li>Ch.9 Consistency — why "exact" requires a settled batch view, not stream.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"For 99% of products an approximate count via Redis INCR with 1s lag is enough; exact reconciliation is a $/SLA decision."</li>
+  <li>"The hardest bug at scale is double-counting on retry — we anchor exactness in Kafka offsets, not in the counter store itself."</li>
+  <li>"I'd build with Kappa (stream-only) if Flink exactly-once is acceptable, dropping the batch path entirely (DDIA Ch.11)."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Kafka (100 partitions on events topic)</td>
+      <td>Durable log absorbs 1M events/sec * 100 B = 100 MB/s with 1s lost-write SLA via leader ack=1 + replication. Partition-by-objectId gives stickiness so all increments for a tweet land at one consumer (DDIA Ch.11 stream processing). Offsets anchor exactly-once.</td>
+      <td>Pulsar (similar, less ecosystem); RabbitMQ (no durable log replay for batch reconcile).</td>
+    </tr>
+    <tr>
+      <td>Flink stream aggregator</td>
+      <td>Tumbling 1s windows pre-aggregate per-key sums, cutting downstream KV writes 10x (100 MB/s in → 10 MB/s out). Exactly-once via Kafka source + checkpoint barriers prevents the double-count bug that kills Cassandra counter retries.</td>
+      <td>Samza (similar, smaller community); Kafka Streams (lacks robust event-time windowing at this scale).</td>
+    </tr>
+    <tr>
+      <td>Redis INCRBY for fast path</td>
+      <td>Atomic single-threaded increment at sub-ms latency hits the get p99 &lt;50 ms target with massive headroom. INCR is O(1) and race-free without app-level locks. 320 GB working set fits across ~6 shards comfortably.</td>
+      <td>Memcached incr (no persistence); App-level CAS loop (10x latency, contention).</td>
+    </tr>
+    <tr>
+      <td>Cassandra counter columns</td>
+      <td>Counter columns merge via CRDT-style commutative increment (DDIA Ch.5) — perfect for multi-replica eventual consistency. Time-series partition key (object_id, bucket_min) supports windowed reads with 1-row-per-minute density.</td>
+      <td>DynamoDB ADD (vendor lock, $/op); Postgres counters (write-lock contention at 1M/s).</td>
+    </tr>
+    <tr>
+      <td>HyperLogLog for unique counts</td>
+      <td>14-bit HLL registers fit in 16 KB and give 1% std error at billion-scale cardinalities — exact set membership would need TBs. PFMERGE supports windowed unique-viewer aggregation across shards. Constant memory regardless of input.</td>
+      <td>Set/HashSet (memory blows up); KMV sketch (worse error-per-byte ratio).</td>
+    </tr>
+    <tr>
+      <td>Bloom filter for eventId dedupe (24h TTL)</td>
+      <td>Producer-assigned UUID + Bloom check eliminates duplicate increments from retried events. 1% FP at ~10 bits/event covers 5 min of 1M events/s in ~600 MB; cross-window exactness comes from batch reconciliation (DDIA Ch.10).</td>
+      <td>Exact KV dedupe (10x memory); no dedupe (over-count on retry).</td>
+    </tr>
+    <tr>
+      <td>K-way logical sharding for hot keys</td>
+      <td>Single tweet at 100k incr/s exceeds one Redis shard's 100k ops/sec ceiling. Splitting into <code>{tweetId}:{shardN}</code> with random write + sum-on-read trades read cost (K GETs) for write throughput (K-fold). Adaptive K targets 1k QPS/shard.</td>
+      <td>Vertical scaling Redis (single-thread ceiling); pre-sharding all keys (overhead for cold tail).</td>
+    </tr>
+    <tr>
+      <td>Count-min sketch (backpressure mode)</td>
+      <td>When Kafka lag &gt;60s, switch to CMS sampling at 10% with extrapolation — cheaper than dropping events outright. Preserves the within-1% accuracy SLA at the cost of momentary fidelity. Per-tenant configurable.</td>
+      <td>Drop events (violates SLA); slow path with full fidelity (cascading lag).</td>
+    </tr>
+    <tr>
+      <td>HDFS exact archive + nightly batch</td>
+      <td>Lambda architecture (DDIA Ch.10/11): raw events archived for ground-truth reconciliation when the 60s exact SLA matters. Batch sums over 24h are deterministic and replayable, catching any stream-side drift before it pollutes long-term rollups.</td>
+      <td>Stream-only Kappa (acceptable but no recovery from stream bugs); S3 only (HDFS preferred for batch locality).</td>
+    </tr>
+    <tr>
+      <td>Broker ingestion timestamp (not client clock)</td>
+      <td>1-min buckets tolerate ~10s skew, but client clocks drift wildly across mobile devices. Using Kafka broker timestamp (NTP-disciplined, ~10ms) keeps bucket assignments deterministic and avoids late-data tail (DDIA Ch.8 unreliable clocks).</td>
+      <td>Client timestamp (skew breaks bucketing); ingestion-time at edge svc (extra hop variance).</td>
+    </tr>
+    <tr>
+      <td>Edge service (HTTP → Kafka producer)</td>
+      <td>Decouples client retry semantics from Kafka. 202 Accepted returns immediately (sub-20 ms p99) so callers don't wait for downstream aggregation. Owns rate limiting + admission control per tenant on the request hot path.</td>
+      <td>Direct Kafka produce from clients (auth complexity, version drift); sync ack (latency cost).</td>
+    </tr>
+    <tr>
+      <td>Per-tenant token bucket admission</td>
+      <td>Multi-tenant 1M ops/s service needs noisy-neighbor isolation; token bucket per tenant drops excess at the edge before Kafka sees it, protecting downstream from runaway producers and preserving budget for fair tenants.</td>
+      <td>No admission (one tenant DOSes pipeline); fixed quota (no burst tolerance).</td>
+    </tr>
+    <tr>
+      <td>Pinned consumer assignments</td>
+      <td>Consumer rebalances stall the entire group for 5-30s — unacceptable at 1M events/s. Pinning partitions to consumer instances keeps Flink checkpoints cheap and avoids the partition-skew amplification when consumers shuffle.</td>
+      <td>Default range/round-robin (frequent rebalance); cooperative sticky (better but Kafka 2.4+).</td>
+    </tr>
+    <tr>
+      <td>Prometheus metrics on Kafka lag, Redis QPS, CMS error</td>
+      <td>The three leading indicators for the failure modes in section 9. Lag &gt;60s triggers CMS fallback; Redis shard QPS &gt;80% triggers K-way reshard; CMS error &gt;1% alerts ops. Pull-scrape every 15s is cheap relative to event volume.</td>
+      <td>Push StatsD (counter loss on agent restart); polling INFO only (no time-series).</td>
+    </tr>
+  </tbody>
+</table>

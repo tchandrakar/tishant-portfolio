@@ -1,0 +1,85 @@
+<h1>Multi-region strategies: active-active vs active-passive</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">multi-region</span>
+  <span class="tag">disaster-recovery</span>
+  <span class="tag">replication</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p><b>Active-passive</b> sends all traffic to a primary region; the secondary is hot, replicated, and idle until failover. <b>Active-active</b> serves traffic from every region all the time; users hit the closest one and writes replicate cross-region. Active-passive is conceptually simple — there's always one source of truth — but you waste capacity and failover is a cliff. Active-active gives lower latency and elastic capacity but forces you to confront concurrent writes, cross-region consistency, and split-brain.</p>
+
+<h2>Why it matters</h2>
+<p>Below ~99.9% availability, single-region is fine. Above that, AZ-level redundancy isn't enough — you need to survive an entire region going down (AWS us-east-1 has had multi-hour outages). Multi-region is also driven by latency (a user in Sydney shouldn't pay 200ms RTT to us-east-1) and data residency (EU data must stay in EU). The strategy you pick cascades into your data model, your auth, and your incident playbook.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Stripe:</b> Active-active for read, primary-region for writes (users pinned). Multi-region transactional store with careful conflict scopes.</li>
+  <li><b>DynamoDB Global Tables:</b> Active-active leaderless, last-writer-wins per item. Cheap to opt into, conflict semantics are your problem.</li>
+  <li><b>Spanner / CockroachDB:</b> Active-active with consensus per range — strongly consistent across regions but writes pay quorum latency.</li>
+  <li><b>Most Postgres shops:</b> Active-passive with streaming replication; failover via Patroni/RDS Multi-AZ + manual cross-region promote.</li>
+  <li><b>Netflix:</b> Active-active across 3 AWS regions; user state replicated via Cassandra; "evacuate a region in 7 minutes" drills.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">ACTIVE-PASSIVE
+   users --> [ Region A: primary ]  --replicate--> [ Region B: standby ]
+              writes + reads                          (warm, idle)
+   failover: DNS/anycast flip, promote B to primary, hope replication lag was zero
+
+ACTIVE-ACTIVE (regional sharding)
+   EU users --> [ Region EU ] <--replicate--> [ Region US ] <-- US users
+   each region owns a shard of users; cross-shard writes are rare and slow
+
+ACTIVE-ACTIVE (global consensus)
+   any user --> [ A | B | C ]  Paxos/Raft per data range, quorum across regions
+   writes pay 1 cross-region RTT; reads can be local-leaseholder
+</div>
+<p>The three modes differ in <i>where the leader lives</i>. Active-passive: one region. Regional-sharded active-active: leader per shard, pinned to a region. Global-consensus active-active: leader can be anywhere, voted by quorum.</p>
+
+<h2>RPO and RTO — the only numbers that matter</h2>
+<ul>
+  <li><b>RPO (Recovery Point Objective):</b> how much data you're willing to lose. Async replication = RPO of seconds-to-minutes. Sync = RPO of zero.</li>
+  <li><b>RTO (Recovery Time Objective):</b> how long until you're serving again. Manual promotion = 30+ minutes. Automated with health checks = 1–5 minutes. Active-active = effectively zero (drain the dead region).</li>
+  <li><b>Honest math:</b> async replication with 30s lag means a region failure can lose 30s of writes. If those are payments, that's a real conversation with finance.</li>
+</ul>
+
+<h2>Conflict handling in active-active</h2>
+<ul>
+  <li><b>Pin users to a home region:</b> The cheapest correct option. User writes only ever happen in their home region; the other region has a read replica. No conflicts, but cross-region users pay latency.</li>
+  <li><b>Last-writer-wins (LWW):</b> Easy, lossy. Two concurrent edits — one silently disappears. Fine for "last seen at" timestamps, terrible for shopping carts.</li>
+  <li><b>CRDTs:</b> Counters, sets, registers that merge deterministically. Good for like-counts, presence, collaborative state.</li>
+  <li><b>Per-shard consensus:</b> Spanner-style. Strong consistency, but you pay the cross-region RTT on every write. Use sparingly (e.g., money movement).</li>
+  <li><b>Saga / compensating transactions:</b> When you need cross-region atomicity, give up on it — design business-level undo.</li>
+</ul>
+
+<h2>Anti-patterns and failure modes</h2>
+<ul>
+  <li><b>Split-brain:</b> Network partition between regions. Both sides think they're primary, both accept writes. Reconciliation is misery. Use a witness/arbiter region or fencing tokens.</li>
+  <li><b>Untested failover:</b> The standby has been there for 3 years. The day you flip to it, half your auth tokens are signed by a key the standby doesn't have. Run quarterly game days.</li>
+  <li><b>Asymmetric capacity:</b> Active-active where each region runs at 60% capacity, but if one dies the other has to absorb 120% — and immediately tips over. Plan for N+1 regions, not just N.</li>
+  <li><b>DNS TTL traps:</b> Failover relies on DNS but client TTL is 1 hour. Half your users keep hitting the dead region. Use anycast or short TTLs (with cost awareness).</li>
+  <li><b>Replication lag amplification:</b> A user writes to region A, immediately reads from region B (closer to them), sees stale data, retries the write. Now you have duplicate writes. Use read-your-writes routing, sticky sessions, or causal tokens.</li>
+  <li><b>Cross-region chatty services:</b> One transaction makes 12 cross-region calls. Each is 80ms. p99 latency is now 1+ second. Co-locate dependent services.</li>
+  <li><b>Forgetting blast radius shared services:</b> Auth, config, feature flags all live in one region. The "multi-region" app falls over when that region dies. Replicate the spine.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Choosing active-active for marketing reasons when active-passive with a tested 5-minute failover would meet the SLA at half the cost.</li>
+  <li>Treating "global table" features as a substitute for thinking about conflict semantics.</li>
+  <li>Not accounting for cross-region egress costs — they're substantial and surprise finance teams.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're designing a global ride-hailing app. Drivers and riders are physically in one city. Trip records, payment records, and user profiles all need to be highly available. Which data goes active-active, which goes active-passive, and where does the leader live for a payment?
+  <br/>
+  <b>Hint:</b> Think about which entities are "naturally regional" (a Tokyo trip never needs Frankfurt's view) vs "globally referenced" (a user logging in while traveling). And payments — would you rather lose the trip or double-charge?
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-multi-region-failover">Design a multi-region failover system</a> — RPO/RTO drills end-to-end.</li>
+  <li><a href="#problem/design-twitter-timeline">Design Twitter's timeline</a> — globally readable, regionally written.</li>
+</ul>

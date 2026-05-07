@@ -1,0 +1,77 @@
+<h1>Designing for 10x growth: how to identify bottlenecks early</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">scalability</span>
+  <span class="tag">capacity</span>
+  <span class="tag">architecture</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>"Designing for 10x" is not about over-engineering for a future that may never come — it is about identifying which components will be the <i>first three</i> to fall over when traffic multiplies, and making sure those components have a clear escape hatch. Every system has a hierarchy of bottlenecks: at any moment one resource is saturated first, and once you remove it another one takes its place. Good designers can list the next two bottlenecks before they hit, and have a low-risk migration path queued for each.</p>
+
+<h2>Why it matters</h2>
+<p>Companies rarely die from "not enough scale headroom." They die from <i>scaling rewrites</i> — being forced to swap a database or split a monolith while on fire. The cheap moment to design for 10x is at v1, when you pick the schema, the partition key, the queue, and the cache topology. The expensive moment is in the middle of an outage at v2.5. The mantra: "build for today, but make sure tomorrow's bottleneck is one you can swap, not one you have to rewrite around."</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>Twitter timeline (2008–2012):</b> the original pull-on-read design hit a celebrity-fanout wall; the fix was a hybrid push/pull that took years.</li>
+  <li><b>Instagram early days:</b> scaled Postgres to billions of rows by sharding by user_id early, before the table was unmanageable.</li>
+  <li><b>Slack message storage:</b> moved from a single MySQL primary per workspace to Vitess shards as the largest customers passed millions of messages.</li>
+  <li><b>Stripe API:</b> idempotency keys and request IDs were in v1, which made later retries-and-async-processing additions safe.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">  Find the bottleneck stack:
+  +-----------------------------+
+  |  1. Single hot row / key    |  <- usually first to die
+  +-----------------------------+
+  |  2. Single DB primary       |
+  +-----------------------------+
+  |  3. Single queue / topic    |
+  +-----------------------------+
+  |  4. Sync fan-out chain      |
+  +-----------------------------+
+  |  5. App-tier CPU            |  <- last to die, easy to scale
+  +-----------------------------+
+
+  For each layer ask:
+    - what saturates first? (CPU? IOPS? lock? connection pool?)
+    - is the fix horizontal (add nodes) or surgical (rewrite)?
+    - what's the migration cost at 1x vs 10x?
+</div>
+<p>The pattern: <i>state</i> bottlenecks (rows, keys, partitions) are catastrophic to fix late; <i>stateless</i> bottlenecks (CPU, app servers) are nearly free. Spend design effort proportional to migration cost.</p>
+
+<h2>Diagnosing the next bottleneck</h2>
+<p>Use a structured drill-down. (1) <b>Pick the metric that defines saturation</b> for each tier: DB → IOPS or replication lag, queue → consumer lag, cache → hit-rate and eviction-rate, app → p99 latency. (2) <b>Project at 10x</b>: linearly scale ingress traffic and ask which metric crosses red first. (3) <b>Identify the fix class</b>: add replicas (cheap), shard (medium), re-key the partition scheme (expensive), change the storage engine (very expensive). (4) <b>Pre-pay the cheap optionality</b>: even if you don't shard now, design with a partition key in your schema so sharding later is mechanical.</p>
+
+<h2>Cheap optionality you should buy at v1</h2>
+<ul>
+  <li><b>Idempotency keys</b> on every write API — required to retry safely later.</li>
+  <li><b>Schema with a tenant/shard column</b> even on a single DB — splits later become rehoming, not redesign.</li>
+  <li><b>Async outbox</b> for cross-service writes — lets you decouple consumers without 2PC.</li>
+  <li><b>Read/write split at the data layer</b> from day one — even if both point to the same node.</li>
+  <li><b>Strong observability primitives</b> (request IDs, structured logs, RED metrics) — you cannot tune what you cannot see.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Sharding too early. Adds complexity and obscures the real bottleneck (often the cache).</li>
+  <li>Optimizing the easy tier (app CPU) while ignoring the hard tier (a single hot row).</li>
+  <li>Using "we'll add a queue" as a magic answer — queues hide pressure, they don't remove it.</li>
+  <li>No load test. Synthetic 10x traffic is the only honest signal.</li>
+  <li>Forgetting that 10x writes is also 10x replication traffic, 10x backup volume, and 10x analytics ingest.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> A URL shortener handles 1k QPS reads and 100 QPS writes today on a single Postgres + Redis. Sketch what breaks first at 10x (10k/1k) and at 100x (100k/10k). For each break, name the change and whether it requires a rewrite.
+  <br/>
+  <b>Hint:</b> At 10x: cache hit-rate matters more than DB size; Postgres reads are still fine but writes start to push WAL throughput. At 100x: you need to shard by short-code prefix or move to a KV store. Plan the partition key now so the 100x move is data migration, not redesign.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-url-shortener">Design a URL shortener</a> — canonical "what scales linearly, what doesn't" exercise.</li>
+  <li><a href="#problem/design-twitter">Design Twitter</a> — fan-out architecture is the textbook 10x bottleneck.</li>
+  <li><a href="#problem/design-instagram">Design Instagram feed</a> — feed assembly cost grows non-linearly with followers.</li>
+</ul>

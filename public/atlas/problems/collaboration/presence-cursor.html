@@ -1,0 +1,137 @@
+<h1>Design Presence + Live Cursor Service (ephemeral state, broadcast)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">collaboration</span>
+  <span class="tag">messaging</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Build a horizontal "presence" service that any product (Docs, Figma, Slack, Linear) can use: who is online, who is in this room, where are their cursors, what are they typing? The state is purely <b>ephemeral</b> (lost on disconnect), but fan-out is enormous and latency-critical. This is the Liveblocks / Pusher Channels / Slack Presence problem.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Track online/offline status per (user, app, room) tuple.</li>
+  <li>Broadcast cursor (x,y), selection, "typing…", custom JSON state at up to 60 Hz.</li>
+  <li>Subscribe to a room and get the full presence snapshot on join.</li>
+  <li>Detect disconnects within 5 s.</li>
+  <li>Auth: only members of a room may publish or subscribe.</li>
+  <li>Multi-tenant: thousands of customer apps share infra.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> broadcast p99 &lt; 50 ms within region, &lt; 150 ms cross-region.</li>
+  <li><b>Scale:</b> 50 M concurrent connections, 5 M rooms, 10 GB/s aggregate cursor traffic.</li>
+  <li><b>Durability:</b> none required — losing presence is acceptable.</li>
+  <li><b>Availability:</b> 99.95%; partial outages must degrade per-region, not globally.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>50 M conns × avg 2 rooms each = 100 M (conn, room) subscriptions.</li>
+  <li>Cursor publish: ~30 Hz × avg 10 active publishers / room × 5 M rooms × 16 B = 24 GB/s pre-fanout. Most rooms idle so realistic peak ~3 GB/s.</li>
+  <li>Fanout multiplier: avg 8 viewers / room → 24 GB/s egress.</li>
+  <li>Memory: 50 M conns × ~4 KB state = 200 GB across the fleet.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>WS  /v1/connect?token=jwt           → { connId }
+WS  C2S { type:"join",   roomId }
+WS  C2S { type:"presence", roomId, state:{cursor,sel,typing} }   // 60 Hz
+WS  C2S { type:"leave",  roomId }
+WS  S2C { type:"snapshot", roomId, peers:[{id,state}] }
+WS  S2C { type:"update",   roomId, peerId, state }
+WS  S2C { type:"left",     roomId, peerId }
+GET  /v1/rooms/{id}/presence         → snapshot (REST)</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Client]──WS──&gt;[Edge LB (anycast)]──&gt;[Edge WS Server (Rust/Go)]
+                                              │
+                                              ├─local fanout for same-edge subscribers
+                                              │
+                                              └─&gt;[Room Router (consistent hash)]──&gt;[Room Shard]
+                                                                                     │
+                                                                                     └─pub/sub to peer Edge servers
+                                              [Redis Cluster] = subscription index, KV for snapshots
+                                              [Heartbeat watchdog] for disconnect detection
+</div>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 In-memory only</h3>
+<pre>RoomState {
+  roomId,
+  members: Map&lt;peerId, { state, lastSeen, ownerEdge }&gt;,
+  subscribers: Set&lt;edgeId&gt;          // which edges have subscribers
+}</pre>
+<p>Each room is owned by one Room Shard process. Edge servers locally cache the slice of state relevant to their connected peers and receive deltas from the owner.</p>
+<h3>7.2 Redis usage</h3>
+<p>Redis is the source-of-truth for the routing table only: <code>room:{id}:owner → shardId</code>, <code>conn:{id}:rooms → set</code>. Cursor state itself never goes to Redis (too hot). DDIA Ch.5 (gossip / multi-leader) describes the same trade-off.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Connection layer</h3>
+<p>Stateless edge WS servers behind anycast. Use SO_REUSEPORT + io_uring on Linux to handle ~500K conns/box. JWT auth on connect; token includes app_id and allowed roomId glob.</p>
+<h3>8.2 Room ownership</h3>
+<p>Consistent hash on roomId picks a Room Shard. Owner shard maintains the canonical member list and broadcasts updates. On shard failure, watchdog reassigns ownership in &lt; 2 s; clients see at most one snapshot replay.</p>
+<h3>8.3 Fanout strategy</h3>
+<p>Two-tier: Room Shard sends one message per <i>Edge</i> that has subscribers (not per subscriber). Edge then locally fans out to its peers. With 1k subs spread across 50 edges, this is 50× cheaper than naive fanout.</p>
+<h3>8.4 Rate limiting</h3>
+<p>Per-conn token bucket: 60 publish/s for cursors, 5/s for non-cursor. Drops oldest on overflow (cursor freshness &gt; completeness).</p>
+<h3>8.5 Disconnect detection</h3>
+<p>Bidirectional ping every 5 s, declared dead at 12 s. Edge proactively notifies Room Shard, which broadcasts <code>left</code>. Without this, ghost cursors linger.</p>
+<h3>8.6 Cross-region</h3>
+<p>Each region has its own Room Shards. A room with members in multiple regions gets a "primary" region (where the room was created) and other regions subscribe via a tunneled WS. Adds ~80 ms cross-region but bounded.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Hot room (livestream w/ 100k viewers):</b> Room Shard becomes CPU-bound on fanout; degrade to read-only mode (snapshot every 1 s instead of per-update).</li>
+  <li><b>Thundering herd on shard failover:</b> 500K conns try to resnapshot — solved by jittered backoff (random 0–5 s).</li>
+  <li><b>Cursor flood:</b> per-publisher coalescing — only the last cursor in a 33ms window survives; others dropped.</li>
+  <li><b>Cost:</b> persistent WS conns are expensive. Idle rooms downgrade to long-poll after 60 s no activity.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Ephemeral, no durability</td><td>RAM-only, cheap, fast</td><td>Snapshot lost on shard restart</td></tr>
+<tr><td>Two-tier fanout</td><td>50× egress savings on hot rooms</td><td>Edge complexity; partial-failure modes</td></tr>
+<tr><td>Consistent hash by roomId</td><td>Even spread, simple</td><td>Hot room overloads one shard; need split</td></tr>
+<tr><td>Per-region primary</td><td>Local-first latency</td><td>Cross-region members see ~80 ms extra</td></tr>
+<tr><td>Coalesce cursors</td><td>Tames 60 Hz floods</td><td>Slightly stale cursors at edges</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 5 Replication — multi-leader / gossip is the right model for ephemeral, low-stakes state.</li>
+  <li>Ch. 8 Trouble with Distributed Systems — heartbeat-based failure detection &amp; the impossibility of perfect detection (Chandra-Toueg).</li>
+  <li>Ch. 11 Stream Processing — pub/sub fanout patterns, backpressure.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"Presence is the canonical 'big fanout, no durability' problem; treating it like a normal CRUD service is the #1 mistake."</li>
+  <li>"I'd lean hard on Rust/Go for the edge — GC pauses on 500K conns are death; tail latency dominates everything."</li>
+  <li>"For the interview, the key insight is: shard by roomId, fan out by edge, coalesce in time."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td>WebSocket (edge transport)</td><td>50 M concurrent persistent conns need bidirectional push under 50 ms. WS over TLS works through every corporate proxy and lets us keep state per-conn for fast fanout. We do NOT need OT or CRDT here — presence is ephemeral and last-writer wins by definition.</td><td>WebTransport (viable for cursor-only path; rejected today for browser support gaps); SSE (rejected: half-duplex doubles RTT for 60 Hz publishes).</td></tr>
+    <tr><td>Rust/Go edge servers</td><td>500 K conns/box at 60 Hz publish each = 30 M ops/s/box on the fanout path. GC pauses on 50 M conns turn into 200 ms+ tail-latency spikes; Rust + tokio (or Go with tuned GOGC) hold p99 broadcast under 50 ms.</td><td>Java/Netty (rejected: GC tail latency); Node.js (rejected: single-threaded saturates at ~50 K conns/box).</td></tr>
+    <tr><td>SO_REUSEPORT + io_uring</td><td>Per-box conn target is 500 K. SO_REUSEPORT spreads accept across cores; io_uring removes syscall overhead per packet, giving ~3× throughput vs epoll on cursor traffic where each message is 16 B.</td><td>epoll (rejected: ~30% lower throughput at our message rate); kqueue (Linux-only fleet, irrelevant).</td></tr>
+    <tr><td>Anycast LB</td><td>Clients must hit the closest edge for &lt; 50 ms p99 in-region. Anycast routes to the topologically nearest PoP at the IP layer with no DNS dependency, beating GeoDNS (which can mis-route 5–10% of users due to resolver location).</td><td>GeoDNS (rejected: misroute rate); GSLB w/ healthchecks (rejected: minute-scale convergence on failure).</td></tr>
+    <tr><td>Redis Cluster (routing only)</td><td>Source-of-truth for room→shard mapping and conn→rooms set; never holds cursor state. ~5 M rooms × ~32 B routing entries = 160 MB, easily fits in one Redis Cluster with sub-ms lookup, our 50 ms broadcast budget tolerates one Redis hop on join.</td><td>Postgres (rejected: 5–20 ms latency on a hot lookup); etcd (rejected: not designed for high read-fanout KV).</td></tr>
+    <tr><td>Consistent hash by roomId</td><td>Even spread across Room Shards with minimal re-shuffling on node churn. Hashing on roomId means all members of a room land on one owner, eliminating the cross-shard fan-out problem inside the canonical state path.</td><td>Random LB + global table (rejected: every publish pays a Redis hop); Maglev (viable but added complexity).</td></tr>
+    <tr><td>Two-tier fanout (shard → edge → conn)</td><td>1k subs across 50 edges costs 50 messages from shard, not 1k. 50× egress savings on hot rooms (livestreams with 100k viewers). Edge does local memcpy fanout — sub-microsecond per recipient — while shard CPU stays free for ordering.</td><td>Direct shard→conn fanout (rejected: shard becomes egress bottleneck on hot rooms); per-conn pull (rejected: 50× more upstream load).</td></tr>
+    <tr><td>Heartbeat watchdog (5 s ping / 12 s dead)</td><td>Disconnect detection within 5 s SLA. Bidirectional pings every 5 s catch silent half-opens that TCP keepalive (default 2 hr) misses. 12 s dead threshold absorbs one missed ping without false-positive ghost cursors.</td><td>TCP keepalive only (rejected: 2 hr default); single missed ping (rejected: false positives on 1 s GC blip).</td></tr>
+    <tr><td>JWT auth (per-conn)</td><td>Multi-tenant with thousands of customer apps. JWT signed by central auth carries app_id + allowed roomId glob, validated locally at the edge with no auth roundtrip — critical because each connect would otherwise add 20–50 ms.</td><td>Session cookie + auth lookup (rejected: edge needs DB access); mTLS (rejected: ops overhead for browser clients).</td></tr>
+    <tr><td>In-memory state (no durability)</td><td>"Losing presence on shard restart is acceptable" — the requirement frees us from any persistence. RAM-only is 100× cheaper than backing 200 GB across the fleet to disk; clients re-snapshot on reconnect, which is the existing happy path.</td><td>Persistent KV (rejected: 100× cost for zero benefit); CRDT presence (rejected: ephemeral data should never be in a CRDT).</td></tr>
+    <tr><td>Cursor coalescing (33 ms window)</td><td>60 Hz publishes flood the network when 100 publishers in a room all wiggle. Per-publisher coalescing keeps only the last cursor in each 33 ms slot — humans can't see faster anyway. Saves ~50% of fanout bytes on hot rooms.</td><td>No coalescing (rejected: 2× egress cost); server-side rate limit only (rejected: drops freshness, not stale data).</td></tr>
+    <tr><td>Per-region primary room</td><td>50 ms in-region SLO requires local writes. Each room has a primary region (where created); other regions tunnel via WS. Adds bounded ~80 ms cross-region but keeps single-writer ordering — vital for "join" snapshots.</td><td>Multi-region active-active (rejected: ordering ambiguity on join snapshots); pinned home region forever (chosen — region migration is rare and manual).</td></tr>
+    <tr><td>Idle-conn long-poll downgrade</td><td>Persistent WS conns cost RAM (~4 KB each) and TCP slots. After 60 s of zero activity in all subscribed rooms we downgrade to long-poll, saving ~30% of conn cost on the typical user with most rooms idle, with a 1–2 s wake latency we accept.</td><td>Always-on WS (rejected: 30% wasted RAM); BFF push notifications (rejected: mobile-only, web stays WS).</td></tr>
+  </tbody>
+</table>

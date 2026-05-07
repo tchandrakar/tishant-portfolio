@@ -1,0 +1,59 @@
+<h1>Load balancers: L4 vs L7, algorithms</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Easy</span>
+  <span class="tag">load-balancing</span>
+  <span class="tag">networking</span>
+  <span class="tag">routing</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>A load balancer is the traffic cop sitting in front of your fleet of servers. Clients talk to <i>it</i>; it picks a healthy backend and forwards the request. The two big choices are <b>where in the network stack it operates</b> (L4 = transport / TCP, L7 = application / HTTP) and <b>how it picks a backend</b> (round-robin, least connections, consistent hashing, and friends). These choices decide what your load balancer can <i>see</i> and how evenly traffic actually distributes.</p>
+
+<h2>Why it matters</h2>
+<p>Without a load balancer, horizontal scaling is impossible — clients would have to know every server's IP. With one, you get a single virtual endpoint, automatic failover when a node dies, rolling deploys without downtime, and the ability to slice traffic by URL, header, or cookie. Almost every web architecture you'll design starts with "users hit a load balancer, which routes to..." — so it pays to know exactly which kind to draw.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>AWS NLB / GCP TCP LB:</b> classic L4 — fast, blind to HTTP, used for raw TCP, gaming, databases.</li>
+  <li><b>AWS ALB / NGINX / HAProxy in HTTP mode:</b> L7 — can route by path, host, header; can terminate TLS.</li>
+  <li><b>Envoy / Istio:</b> L7 service-mesh proxies with retries, circuit breaking, mTLS.</li>
+  <li><b>Memcached client / Cassandra coordinator:</b> consistent hashing — same key always goes to the same node, so caches stay warm.</li>
+</ul>
+
+<h2>The mental model</h2>
+<div class="ascii-diagram">       client
+         |
+         v
+  +---------------+    L4: routes by (src IP, src port, dst IP, dst port)
+  | Load Balancer |    L7: routes by URL path, Host header, cookie...
+  +---------------+
+     /    |    \
+    v     v     v
+  [B1]  [B2]  [B3]   <-- backends, picked by an algorithm:
+                          - round-robin: B1, B2, B3, B1...
+                          - least-conn:  whichever has fewest open conns
+                          - hash(key):   user 42 -> always B2
+</div>
+<p>L4 is a dumb-but-fast packet forwarder; it can't read the HTTP body. L7 parses the request, so it can do path-based routing (<code>/api</code> → API fleet, <code>/static</code> → CDN origin) at the cost of more CPU.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Using round-robin for long-lived connections (WebSockets, gRPC). One unlucky node ends up with all the heavy clients — use least-connections instead.</li>
+  <li>Putting an L4 LB in front of services that need sticky sessions or path routing. You'll either build your own routing in the app or have to upgrade.</li>
+  <li>Forgetting health checks. A "healthy" port-open check passes even when the app is deadlocked. Use an HTTP <code>/healthz</code> that exercises a real dependency.</li>
+  <li>Ignoring consistent hashing. With plain hash-mod-N, adding one node remaps almost every key — your cache hit ratio collapses.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're running a chat service with 1M concurrent WebSocket connections across 20 backend servers. You currently use round-robin DNS. You add 5 more servers and traffic stays unbalanced — the old servers are still pegged. Why? Which algorithm and which LB layer would you switch to?
+  <br/>
+  <b>Hint:</b> Round-robin balances <i>new</i> connections, not <i>active</i> ones. Long-lived connections never rebalance on their own.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-whatsapp">Design WhatsApp</a> — L7 routing for chat plus sticky WebSocket assignment.</li>
+  <li><a href="#problem/design-redis-cluster">Design Redis Cluster</a> — consistent hashing as a load-distribution primitive.</li>
+  <li><a href="#problem/design-netflix">Design Netflix</a> — multi-tier LB: edge LB → service LB → DB proxy.</li>
+</ul>

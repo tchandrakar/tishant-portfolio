@@ -1,0 +1,91 @@
+<h1>Storage internals: WAL, LSM-tree, B-tree</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">storage</span>
+  <span class="tag">lsm</span>
+  <span class="tag">btree</span>
+  <span class="tag">wal</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>Every durable database is built from three primitives: a <b>write-ahead log (WAL)</b> for crash recovery, a <b>main index</b> for fast lookups, and a <b>page cache</b> in RAM. The two dominant index shapes are <b>B-trees</b> (in-place updates, optimized for reads) and <b>LSM-trees</b> (append-only writes flushed to sorted files, optimized for writes). Knowing which one you're sitting on tells you why your queries are slow.</p>
+
+<h2>Why it matters</h2>
+<p>If your workload is write-heavy and Postgres feels strained, you may want RocksDB or Cassandra (LSM). If you're doing range scans and point lookups on a stable corpus, B-trees crush LSMs. The WAL is non-negotiable for both — it's how durability survives a power cut. Confusing these layers leads to bad index choices, surprise write amplification, and 10x storage bills.</p>
+
+<h2>Real-world examples</h2>
+<ul>
+  <li><b>B-tree engines:</b> Postgres, MySQL InnoDB, SQLite, MongoDB WiredTiger, Oracle.</li>
+  <li><b>LSM engines:</b> RocksDB, LevelDB, Cassandra, ScyllaDB, HBase, BigTable, DynamoDB (under the hood).</li>
+  <li><b>WAL everywhere:</b> Postgres pg_wal, MySQL redo log, SQLite journal, Kafka segment log, etcd Raft log.</li>
+</ul>
+
+<h2>WAL: the universal durability trick</h2>
+<div class="ascii-diagram">  client write
+       |
+       v
+  [ WAL append + fsync ] -----&gt; "durable, ack the client"
+       |
+       v
+  [ apply to in-memory page / memtable ]
+       |
+       v (later, batched)
+  [ flush dirty pages / SSTables to data files ]
+</div>
+<p>The trick: writing one sequential append to the WAL is dramatically faster than random-writing the data file in place. After a crash, replay the WAL from the last checkpoint to redo lost mutations. Group commit (batching many transactions into one fsync) is what gets databases to thousands of TPS on commodity SSDs.</p>
+
+<h2>B-tree: balanced, in-place, read-friendly</h2>
+<p>A B-tree is a wide, shallow tree of fixed-size pages (typically 4–16 KB). Each internal node holds dozens to hundreds of keys; height is log_B(N), so a billion rows reach in 3–4 disk seeks. Updates rewrite the page in place — fast for reads, but every write touches the WAL <i>and</i> the page (write amp ≈ 2x baseline plus index maintenance).</p>
+<ul>
+  <li><b>Strengths:</b> excellent point reads, range scans, predictable latency, mature MVCC.</li>
+  <li><b>Weaknesses:</b> random write IO; page splits cause fragmentation; concurrency requires careful latching.</li>
+</ul>
+
+<h2>LSM-tree: log-structured, append-only, write-friendly</h2>
+<div class="ascii-diagram">  writes -&gt; [ WAL ] + [ memtable (sorted, in RAM) ]
+                          |
+                          v  (when full)
+                       [ L0 SSTable ] [ L0 ] [ L0 ]
+                                |  compaction
+                                v
+                       [ L1 SSTables: 10x bigger, non-overlapping ]
+                                |
+                                v
+                       [ L2 ... ]
+</div>
+<p>Writes are buffered in a sorted in-memory structure (memtable) and flushed as immutable sorted files (SSTables). Background <b>compaction</b> merges files, drops tombstones, and pushes data down levels. Reads check memtable, then L0, then deeper levels — a Bloom filter per SSTable skips levels that can't contain the key.</p>
+<ul>
+  <li><b>Strengths:</b> sequential writes, high ingest throughput, great compression (sorted files dedup well).</li>
+  <li><b>Weaknesses:</b> read amplification (multiple files), write amplification from compaction (often 10–30x), tail-latency spikes during big merges.</li>
+</ul>
+
+<h2>The three amplifications</h2>
+<ul>
+  <li><b>Write amp:</b> bytes written to disk ÷ bytes the user wrote. LSMs trade this for sequential IO; B-trees keep it small but random.</li>
+  <li><b>Read amp:</b> blocks read per logical lookup. LSMs higher (multiple SSTables); B-trees ≈ tree height.</li>
+  <li><b>Space amp:</b> bytes on disk ÷ live bytes. LSMs hold tombstones until compaction; B-trees fragment after deletes.</li>
+</ul>
+<p>Tuning storage is mostly negotiating among these three.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Picking an LSM for a read-heavy point-lookup workload — Bloom filters help, but B-trees still win.</li>
+  <li>Disabling fsync to "speed things up" — your durability guarantee evaporates on the first power loss.</li>
+  <li>Ignoring compaction tuning on Cassandra/RocksDB — default settings rarely match your write rate.</li>
+  <li>Treating SSDs as having infinite endurance — write amp shortens drive life proportionally.</li>
+  <li>Putting WAL and data files on the same disk — fsync contention destroys throughput.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> You're storing 5 KB user-event records at 200k writes/sec, queried mostly by recent timestamp ranges, occasionally by user_id. Which engine — B-tree or LSM — and why? Where do you put the WAL?
+  <br/>
+  <b>Hint:</b> 200k/sec random writes will melt a B-tree (page splits, random IO). Pick an LSM (RocksDB, Cassandra) keyed by <code>(user_id, timestamp)</code> so recent ranges are co-located in young SSTables. Put the WAL on a separate fast disk to avoid fsync contention with compaction.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-lsm-tree">Design an LSM-tree engine</a> — memtable, SSTable, compaction strategies.</li>
+  <li><a href="#problem/design-btree-engine">Design a B-tree engine</a> — page layout, splits, latching.</li>
+  <li><a href="#problem/design-wal">Design a write-ahead log</a> — group commit, checkpoints, recovery.</li>
+</ul>

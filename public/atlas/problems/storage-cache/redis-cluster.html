@@ -1,0 +1,194 @@
+<h1>Design Redis Cluster (16384 hash slots, replication, failover)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">storage-cache</span>
+  <span class="tag">database-ddia</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design a horizontally-sharded, in-memory key-value store compatible with Redis semantics. The cluster must distribute keys across N shards via 16384 hash slots, replicate each shard for HA, detect node failure via gossip, and promote a replica with sub-10s impact. The system targets 10M+ ops/sec aggregate with p99 GET latency under 1 ms inside the DC.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Standard Redis commands: GET/SET/DEL/EXPIRE, INCR, LPUSH/RPOP, ZADD, HSET, SUBSCRIBE.</li>
+  <li>Multi-key ops within the same hash slot via hash-tags <code>{user:42}:profile</code>.</li>
+  <li>Online resharding: move slots between nodes without downtime.</li>
+  <li>Replica failover within 10s of master loss; CLUSTER MEET/FORGET for membership.</li>
+  <li>Pub/Sub broadcast across all nodes; client-side smart routing via MOVED/ASK.</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> p50 GET under 200 us, p99 under 1 ms intra-AZ.</li>
+  <li><b>Throughput:</b> 100k ops/sec/node; 100-node cluster ~ 10M ops/sec.</li>
+  <li><b>Availability:</b> 99.99% with 1 master + 2 replicas per shard.</li>
+  <li><b>Durability:</b> AOF every 1s = ~1s data-loss window on power-loss.</li>
+  <li><b>Memory:</b> 64-256 GB per node, 6.4-25.6 TB cluster.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Active users: 200M, 5 cache reads/sec/user peak = 1B ops/sec aggregate; we shard to ~100 shards.</li>
+  <li>Avg value 512 B, working set 5B keys = 2.5 TB; with 3x replication factor = 7.5 TB RAM.</li>
+  <li>Cluster bus traffic: gossip 10 packets/sec/node, ~200 B each = 2 KB/s/node, negligible.</li>
+  <li>Replication stream: 50 MB/s/master at sustained writes, 100 nodes = 5 GB/s intra-AZ.</li>
+  <li>Failover budget: NODE_TIMEOUT 5s + election quorum 1s + slot reconfig 1s = ~7s downtime.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>SET   key value [EX seconds] [NX|XX]    → OK | (nil) | -MOVED 3999 10.0.0.5:6379
+GET   key                                → value | (nil) | -ASK 3999 10.0.0.6:6379
+CLUSTER SLOTS                            → [[0,5460,[ip,port,nodeId]],...]
+CLUSTER FAILOVER [FORCE|TAKEOVER]        → OK
+CLUSTER SETSLOT &lt;slot&gt; MIGRATING|IMPORTING|NODE &lt;target-id&gt;
+MIGRATE host port key|"" db timeout COPY REPLACE KEYS k1 k2 ...</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">[Smart Client]──CRC16(key) % 16384──┐
+       │                              ▼
+       │                      [slot→node map cache]
+       │                              │
+       ▼                              ▼
+ ┌────────────┐ gossip ┌────────────┐ gossip ┌────────────┐
+ │ Master M1  │◄──────►│ Master M2  │◄──────►│ Master M3  │
+ │ slots 0-5k │        │ slots 5k-10k│       │ slots 10k+ │
+ └─────┬──────┘        └─────┬──────┘        └─────┬──────┘
+   async repl              async repl            async repl
+   ┌───▼───┐  ┌───▼───┐  ┌───▼───┐  ┌───▼───┐  ┌───▼───┐
+   │ R1a   │  │ R1b   │  │ R2a   │  │ R3a   │  │ R3b   │
+   └───────┘  └───────┘  └───────┘  └───────┘  └───────┘
+</div>
+<p>Client computes CRC16(key) mod 16384; on first MOVED response it caches the slot map. Masters gossip via the cluster bus on port 6379+10000. A replica wins election if it has the most-recent replication offset and a majority of masters vote.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 In-memory layout</h3>
+<pre>// Per-key encoding in keyspace
+robj { type:STRING|LIST|HASH|ZSET|SET|STREAM,
+       encoding:embstr|int|listpack|skiplist|quicklist,
+       lru:24bit, refcount, ptr };
+// Slot ownership table
+slot_to_node[16384] = nodeId;
+// Replication backlog: ring buffer 1 GB, offset-indexed</pre>
+<h3>7.2 Persistence</h3>
+<p>RDB snapshot every 5 min + AOF append. AOF rewrite is fork+COW, doubling RSS briefly — size nodes to 50% memory headroom. Disable swap; THP off.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Slot routing &amp; resharding</h3>
+<p>16384 slots is a sweet spot: bitmap fits in 2 KB per gossip packet (DDIA Ch.6 "Partitioning by Hash of Key"). To move slot 3999, source enters MIGRATING, target enters IMPORTING; client GETs return ASK redirect for keys not yet migrated. MIGRATE moves keys atomically; finally CLUSTER SETSLOT NODE updates ownership.</p>
+<h3>8.2 Replication &amp; failover</h3>
+<p>Async leader-follower (DDIA Ch.5 "Single-Leader Replication"). PSYNC2 supports partial resync via repl-id + offset. On master loss, a replica with min(rank) and majority votes from other masters wins election. <b>Split-brain risk:</b> a stale master in a network partition keeps accepting writes until NODE_TIMEOUT, so set <code>min-replicas-to-write 1</code> for stronger guarantees.</p>
+<h3>8.3 Hot key mitigation</h3>
+<p>Use hash tags so related keys colocate; for a single hot key (celebrity timeline), front with client-side L1 LRU + Redis pub/sub invalidation. Optionally enable Redis 6 client-side caching (RESP3 tracking).</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>Single-thread per shard:</b> CPU-bound at ~100k ops/sec; scale by adding shards, not threads. Redis 6 I/O threads parse only.</li>
+  <li><b>Big keys:</b> a 100 MB list freezes the event loop on DEL; use UNLINK and avoid &gt;10k elements per key.</li>
+  <li><b>Cluster bus storm:</b> 1000+ nodes generate O(N²) gossip; cap at ~500 masters.</li>
+  <li><b>Failover oscillation:</b> tune <code>cluster-node-timeout</code> 5-15s; lower → faster failover but flaps; higher → longer outage.</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Async replication</td><td>Low write latency</td><td>Up to NODE_TIMEOUT data loss on failover (DDIA Ch.5)</td></tr>
+<tr><td>Hash slots vs consistent hash</td><td>Tiny gossip footprint, deterministic</td><td>Slot rebalance is manual</td></tr>
+<tr><td>Single-threaded</td><td>No locks, predictable latency</td><td>Big-key blocking, no vertical scale</td></tr>
+<tr><td>Smart client</td><td>One hop after warm cache</td><td>Client complexity, MOVED storms during reshard</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch.3 Storage and Retrieval — in-memory hash index, log-structured AOF.</li>
+  <li>Ch.5 Replication — single-leader async, replication lag, failover pitfalls.</li>
+  <li>Ch.6 Partitioning — hash partitioning, rebalancing without rehashing all keys.</li>
+  <li>Ch.8 Trouble — split-brain on network partition, NODE_TIMEOUT semantics.</li>
+  <li>Ch.9 Consistency — Redis offers no linearizability; lost writes during failover possible.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd default to 16384 fixed slots over consistent hashing because the bitmap fits in gossip and lets clients cache routing in 2 KB."</li>
+  <li>"Failover is async + best-effort; for write-once-or-fail semantics I'd front Redis with a Raft-backed sequencer or use Redis-Raft."</li>
+  <li>"The hardest operational issue is big keys and forking AOF on 64 GB RSS — I size nodes ≤ 25 GB and shard aggressively."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason.</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Redis 7.x server</td>
+      <td>Single-threaded event loop gives predictable sub-200us p50 GETs and lock-free atomic ops; in-memory hash index (DDIA Ch.3) at 100k ops/sec/node hits the 10M aggregate target without exotic hardware. Native cluster mode ships the 16384-slot routing we need.</td>
+      <td>KeyDB (multi-thread, but fork costs worse on 64GB); Dragonfly (newer, less battle-tested at 100-node scale).</td>
+    </tr>
+    <tr>
+      <td>16384 hash slots (fixed)</td>
+      <td>Slot bitmap fits in 2 KB, so each gossip packet carries full ownership info — keeps cluster bus under 2 KB/s/node at 100 nodes (DDIA Ch.6 partitioning by hash). CRC16(key) mod 16384 is deterministic and clients cache the map.</td>
+      <td>Consistent hashing rings (gossip payload grows O(N) with vnodes); range partitioning (hot ranges, manual splits).</td>
+    </tr>
+    <tr>
+      <td>CRC16 hash function</td>
+      <td>Cheap (~1 ns/key), uniform distribution across 16384 slots, fits in 14 bits. Hash-tags <code>{user:42}</code> let multi-key ops colocate without sacrificing distribution. Good enough since collisions just mean same-slot, not same-key.</td>
+      <td>SHA-1 (overkill, 30x slower); xxhash (excellent but not in client compat matrix).</td>
+    </tr>
+    <tr>
+      <td>Cluster bus gossip (port +10000)</td>
+      <td>O(N²) message complexity is acceptable up to ~500 masters at 10 packets/sec each (~200 B). Detects PFAIL/FAIL in &lt;NODE_TIMEOUT (5-15s) without a central coordinator (DDIA Ch.8). PING/PONG carries slot bitmap piggyback.</td>
+      <td>ZooKeeper/etcd-based membership (extra dependency, 2-3 hop coordination); SWIM (better scaling but custom).</td>
+    </tr>
+    <tr>
+      <td>PSYNC2 async replication</td>
+      <td>1 GB ring-buffer backlog allows partial resync after replica reconnects, avoiding full RDB transfer (which would saturate the 5 GB/s intra-AZ stream). Single-leader async (DDIA Ch.5) keeps write latency at sub-ms.</td>
+      <td>Sync replication (10x write tail latency); chain replication (more complex failover).</td>
+    </tr>
+    <tr>
+      <td>AOF + RDB hybrid persistence</td>
+      <td>AOF every 1s caps data loss to ~1s per the NFR; RDB snapshot every 5 min gives fast restart (load 64 GB in ~90s vs ~10 min for AOF replay). Fork+COW for rewrite needs the 50% RSS headroom we sized for.</td>
+      <td>AOF-only (slow restart); RDB-only (5-min loss window violates NFR); no persistence (cold cache stampedes).</td>
+    </tr>
+    <tr>
+      <td>Replica-based failover (1 master + 2 replicas)</td>
+      <td>Quorum vote among masters (DDIA Ch.5 leader election) completes in ~1s. Two replicas survive AZ loss + ongoing maintenance. Election uses replication offset rank — replica with most-recent data wins, minimizing rollback.</td>
+      <td>Sentinel-only (no automated slot rebalance); Raft-per-shard like Redis-Raft (CP but 2-3x latency).</td>
+    </tr>
+    <tr>
+      <td>Smart client (slot map cache)</td>
+      <td>One MOVED redirect bootstraps the entire slot→node map (2 KB), so steady-state requests are 1-hop. 100k ops/sec/node math assumes no proxy hop. ASK redirects handle in-flight migration without invalidating the cache.</td>
+      <td>Twemproxy/envoy proxy (extra hop = +200us p50, 2x conn count); dumb client (every op risks MOVED).</td>
+    </tr>
+    <tr>
+      <td>UNLINK + lazy free</td>
+      <td>Big keys (100 MB lists) would freeze the single-threaded event loop on DEL for &gt;100 ms, blowing p99 budget. UNLINK offloads memory reclamation to a background thread, keeping the main loop &lt;1 ms.</td>
+      <td>Synchronous DEL (event-loop stalls); manual sharding of big keys (app burden).</td>
+    </tr>
+    <tr>
+      <td>Hash-tag colocation <code>{user:42}:profile</code></td>
+      <td>Forces related keys into the same slot so MULTI/EXEC, Lua, and pipelined ops work atomically. Without it, multi-key ops error with CROSSSLOT — the routing layer cannot coordinate across shards (no 2PC in Redis).</td>
+      <td>Client-side fan-out + reconciliation (no atomicity); cross-slot transactions via Redis-Raft (heavy).</td>
+    </tr>
+    <tr>
+      <td>min-replicas-to-write 1</td>
+      <td>Refuses writes if no replica is connected, preventing the split-brain stale-master scenario during a NODE_TIMEOUT-sized partition (DDIA Ch.8). Trades a sliver of availability for bounded data loss on failover.</td>
+      <td>Default (accept writes always — risk lost writes); WAIT command per write (5x latency).</td>
+    </tr>
+    <tr>
+      <td>RESP3 client-side caching</td>
+      <td>Redis tracks which keys each client cached and pushes invalidations on change, eliminating round-trips for hot keys (celebrity timeline at 100k+ QPS) without app-level pub/sub plumbing. Cuts hot-key shard load 10-100x.</td>
+      <td>App-level LRU + pub/sub invalidation (works but more code); read-replica scaling (replication lag risk).</td>
+    </tr>
+    <tr>
+      <td>Linux: THP off, swap disabled, vm.overcommit=1</td>
+      <td>Transparent huge pages cause &gt;100 ms latency spikes during fork-on-AOF-rewrite. Swap on a 64 GB RSS = unbounded latency. overcommit=1 lets fork() succeed even when nominal memory looks short. These tunings preserve the p99 &lt; 1 ms budget.</td>
+      <td>Default kernel settings (THP causes pauses); cgroup memory limits (forks fail at worst time).</td>
+    </tr>
+    <tr>
+      <td>Prometheus + redis_exporter</td>
+      <td>Tracks cluster bus messages, replication lag offset, slowlog, fork time, RSS — the four leading indicators for the failure modes listed in section 9. Pull-based scrape every 10s is cheap relative to 100k ops/sec.</td>
+      <td>Redis INFO polling only (no time-series); Datadog (SaaS cost at 100 nodes).</td>
+    </tr>
+  </tbody>
+</table>

@@ -1,0 +1,147 @@
+<h1>Design Video Recommendation System (candidate gen + ranking)</h1>
+<div class="meta-row">
+  <span class="tag diff-Hard">Hard</span>
+  <span class="tag">video-streaming</span>
+  <span class="tag">recommendation</span>
+</div>
+
+<h2>1. Problem statement</h2>
+<p>Design the recommendation system that powers the "home feed" and "Up Next" surfaces of a video platform. The system must turn a corpus of ~1 B videos and a viewer's history into an ordered list of 20–50 items, in &lt; 200 ms, and improve a north-star metric like watch-time-per-session. YouTube reports that ~70% of watch time comes from recommendations, making this the highest-leverage system in the entire product. The classic two-stage architecture — candidate generation + ranking — is what makes the latency and quality tractable at this scale.</p>
+
+<h2>2. Functional requirements</h2>
+<ul>
+  <li>Personalized home-page feed per user/profile.</li>
+  <li>"Up Next" recommendations during/after playback.</li>
+  <li>Exploration vs exploitation balance (avoid filter bubbles).</li>
+  <li>Real-time response to user signals (skip, like, "Don't recommend").</li>
+  <li>Cold-start handling for new users and new videos.</li>
+  <li>Diversity, freshness, and policy constraints (no clickbait promotion).</li>
+</ul>
+
+<h2>3. Non-functional requirements</h2>
+<ul>
+  <li><b>Latency:</b> &lt; 200 ms p95 end-to-end ranking call.</li>
+  <li><b>Scale:</b> 1 B users × tens of impressions/day = ~10 B ranking calls/day = ~120k QPS avg, ~500k peak.</li>
+  <li><b>Freshness:</b> a video uploaded an hour ago should be reachable in candidate generation.</li>
+  <li><b>Coverage:</b> the system must be able to surface the long tail, not just the top 1%.</li>
+  <li><b>A/B-able:</b> every model and every business rule must be experimentally swappable.</li>
+</ul>
+
+<h2>4. Capacity estimation</h2>
+<ul>
+  <li>Candidate gen: ~120k QPS × 5 retrievers × 1k candidates each = 600 M candidate lookups/s aggregate; ANN index must serve &gt; 100k QPS per shard.</li>
+  <li>Ranking: 120k QPS × ~500 candidates per request × ~1 µs per scoring op = ~60 M scoring ops/s; served by a TF-Serving / TorchServe fleet.</li>
+  <li>Feature store reads: ~120k QPS × 200 features × 8 bytes = ~200 GB/s feature traffic — needs in-memory KV.</li>
+  <li>Training data: 10 B impressions/day × 1 KB = 10 TB/day into the data lake.</li>
+</ul>
+
+<h2>5. API design</h2>
+<pre>POST  /v1/feed   {userId, surface:home|upnext, ctx:{deviceType,locale,nowPlayingId?}}
+                                                     → items[ {videoId, score, debugInfo} ]
+POST  /v1/feedback {userId, videoId, signal:like|skip|notInterested|watchedMs} → 204
+POST  /v1/admin/policy {ruleId, expression}          → policyVersion
+GET   /v1/admin/experiments                          → activeExperiments[]</pre>
+
+<h2>6. High-level architecture</h2>
+<div class="ascii-diagram">                          ┌──────────────────────────────┐
+                          │     Online Serving Path      │
+[Client] ─► [Edge GW] ─► [Reco GW] ─► [Candidate Generators]
+                                          ├─ ANN retriever (user→video embed)
+                                          ├─ Subscription/follow retriever
+                                          ├─ Trending retriever
+                                          └─ Personalized rules retriever
+                                          │
+                                          ▼ ~500 candidates
+                                    [Ranker (DNN)]   ◄── [Feature Store (Redis/Bigtable)]
+                                          │
+                                          ▼  re-rank for diversity / policy
+                                    [Final 20–50 items]
+
+         Offline path:
+[Kafka: impressions, plays, likes] → [Flink: realtime features]
+                                  → [Spark/Beam: training data] → [Trainers] → [Model Registry] → [Serving]
+                                  → [Embedding builder] → [ANN index build] → [Vector store]
+</div>
+<p>The split between candidate gen (recall) and ranking (precision) is what makes the latency budget work: candidate gen reduces 1 B → 500 with cheap retrievers, then a heavy DNN scores only those 500.</p>
+
+<h2>7. Data model &amp; storage</h2>
+<h3>7.1 User &amp; video embeddings (vector store)</h3>
+<pre>user_embed[userId]    -&gt; float32[256]
+video_embed[videoId]  -&gt; float32[256]
+ann_index             -&gt; HNSW over video_embed, sharded by random hash</pre>
+<p>Stored in a dedicated vector DB (Vespa, ScaNN, Faiss-shard) for sub-10ms top-K queries.</p>
+<h3>7.2 Feature store</h3>
+<pre>fs:user:{uid}:lastN_videos        -&gt; list&lt;videoId&gt;
+fs:user:{uid}:topic_affinity      -&gt; map&lt;topic,float&gt;
+fs:video:{vid}:ctr_24h            -&gt; float
+fs:video:{vid}:watchtime_p50      -&gt; int</pre>
+<p>Redis Cluster for low-latency online features; a parallel offline view in Bigtable/Bigquery for training. Both are populated from the same Kafka stream so training-serving skew stays bounded.</p>
+<h3>7.3 Impression log</h3>
+<p>Every served item is logged with ranker version, candidate sources, and outcome. This is the fuel for training and for counter-factual evaluation.</p>
+
+<h2>8. Detailed component design</h2>
+<h3>8.1 Candidate generation</h3>
+<p>Multiple retrievers in parallel: (1) ANN over user/video embeddings — captures "users like you watched this", (2) graph-based co-watch — videos co-watched in the same session, (3) subscription/follow — fresh uploads from followed channels, (4) trending bucket — locale &amp; topic. Each emits ~200 candidates; we union and dedupe.</p>
+<h3>8.2 Ranker</h3>
+<p>Multi-task DNN with shared trunk and heads for click probability, expected watch time, and satisfaction (1-5 survey). The final score is a learned linear combo of heads. Inputs: user features, video features, cross features, context features. ~50 ms inference budget per request.</p>
+<h3>8.3 Re-ranker</h3>
+<p>After scoring, we apply diversity (MMR), freshness boosting, and business/policy constraints (e.g., suppress titles flagged by Trust &amp; Safety). This is the place where product intuition lives — it's intentionally simple and rule-based so PMs can reason about it.</p>
+<h3>8.4 Cold start</h3>
+<p>New users: bootstrap from registration signals (locale, age band, declared interests) and content-based candidates. New videos: rely on content embeddings + a "exploration boost" that gives every new video a small impression budget for ~24 hours; the system collects engagement signal to update embeddings.</p>
+
+<h2>9. Scaling &amp; bottlenecks</h2>
+<ul>
+  <li><b>ANN throughput:</b> shard the index by random hash; query fan-out + scatter-gather. Each shard runs HNSW in-memory.</li>
+  <li><b>Feature fanout:</b> co-locate user and video features in same Redis shard via consistent hashing on userId; fetch 500 video features in one batched mget.</li>
+  <li><b>Training-serving skew:</b> compute features once in Flink and write to both stores; never compute features differently in the trainer vs the server.</li>
+  <li><b>Model rollout:</b> shadow-eval new models on 1% of traffic for a week before promotion; canary at 5%.</li>
+  <li><b>Filter bubbles:</b> cap the share of any single channel/topic in the final feed (e.g., max 3 videos from any one channel in the top 20).</li>
+</ul>
+
+<h2>10. Trade-offs</h2>
+<table>
+<thead><tr><th>Decision</th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Two-stage retrieval + ranking</td><td>Tractable latency at corpus scale</td><td>Recall errors at stage-1 are unrecoverable</td></tr>
+<tr><td>Multi-task DNN ranker</td><td>Optimizes joint objectives</td><td>Harder to debug per-objective regressions</td></tr>
+<tr><td>Real-time features via Flink</td><td>Sub-minute reaction to user signals</td><td>Ops complexity vs batch features</td></tr>
+<tr><td>Rule-based re-ranker last</td><td>Product control, explainable</td><td>Easy to over-tune and regress quality</td></tr>
+<tr><td>Exploration budget for new videos</td><td>Solves cold start</td><td>Costs some watch-time on average</td></tr>
+</tbody>
+</table>
+
+<h2>11. DDIA references</h2>
+<ul>
+  <li>Ch. 6 Partitioning — sharding ANN and feature stores by random hash for even load.</li>
+  <li>Ch. 10 Batch Processing — daily Spark/Beam jobs to materialize training data and rebuild embeddings.</li>
+  <li>Ch. 11 Stream Processing — Flink pipelines for real-time features and counter-factual logging.</li>
+  <li>Ch. 12 Future of Data Systems — the impression log is the source of truth; embeddings, features, and model snapshots are derived data.</li>
+</ul>
+
+<h2>12. Talking points for the interviewer</h2>
+<ul>
+  <li>"I'd commit to two stages on day one — anything else doesn't fit the latency budget at billion-item scale."</li>
+  <li>"The hardest part is training-serving skew — most production reco regressions I've seen come from a feature being computed slightly differently online vs offline; my mitigation is a single Flink pipeline writing both stores."</li>
+  <li>"For metrics, I'd optimize watch-time per session but guard with satisfaction surveys, otherwise the model will learn to maximize sessions full of clickbait."</li>
+</ul>
+
+<h2>13. Tech stack &amp; rationale</h2>
+<p>Every technology choice in this design exists for a concrete reason. Here's the why behind each one:</p>
+<table>
+  <thead><tr><th>Technology</th><th>Why we chose it (for THIS problem)</th><th>Alternatives considered</th></tr></thead>
+  <tbody>
+    <tr><td><b>Vespa / ScaNN / Faiss</b></td><td>HNSW ANN at &gt;100k QPS per shard for &lt;10ms top-K retrieval over 1B video embeddings; the 200 ms p95 budget can't survive brute-force similarity over a billion 256-dim vectors.</td><td>Pinecone — managed but cost-prohibitive at 120k QPS; brute-force — impossible at 1B scale</td></tr>
+    <tr><td><b>Redis Cluster (feature store)</b></td><td>200 GB/s feature traffic (200 features × 8 bytes × 120k QPS) needs in-memory KV with batched mget; consistent-hash shard on userId co-locates user+video features in one round-trip.</td><td>Memcached — no atomic ops needed for online scoring; DynamoDB — too slow for batched 500-key reads</td></tr>
+    <tr><td><b>Bigtable / BigQuery (offline store)</b></td><td>Parallel offline view populated from the same Kafka stream as the online store; training jobs read from Bigtable for feature serving and BigQuery for analytics — both fed identically to bound training-serving skew.</td><td>Single store for both — online latency vs offline scan are different access patterns; no parallel store — guaranteed skew</td></tr>
+    <tr><td><b>Apache Kafka</b></td><td>10 B impressions/day (~120k events/s avg) into a partitioned log that fuels training data, online features, and counter-factual evaluation; impression log is the source-of-truth event stream that all derived data flows from.</td><td>Pub/Sub — works but Kafka chosen for replay flexibility; Kinesis — partition limits at this scale</td></tr>
+    <tr><td><b>Apache Flink</b></td><td>Real-time features (last-N watched, time-of-day) with exactly-once semantics; sub-minute reaction to skip/like signals via the same pipeline that writes both online (Redis) and offline (Bigtable) stores — single source of feature definitions.</td><td>Spark Streaming — micro-batch lag too high for sub-minute features; Storm — no exactly-once</td></tr>
+    <tr><td><b>Apache Spark / Beam</b></td><td>Daily training data materialization over 10 TB/day of impression logs and embedding rebuilds at billion-item scale; Spark wins on memory-heavy ML feature engineering, Beam unifies batch+stream when needed.</td><td>Hive — too slow for embedding builds; raw MapReduce — productivity hit</td></tr>
+    <tr><td><b>TF-Serving / TorchServe</b></td><td>~60 M scoring ops/s served at 50 ms p95 inference budget; GPU/TPU batching on shared-trunk multi-task DNNs delivers the throughput a Python service couldn't.</td><td>Custom inference server — reinvents the wheel; ONNX Runtime — viable but less ecosystem integration</td></tr>
+    <tr><td><b>Multi-task DNN ranker</b></td><td>Joint optimization of CTR, watch-time, and satisfaction shares feature representations; trained daily on a year of engagement events to capture seasonality without overfitting last week.</td><td>Single-objective ranker — over-optimizes one metric (watch-time → clickbait); LambdaMART — less expressive on continuous features</td></tr>
+    <tr><td><b>HNSW indexing</b></td><td>Logarithmic search complexity over 1B vectors with 95%+ recall at 10ms; the recall-vs-latency knob fits the 200ms p95 budget where IVF would either miss candidates or blow latency.</td><td>IVF-PQ — lossy at top-K=200; LSH — quality regression</td></tr>
+    <tr><td><b>Two-stage retrieval + ranking</b></td><td>Reduces 1B → 500 candidates with cheap retrievers; only then runs the heavy DNN — without this split the latency budget is mathematically unreachable at billion-item corpus scale.</td><td>Single-stage ranker — won't fit 200ms budget; retrieval-only — no fine-grained ranking quality</td></tr>
+    <tr><td><b>MMR re-ranker</b></td><td>Maximal Marginal Relevance enforces diversity and freshness boosts after DNN scoring; rule-based by design so PMs can reason about and tune business policy without retraining.</td><td>Learned diversity — opaque to product; no diversity — filter bubbles, user dissatisfaction</td></tr>
+    <tr><td><b>A/B testing platform</b></td><td>Every model and policy rule must be experimentally swappable; shadow-eval at 1% then canary at 5% catches regressions before full rollout, since reco quality regressions are immediately revenue-impacting.</td><td>No experimentation — flying blind; manual rollout — slow iteration</td></tr>
+    <tr><td><b>Model registry (MLflow)</b></td><td>Versioned model artifacts with metadata (training data window, evaluation metrics, owning team) so a regression can be rolled back in seconds, and shadow-eval traffic targets a specific version.</td><td>Custom artifact store — reinvents standard tooling; no registry — operational risk</td></tr>
+  </tbody>
+</table>
