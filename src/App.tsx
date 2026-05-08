@@ -27,7 +27,8 @@ function detectMode(): PortfolioMode {
   if (hash === 'kali') return 'kali';
   if (hash === 'classic') return 'classic';
   if (hash === 'atlas' || hash.startsWith('atlas/')) return 'atlas';
-  return 'chooser';
+  if (hash === 'chooser') return 'chooser';
+  return 'classic';
 }
 
 export default function App() {
@@ -48,7 +49,7 @@ export default function App() {
   // Sync hash with mode (preserve sub-route for atlas like #atlas/problem/x)
   useEffect(() => {
     if (mode === 'chooser') {
-      if (window.location.hash) window.location.hash = '';
+      if (window.location.hash !== '#chooser') window.location.hash = 'chooser';
     } else if (mode === 'atlas') {
       // Don't clobber sub-routes like #atlas/problem/foo — only set if not already on a atlas route
       if (!window.location.hash.startsWith('#atlas')) window.location.hash = 'atlas';
@@ -64,7 +65,7 @@ export default function App() {
     return () => window.removeEventListener('hashchange', handleHash);
   }, []);
 
-  const handleChoose = useCallback((chosen: 'kali' | 'classic' | 'atlas') => {
+  const handleChoose = useCallback((chosen: 'kali' | 'classic') => {
     setMode(chosen);
     if (chosen === 'kali') setScreen('boot');
   }, []);
@@ -122,7 +123,7 @@ export default function App() {
   if (mode === 'classic') {
     return (
       <div className="classic-mode page-transition" key="classic">
-        <ClassicPortfolio onSwitchPortfolio={() => setMode('chooser')} onOpenAtlas={() => setMode('atlas')} />
+        <ClassicPortfolio onSwitchPortfolio={() => setMode('chooser')} />
       </div>
     );
   }
