@@ -1,0 +1,186 @@
+<h1>LSM-trees &amp; SSTables: turning random writes into sequential ones</h1>
+<div class="meta-row">
+  <span class="tag diff-Medium">Medium</span>
+  <span class="tag">storage</span>
+  <span class="tag">lsm</span>
+  <span class="tag">sstable</span>
+  <span class="tag">compaction</span>
+  <span class="tag">rocksdb</span>
+</div>
+
+<h2>The idea in one paragraph</h2>
+<p>An <b>LSM-tree</b> (Log-Structured Merge tree) is a write-optimized storage shape that buffers mutations in a sorted in-memory structure (the <b>memtable</b>), persists them as immutable, sorted on-disk files (<b>SSTables</b> — Sorted String Tables), and reconciles the resulting overlap with a background <b>compaction</b> process. Reads check the memtable first, then progressively older SSTables; bloom filters prune levels that can't possibly contain the key. The whole point: turn the workload's random writes into one sequential append (cheap on every storage medium ever invented) and pay the bookkeeping cost off the critical path.</p>
+
+<h2>What LSM + SSTables are used for</h2>
+<ul>
+  <li><b>Write-heavy KV stores:</b> RocksDB, LevelDB, Cassandra, ScyllaDB, HBase, BigTable, Riak — all LSM under the hood.</li>
+  <li><b>Embedded engines inside larger systems:</b> RocksDB powers DynamoDB's storage nodes, CockroachDB, TiKV, Kafka Streams state stores, Flink's RocksDBStateBackend, MySQL MyRocks, MongoDB's WiredTiger LSM mode.</li>
+  <li><b>Time-series &amp; logging:</b> InfluxDB, Prometheus TSDB, ClickHouse's MergeTree all share LSM DNA — high ingest, range scans on recent data.</li>
+  <li><b>Anything ingest-bound:</b> ad-click pipelines, IoT telemetry, observability stacks, blockchain state DBs (Geth's Pebble), search index segments (Lucene's segment merge is structurally an LSM).</li>
+  <li><b>NOT a fit for:</b> read-heavy point lookups on a stable corpus (B-tree wins), workloads with cheap in-place updates (Postgres heap), or anywhere predictable p99 matters more than throughput.</li>
+</ul>
+
+<h2>Why it exists: the SSD/HDD reality check</h2>
+<p>A spinning disk does ~100 random IOPS but ~100 MB/s sequential. SSDs flatten the gap but still pay <i>write amplification</i> on small random writes (the FTL has to erase a 256 KB block to update a 4 KB page). Every storage medium rewards <b>sequential append</b>. B-trees, by contrast, do random in-place page writes — fast for reads, but every update walks from root to leaf and rewrites a page. LSMs trade read amplification (multiple files to consult) for write amplification you can <i>schedule</i> (compaction runs in the background, not on the write path).</p>
+
+<h2>The four building blocks</h2>
+<div class="ascii-diagram">    client put(k, v)
+         |
+         v
+   +--------------------+
+   |  WAL (append+fsync)|     1. Durability: one sequential append
+   +--------------------+
+         |
+         v
+   +--------------------+
+   | Memtable (skiplist)|     2. Sorted, in-memory mutable buffer
+   +--------------------+
+         | (full -&gt; sealed, new memtable takes over)
+         v
+   +--------------------+
+   | Immutable memtable | --&gt; flushed as one SSTable into L0
+   +--------------------+
+         |
+         v
+   L0  [SST] [SST] [SST]      3. Immutable, sorted on-disk files
+            | compaction
+            v
+   L1  [SST .. SST]           4. Background merge into deeper levels
+   L2  [SST ............]
+   ...
+   L6  [SST ......................................]</div>
+<ol>
+  <li><b>WAL (write-ahead log):</b> every <code>put</code>/<code>delete</code> is appended to a single log file with one fsync (or batched via group commit). On crash, replay the WAL to rebuild the lost memtable.</li>
+  <li><b>Memtable:</b> sorted in-memory structure (skiplist in LevelDB/RocksDB). Writes are O(log n); a single sealed flush dumps the whole thing to disk in key order.</li>
+  <li><b>SSTable (Sorted String Table):</b> immutable file of sorted (key, sequence#, type, value) records, plus a sparse index, a bloom filter, and a footer. Once written, it's never modified — only deleted by compaction.</li>
+  <li><b>Compaction:</b> background job that merges overlapping SSTables, resolves duplicates (newest seq# wins), drops tombstones whose deletion is provably safe, and produces fewer, larger files at the next level.</li>
+</ol>
+
+<h2>SSTable file format (the bytes on disk)</h2>
+<div class="ascii-diagram">+----------------+----------------+--------+--------+--------+--------+
+| Data Block 0   | Data Block 1   |  ...   | Index  | Filter | Footer |
++----------------+----------------+--------+--------+--------+--------+
+  ~32 KB each      restart points         (last_key   bloom    magic +
+  prefix-compressed   every 16 keys        -&gt; offset) per SST  offsets
+  CRC32C checksum     for binary search    binary
+                                           searchable</div>
+<ul>
+  <li><b>Data blocks:</b> sorted (key, seq, type, value) tuples with prefix compression — adjacent keys share a common prefix, so <code>user:1234</code>, <code>user:1235</code> store the diff, not the whole key. Restart points every 16 keys let you binary-search inside a block.</li>
+  <li><b>Index block:</b> one entry per data block — <code>(last_key_of_block -&gt; block_offset)</code>. To find a key: binary search the index, load the one block that could contain it.</li>
+  <li><b>Filter block:</b> a bloom filter (typically 10 bits/key, ~1% false positive rate) per SSTable, or partitioned per data block. If the bloom says "no," skip the file entirely — saves a disk read.</li>
+  <li><b>Footer:</b> fixed-size trailer with magic bytes + offsets to index and filter, so opening an SSTable is one positional read of the last 48 bytes.</li>
+</ul>
+
+<h2>The write path (one put at a time)</h2>
+<ol>
+  <li>Append <code>(seq, op, k, v)</code> to the WAL. <code>fsync</code> (or join a group commit batch).</li>
+  <li>Insert into the memtable (skiplist). Acknowledge the client.</li>
+  <li>If memtable size &gt; threshold (e.g. 64 MB): seal it, allocate a new one, hand the sealed copy to the flush thread.</li>
+  <li>Flusher writes the sealed memtable as one SSTable into <b>L0</b>. The L0 file's range overlaps with other L0 files — that's expected; L0 is the spillover zone.</li>
+  <li>Once the SSTable is durable, its WAL segment can be deleted.</li>
+</ol>
+
+<h2>The read path (with bloom filters)</h2>
+<div class="ascii-diagram">  get(k):
+    1. Look in active memtable          -&gt; hit? return value or tombstone
+    2. Look in immutable memtable(s)    -&gt; hit? return
+    3. For each L0 SSTable, newest first:
+         bloom says "maybe"? load index, load block, search.
+    4. For L1..L6 (each level is non-overlapping):
+         binary search the level's manifest for the one file
+         whose key range contains k
+         bloom says "maybe"? load index, load block, search.
+    5. If we never found it -&gt; NotFound.</div>
+<p>Without bloom filters, a missing key forces a probe of every level — that's the famous LSM <b>read amplification</b>. With 10 bits/key bloom filters, ~99% of "key absent" lookups skip the disk read entirely. This is the single highest-leverage optimization in any LSM (DDIA Ch. 3). The cost: ~1.25 GB of RAM per billion keys, per replica.</p>
+
+<h2>Compaction: where the real engineering happens</h2>
+<p>Without compaction, the LSM degenerates into an unbounded pile of overlapping files, reads slow to a crawl, and disk fills with superseded versions. The compactor's job: merge overlapping SSTables, drop dead data, and produce fewer, larger, non-overlapping files at deeper levels.</p>
+<table>
+  <thead><tr><th>Strategy</th><th>How it works</th><th>Write amp</th><th>Space amp</th><th>Best for</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><b>Leveled</b><br/>(RocksDB default)</td>
+      <td>Each level <code>L_n</code> is 10x bigger than <code>L_{n-1}</code> and is non-overlapping. Compacting picks one file from <code>L_n</code> + overlapping files in <code>L_{n+1}</code>, merges, writes a new <code>L_{n+1}</code>.</td>
+      <td>~10–30x</td>
+      <td>~1.1x</td>
+      <td>Read-heavy, mostly-static datasets. Predictable p99.</td>
+    </tr>
+    <tr>
+      <td><b>Size-tiered</b><br/>(Cassandra default)</td>
+      <td>Group SSTables into "tiers" by size; when a tier has N similar-size files, merge them into one bigger file at the next tier.</td>
+      <td>~3–5x</td>
+      <td>up to 2x</td>
+      <td>Write-heavy, churn-light. Tolerates space spikes during merges.</td>
+    </tr>
+    <tr>
+      <td><b>Universal / tiered</b><br/>(RocksDB option)</td>
+      <td>Few very large files; merges only when count or size ratio crosses thresholds.</td>
+      <td>~2–3x</td>
+      <td>2–3x</td>
+      <td>Time-series with TTL — deleting an old file reclaims a giant range cheaply.</td>
+    </tr>
+    <tr>
+      <td><b>FIFO</b></td>
+      <td>No merging — oldest SSTable is dropped when total size exceeds a cap.</td>
+      <td>1x</td>
+      <td>1x</td>
+      <td>Pure-append logs where reads only touch recent data (caches, dead-letter queues).</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Tombstones, MVCC, and why deletes are weird</h2>
+<p>You can't delete a key from an immutable file. So a <code>delete(k)</code> writes a <b>tombstone</b> — a record that says "as of seq N, key k is dead." The tombstone shadows older writes during reads. Compaction can drop the tombstone <i>only</i> when it can prove no older live entry survives below — typically when a compaction reaches the bottom level. Until then, the tombstone occupies space and counts against read amp. <b>Range tombstones</b> (RocksDB) encode mass deletes as one <code>(start, end, seq)</code> record instead of N point tombstones — critical for time-series TTL.</p>
+<p>The same machinery delivers <b>MVCC</b>: each write carries a monotonic 64-bit sequence number; a snapshot read pins a seq# and the iterator skips entries with <code>seq &gt; snapshot</code>. Compaction respects the oldest live snapshot — a long-running scan can pin garbage in place, which is why "snapshot leak" is a real ops problem on any LSM.</p>
+
+<h2>The three amplifications (the LSM tuning lens)</h2>
+<ul>
+  <li><b>Write amp:</b> bytes the engine writes ÷ bytes the user wrote. Compaction rewrites every byte once per level it traverses. Higher fan-out = higher write amp but fewer levels.</li>
+  <li><b>Read amp:</b> blocks read per logical lookup. Without bloom filters: O(levels). With them: ~1 in steady state for misses, 1–2 for hits.</li>
+  <li><b>Space amp:</b> bytes on disk ÷ bytes of live data. Tombstones, superseded versions, and in-flight compactions all inflate this.</li>
+</ul>
+<p>You can't minimize all three at once. Leveled trades write amp for space amp; size-tiered does the opposite. Tuning is mostly negotiating the triangle for your workload.</p>
+
+<h2>Common production failure modes</h2>
+<ul>
+  <li><b>L0 stalls / write throttle:</b> if compaction can't keep up with flushes, L0 grows tall, the engine throttles foreground writes, and your tail latency explodes. Mitigation: more flush threads, larger memtable, sub-compaction parallelism, faster disk.</li>
+  <li><b>Tombstone backlog:</b> mass deletes written as point tombstones can't be dropped until they reach the bottom level — meanwhile every scan walks past them. Use range tombstones; consider TTL/manual compaction.</li>
+  <li><b>Bloom filter blow-up:</b> at 10 bits/key, 10 B keys = 12.5 GB RAM. Use partitioned bloom + ribbon filters for very large datasets.</li>
+  <li><b>Cache pollution from compaction:</b> compaction streams hundreds of MB/s through the page cache and evicts hot user blocks. Use <code>O_DIRECT</code> for compaction I/O or pin the user block cache.</li>
+  <li><b>Snapshot leaks:</b> a forgotten iterator pins old SSTables alive; disk fills. Always set snapshot timeouts and watch <code>num_snapshots</code> in the metrics.</li>
+  <li><b>WAL + data on the same disk:</b> fsync from the WAL contends with sequential compaction writes. Put WAL on a separate fast disk.</li>
+</ul>
+
+<h2>Tuning cheatsheet (RocksDB-flavored)</h2>
+<ul>
+  <li><b>Write-heavy, throughput &gt; latency:</b> size-tiered/universal compaction, larger memtable (256 MB+), more flush threads, maybe disable bloom filters on bottom level.</li>
+  <li><b>Read-heavy point lookups:</b> leveled compaction, 10–16 bits/key bloom, generous block cache, partitioned indexes, prefix bloom if you scan by prefix.</li>
+  <li><b>Time-series with TTL:</b> universal or FIFO, range tombstones, smaller bloom (or none on cold levels), aligned write-time clustering.</li>
+  <li><b>Mixed OLTP-ish workload:</b> leveled, group commit on, MVCC snapshots short-lived, separate WAL disk, watch L0 file count as the leading indicator of trouble.</li>
+</ul>
+
+<h2>Common mistakes</h2>
+<ul>
+  <li>Picking an LSM for a read-heavy point-lookup workload on a stable corpus — Bloom filters help, but B-trees still win on p99.</li>
+  <li>Disabling fsync to "speed things up" — durability evaporates on the first power loss; the correct lever is group commit.</li>
+  <li>Treating compaction as a black box — if you don't watch L0 file count, write amp, and pending-compaction-bytes, you'll only notice the problem when writes stall.</li>
+  <li>Mass-deleting with point tombstones and wondering why scans got slower — use range tombstones.</li>
+  <li>Leaking long-running snapshots and watching disk usage climb — every iterator/snapshot pins SSTables alive.</li>
+  <li>Thinking SSTables can be edited in place — they cannot. Updates go to a new memtable; the old value dies in compaction.</li>
+</ul>
+
+<h2>Try it yourself</h2>
+<blockquote>
+  <b>Question:</b> Your service ingests 5 KB IoT telemetry records at 200k writes/sec, queried mostly by recent (timestamp, device_id) ranges, occasionally by device_id alone. The cluster has 2 NVMe disks per node and 64 GB RAM. Choose a compaction strategy, key encoding, and memtable size. Where does the WAL live, and how do you bound p99 read latency?
+  <br/>
+  <b>Hint:</b> Pick <b>universal compaction</b> with <b>range tombstones</b> for cheap TTL deletion. Encode the key as <code>(device_id, timestamp_desc)</code> so recent ranges are co-located in young SSTables. Memtable 256 MB, 4 flush threads. WAL on the second NVMe to avoid fsync contention with compaction writes. For p99: 10 bits/key bloom on all but the bottom level, partitioned index, block cache 16 GB pinned to user data, <code>O_DIRECT</code> for compaction I/O. Watch <code>num_l0_files</code> and <code>pending_compaction_bytes</code> — they spike before latency does.
+</blockquote>
+
+<h2>Related problems in the vault</h2>
+<ul>
+  <li><a href="#problem/design-lsm-tree-storage-engine">Design an LSM-tree Storage Engine</a> — full memtable + SSTable + compaction design, end to end.</li>
+  <li><a href="#problem/design-btree-storage-engine">Design a B-tree Storage Engine</a> — the read-optimized counterpart.</li>
+  <li><a href="#problem/design-write-ahead-log">Design a Write-Ahead Log</a> — group commit, segment recycling, recovery.</li>
+  <li><a href="#problem/design-dynamodb">Design DynamoDB</a> — production LSM at planet scale (RocksDB under the hood).</li>
+  <li><a href="#problem/design-cassandra-cluster">Design Cassandra-style ring</a> — size-tiered compaction in a leaderless cluster.</li>
+</ul>
