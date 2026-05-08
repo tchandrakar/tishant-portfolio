@@ -6,7 +6,6 @@ import {
   Cpu,
   Mail,
   FileText,
-  Library,
 } from 'lucide-react';
 import type { WindowState } from '../types';
 
@@ -16,7 +15,6 @@ const DOCK_ITEMS = [
   { id: 'about', label: 'About Me', Icon: User },
   { id: 'projects', label: 'Projects', Icon: Globe },
   { id: 'skills', label: 'Skills', Icon: Cpu },
-  { id: 'atlas', label: "Architect's Atlas", Icon: Library },
   { id: 'contact', label: 'Contact', Icon: Mail },
   { id: 'resume', label: 'Resume', Icon: FileText },
 ];
