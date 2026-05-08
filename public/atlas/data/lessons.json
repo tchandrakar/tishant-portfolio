@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "count": 30,
+  "count": 31,
   "lessons": [
     {
       "id": "lesson-scalability",
@@ -382,9 +382,9 @@
         "wal"
       ],
       "relatedProblems": [
-        "design-lsm-tree",
-        "design-btree-engine",
-        "design-wal"
+        "design-lsm-tree-storage-engine",
+        "design-btree-storage-engine",
+        "design-write-ahead-log"
       ],
       "path": "lessons/medium/storage-internals.html"
     },
@@ -585,6 +585,28 @@
         "design-dropbox"
       ],
       "path": "lessons/hard/interview-frame.html"
+    },
+    {
+      "id": "lesson-lsm-sstables",
+      "level": "medium",
+      "order": 31,
+      "title": "LSM-trees & SSTables: turning random writes into sequential ones",
+      "summary": "Memtable, SSTable file format, bloom filters, leveled vs size-tiered compaction, tombstones and MVCC — the whole engine that powers RocksDB, Cassandra, DynamoDB.",
+      "minutes": 14,
+      "tags": [
+        "storage",
+        "lsm",
+        "sstable",
+        "compaction",
+        "rocksdb"
+      ],
+      "relatedProblems": [
+        "design-lsm-tree-storage-engine",
+        "design-btree-storage-engine",
+        "design-write-ahead-log",
+        "design-dynamodb"
+      ],
+      "path": "lessons/medium/lsm-sstables.html"
     }
   ]
 }
