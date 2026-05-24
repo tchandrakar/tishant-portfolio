@@ -28,7 +28,7 @@ export const PROFILE = {
     'Summer Undergraduate Research Award (SURA-2017)',
     'Published: Temperature and time dependent morphological evolution of copper oxide nanostructures (Springer, 2024)',
   ],
-  bio: `I'm an Associate Technical Architect at Hilabs, Bangalore, leading the Provider-Directory team as an acting EM and architect. With 6+ years of experience building scalable systems across healthtech, edtech, fintech, and AI-powered platforms, I've worked at Zilingo, MindTickle, PhotonInsights, and Quizizz before my current role.
+  bio: `I'm an Associate Technical Architect at Hilabs, Bangalore, leading the Provider-Directory team as an acting EM and architect. With 6+ years of experience building scalable systems across healthtech, edtech, fintech, and AI-powered platforms, I've worked at Zilingo, Goldman Sachs, PhotonInsights, and Quizizz before my current role.
 
 I hold a B.Tech from IIT Roorkee and carry certifications in cybersecurity (Security+, CEH v11). I'm passionate about system design, performance optimization, and building products that serve millions of users.
 
@@ -73,24 +73,25 @@ export const EXPERIENCES: Experience[] = [
     techStack: ['AWS', 'Docker', 'React', 'Python', 'OpenAI', 'ECS', 'Scala', 'Java', 'MySQL', 'Postgres', 'MongoDB'],
   },
   {
-    company: 'MindTickle',
-    role: 'Full-Stack Developer',
-    location: 'Pune',
-    period: 'August 2021 - August 2022',
+    company: 'Goldman Sachs',
+    role: 'Analyst — Global Markets Division',
+    location: 'Bangalore',
+    period: 'August 2020 - August 2022',
     highlights: [
-      'Led design and implementation of sales-enablement solutions with a team of 2 interns.',
-      'Maintained terabytes of data, optimizing high data writes from hours to <30 minutes.',
+      'Led the migration of a legacy monolith to a micro-service architecture with unit tests and continuous deployment, alongside a team of 2.',
+      'Solved business problems including duplicate trade-data prevention and rebate/commission calculation based on daily average trades.',
+      'Designed and implemented test scripts using JUnit and FitNesse.',
     ],
-    techStack: ['AWS', 'Docker', 'ECS', 'Scala', 'Scala-Spark', 'Java', 'Python', 'PySpark', 'MySQL', 'Postgres', 'MongoDB'],
+    techStack: ['Java', 'MySQL', 'Postgres'],
   },
   {
     company: 'Zilingo',
     role: 'SDE-II',
     location: 'Bangalore',
-    period: 'July 2019 - July 2021',
+    period: 'July 2019 - July 2020',
     highlights: [
-      'Writing core libraries: pagination in UI interfaces, password authentication across all login micro-services.',
-      'Solved business problems including duplicate trade data prevention, rebates and commission calculation.',
+      'Wrote core libraries: pagination in UI interfaces and password authentication across all login micro-services.',
+      'Solved business problems and built/maintained test scripts with JUnit and FitNesse.',
     ],
     techStack: ['Java', 'Scala', 'MySQL', 'Postgres'],
   },
@@ -213,13 +214,13 @@ export const NEOFETCH = `
 \x1b[36m    :KKxddxkkkxxdddx0:  \x1b[0m   \x1b[36mHost:\x1b[0m   Bangalore, India
 \x1b[36m   dKxddO0OOO00Okxddx0; \x1b[0m   \x1b[36mKernel:\x1b[0m IIT Roorkee B.Tech
 \x1b[36m  dXxddO0KKK00OOOkxddOK \x1b[0m   \x1b[36mUptime:\x1b[0m 6+ years in industry
-\x1b[36m  OXkxxO0KXXKK00Okxdx0X;\x1b[0m   \x1b[36mRole:\x1b[0m   Full Stack Dev @ Quizizz
+\x1b[36m  OXkxxO0KXXKK00Okxdx0X;\x1b[0m   \x1b[36mRole:\x1b[0m   Assoc. Tech Architect @ Hilabs
 \x1b[36m  kXOxxk0KXXXXK0OkxxOKX:\x1b[0m   \x1b[36mDE:\x1b[0m     Node.js + Go + Python
 \x1b[36m  ;KX0kxkO0KKK0OkkO0KXK \x1b[0m   \x1b[36mWM:\x1b[0m     AWS + Docker + ECS
 \x1b[36m   lKXK0kxxkkkkxk0KXKx  \x1b[0m   \x1b[36mTheme:\x1b[0m  Kali-Dark [GTK3]
 \x1b[36m    :0XXKK00000KKXXKl   \x1b[0m   \x1b[36mTerminal:\x1b[0m react-portfolio v1.0
 \x1b[36m      lkKXXXXXXXKkl     \x1b[0m   \x1b[36mShell:\x1b[0m  bash 5.2.15
-\x1b[36m        ,;;::;;,.       \x1b[0m   \x1b[36mCPU:\x1b[0m    Goldman|MindTickle|Photon|Quizizz
+\x1b[36m        ,;;::;;,.       \x1b[0m   \x1b[36mCPU:\x1b[0m    Zilingo|GS|Photon|Quizizz|Hilabs
 \x1b[36m                        \x1b[0m   \x1b[36mGPU:\x1b[0m    React + Angular + TypeScript
 \x1b[36m                        \x1b[0m   \x1b[36mMemory:\x1b[0m  MongoDB | Postgres | MySQL
 `;
@@ -237,7 +238,7 @@ export const NEOFETCH_PLAIN = [
   { art: '   lKXK0kxxkkkkxk0KXKx  ', info: 'Theme:    Kali-Dark [GTK3]' },
   { art: '    :0XXKK00000KKXXKl   ', info: 'Terminal: react-portfolio v1.0' },
   { art: '      lkKXXXXXXXKkl     ', info: 'Shell:    bash 5.2.15' },
-  { art: '        ,;;::;;,.       ', info: 'CPU:      Zilingo|MindTickle|Photon|Quizizz|Hilabs' },
+  { art: '        ,;;::;;,.       ', info: 'CPU:      Zilingo|GS|Photon|Quizizz|Hilabs' },
   { art: '                        ', info: 'GPU:      React + Angular + TypeScript' },
   { art: '                        ', info: 'Memory:   MongoDB | Postgres | MySQL' },
 ];

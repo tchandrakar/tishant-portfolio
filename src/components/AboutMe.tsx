@@ -19,7 +19,7 @@ export default function AboutMe() {
                 <MapPin className="w-3 h-3" /> {PROFILE.location}
               </span>
               <span className="flex items-center gap-1">
-                <Briefcase className="w-3 h-3" /> Quizizz
+                <Briefcase className="w-3 h-3" /> Hilabs
               </span>
               <span className="flex items-center gap-1">
                 <GraduationCap className="w-3 h-3" /> IIT Roorkee
