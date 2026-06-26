@@ -99,6 +99,12 @@ export const EXPERIENCES: Experience[] = [
 
 export const PROJECTS: Project[] = [
   {
+    name: 'Enterprise Datalake — General Solution',
+    description: 'A generic, pluggable enterprise lakehouse platform: a bronze→silver→gold medallion on Apache Iceberg with a no-code, config-driven transform engine and a generic orchestration control plane. Pure Scala 3 (Play + Slick + Guice) backend, Spark/Trino/Kafka compute, and a React/MUI control-plane UI that visualizes and drives the whole pipeline. Designed so any enterprise can drop it in and build their own medallion layers.',
+    tech: ['Scala 3', 'Play Framework', 'Slick', 'Apache Spark', 'Apache Iceberg', 'Trino', 'Kafka', 'PostgreSQL', 'React', 'Docker'],
+    github: 'https://github.com/tchandrakar/enterprise-datalake-general-solution',
+  },
+  {
     name: 'AI Dev Manager',
     description: 'An AI-powered development manager that automates project workflows, task management, and developer coordination using intelligent agents.',
     tech: ['JavaScript', 'AI/LLM', 'Automation', 'DevTools'],
@@ -199,7 +205,7 @@ export const BOOT_MESSAGES = [
   '[    0.896201] Loading portfolio modules...',
   '[    1.024223] [portfolio] experience.ko loaded — 6+ years indexed',
   '[    1.152245] [portfolio] skills.ko loaded — 25 technologies catalogued',
-  '[    1.280267] [portfolio] projects.ko loaded — 5 repositories synced',
+  '[    1.280267] [portfolio] projects.ko loaded — 6 repositories synced',
   '[    1.408289] [portfolio] certifications.ko loaded — Security+ | CEH | Network+',
   '[    1.536312] Initializing display manager...',
   '[    1.664334] Starting GDM (GNOME Display Manager)...',
