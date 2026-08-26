@@ -2,7 +2,7 @@ import type { Experience, Project, Skill } from '../types';
 
 export const PROFILE = {
   name: 'Tishant Chandrakar',
-  title: 'Associate Technical Architect',
+  title: 'AI Engineer',
   email: 'tishantchandrakar007@gmail.com',
   phone: '+91-9068703837',
   location: 'Bangalore, India',
@@ -28,7 +28,7 @@ export const PROFILE = {
     'Summer Undergraduate Research Award (SURA-2017)',
     'Published: Temperature and time dependent morphological evolution of copper oxide nanostructures (Springer, 2024)',
   ],
-  bio: `I'm an Associate Technical Architect at Hilabs, Bangalore, leading the Provider-Directory team as an acting EM and architect. With 6+ years of experience building scalable systems across healthtech, edtech, fintech, and AI-powered platforms, I've worked at Zilingo, Goldman Sachs, PhotonInsights, and Quizizz before my current role.
+  bio: `I'm an AI Engineer at Hilabs, Bangalore, leading the Provider-Directory team as an acting EM and architect. With 6+ years of experience building scalable systems across healthtech, edtech, fintech, and AI-powered platforms, I've worked at Zilingo, Goldman Sachs, PhotonInsights, and Quizizz before my current role.
 
 I hold a B.Tech from IIT Roorkee and carry certifications in cybersecurity (Security+, CEH v11). I'm passionate about system design, performance optimization, and building products that serve millions of users.
 
@@ -38,11 +38,12 @@ When I'm not coding, you'll find me exploring cybersecurity challenges on HackTh
 export const EXPERIENCES: Experience[] = [
   {
     company: 'Hilabs',
-    role: 'Associate Technical Architect',
+    role: 'AI Engineer',
     location: 'Bangalore',
     period: 'December 2025 - Present',
     highlights: [
       'Leading the Provider-Directory team as an acting EM and architect.',
+      'Creating the general workflow of a contextual layer over 3+ terabytes of durable provider data.',
     ],
     techStack: ['AWS', 'Docker', 'Angular', 'Node.JS', 'GO', 'Python', 'OpenAI', 'ECS', 'MongoDB'],
   },
@@ -54,8 +55,8 @@ export const EXPERIENCES: Experience[] = [
     highlights: [
       'Leading the Lessons and Content team back-end as an IC.',
       'Revamped authentication flow with end-to-end reusable refresh tokens for 300K+ DAU across U.S. school platforms.',
-      'Built content import flow for Google Drive and OneDrive integration.',
-      'Implemented AI-driven parameterized quiz generation, reducing user interaction steps by 40%.',
+      'Developed and deployed content import flows for Google Drive and OneDrive, streamlining ingestion of slides and presentations and reducing manual content handling overhead.',
+      'Implemented AI-driven parameterized quiz generation across multiple quiz types and languages, reducing user interaction steps by 40% from content upload to game hosting.',
     ],
     techStack: ['AWS', 'Docker', 'Angular', 'Node.JS', 'GO', 'Python', 'OpenAI', 'ECS', 'MongoDB'],
   },
@@ -66,7 +67,7 @@ export const EXPERIENCES: Experience[] = [
     period: 'August 2022 - October 2024',
     highlights: [
       'Led a backend and infrastructure team of 4, driving scalable system development.',
-      'Generated Level 1 diligence reports for asset management institutions.',
+      'Generated Level 1 diligence reports for asset management financial institutions, and developed historical sentiment analysis by scraping SEC filings and earnings call data.',
       'Enabled document insights with annotations for university PhD students, generating 2-3 new annotations per project.',
       'Integrated Microsoft OpenAI LLM with vector databases, reducing query time from minutes to <5 seconds.',
     ],
@@ -91,7 +92,7 @@ export const EXPERIENCES: Experience[] = [
     period: 'July 2019 - July 2020',
     highlights: [
       'Wrote core libraries: pagination in UI interfaces and password authentication across all login micro-services.',
-      'Solved business problems and built/maintained test scripts with JUnit and FitNesse.',
+      'Designed, developed, and owned the complete B2B invoice tool.',
     ],
     techStack: ['Java', 'Scala', 'MySQL', 'Postgres'],
   },
@@ -220,7 +221,7 @@ export const NEOFETCH = `
 \x1b[36m    :KKxddxkkkxxdddx0:  \x1b[0m   \x1b[36mHost:\x1b[0m   Bangalore, India
 \x1b[36m   dKxddO0OOO00Okxddx0; \x1b[0m   \x1b[36mKernel:\x1b[0m IIT Roorkee B.Tech
 \x1b[36m  dXxddO0KKK00OOOkxddOK \x1b[0m   \x1b[36mUptime:\x1b[0m 6+ years in industry
-\x1b[36m  OXkxxO0KXXKK00Okxdx0X;\x1b[0m   \x1b[36mRole:\x1b[0m   Assoc. Tech Architect @ Hilabs
+\x1b[36m  OXkxxO0KXXKK00Okxdx0X;\x1b[0m   \x1b[36mRole:\x1b[0m   AI Engineer @ Hilabs
 \x1b[36m  kXOxxk0KXXXXK0OkxxOKX:\x1b[0m   \x1b[36mDE:\x1b[0m     Node.js + Go + Python
 \x1b[36m  ;KX0kxkO0KKK0OkkO0KXK \x1b[0m   \x1b[36mWM:\x1b[0m     AWS + Docker + ECS
 \x1b[36m   lKXK0kxxkkkkxk0KXKx  \x1b[0m   \x1b[36mTheme:\x1b[0m  Kali-Dark [GTK3]
@@ -238,7 +239,7 @@ export const NEOFETCH_PLAIN = [
   { art: '    :KKxddxkkkxxdddx0:  ', info: 'Host:     Bangalore, India' },
   { art: '   dKxddO0OOO00Okxddx0; ', info: 'Kernel:   IIT Roorkee B.Tech' },
   { art: '  dXxddO0KKK00OOOkxddOK ', info: 'Uptime:   6+ years in industry' },
-  { art: '  OXkxxO0KXXKK00Okxdx0X;', info: 'Role:     Assoc. Tech Architect @ Hilabs' },
+  { art: '  OXkxxO0KXXKK00Okxdx0X;', info: 'Role:     AI Engineer @ Hilabs' },
   { art: '  kXOxxk0KXXXXK0OkxxOKX:', info: 'DE:       Node.js + Go + Python' },
   { art: '  ;KX0kxkO0KKK0OkkO0KXK ', info: 'WM:       AWS + Docker + ECS' },
   { art: '   lKXK0kxxkkkkxk0KXKx  ', info: 'Theme:    Kali-Dark [GTK3]' },
