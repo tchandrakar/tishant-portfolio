@@ -112,10 +112,10 @@ export const PROJECTS: Project[] = [
     github: 'https://github.com/tchandrakar/ai-dev-manager',
   },
   {
-    name: 'Omniplex',
-    description: 'Open-source Perplexity alternative — AI-powered search and answer engine with real-time web access and intelligent summarization.',
-    tech: ['TypeScript', 'Next.js', 'AI/LLM', 'Web Search'],
-    github: 'https://github.com/tchandrakar/omniplex',
+    name: 'Sutra',
+    description: 'An operating system for AI-native companies — governance, persistent memory, per-turn discipline, and a fleet feedback loop layered on top of Claude Code, so one founder can run many companies through the same canon. Ships as a plugin plus a macOS desktop app (placement registry, Claude chat, terminal, git diff, and gated editor) and is being rebuilt as a deterministic workflow engine around a Work-Atom primitive.',
+    tech: ['TypeScript', 'Python', 'Electron', 'Claude Code', 'AI/LLM', 'Shell'],
+    github: 'https://github.com/tchandrakar/sutra',
   },
   {
     name: 'Tiny GPU',
